@@ -17,7 +17,8 @@ public sealed class AiChatPluginConfig
 public sealed class DefaultSection
 {
     public string Model { get; set; } = "gpt-4o-mini";
-    public string DefaultPrompt { get; set; } = "你是一个乐于助人的助手。";
+    public string DefaultPrompt { get; set; } = "当前时间: {time}\n你是一个乐于助人的助手。";
+    public string SharedPromptSuffix { get; set; } = "你正在群聊 {groupname} 中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。";
     public int TimeoutSeconds { get; set; } = 120;
     public int MaxConcurrency { get; set; } = 4;
 

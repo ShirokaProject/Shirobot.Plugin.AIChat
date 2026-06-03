@@ -47,6 +47,7 @@ public sealed class AiChatPlugin : PluginBase
         {
             _config = updated;
             ApplyConfigDerivatives(initial: false);
+            _ = Task.Run(FetchAndMergeProviderModelsAsync);
             BotLog.Info("[AiChat] 配置已热重载。");
         });
 
@@ -107,8 +108,10 @@ public sealed class AiChatPlugin : PluginBase
         [default]
         # 默认模型名（需在 [[models]] 或 provider fetch 中存在）
         model = "gpt-4o-mini"
-        # 默认 system prompt
-        default_prompt = "你是一个乐于助人的助手。"
+        # 默认 system prompt。支持占位符: {time}, {date}, {groupname}, {groupid}, {userid}, {nickname}, {card}
+        default_prompt = "当前时间: {time}\n你是一个乐于助人的助手。"
+        # shared 模式额外追加的 system prompt。支持同样的占位符；留空则不追加。
+        shared_prompt_suffix = "你正在群聊 {groupname} 中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。"
         # 请求超时（秒）
         timeout_seconds = 120
         # 全局最大并发请求数
@@ -491,9 +494,10 @@ public sealed class AiChatPlugin : PluginBase
                     : !string.IsNullOrWhiteSpace(settings.SystemPrompt)
                         ? settings.SystemPrompt
                         : _config.Default.DefaultPrompt;
-                if (isSharedMode)
+                systemPrompt = RenderPromptPlaceholders(systemPrompt, message);
+                if (isSharedMode && !string.IsNullOrWhiteSpace(_config.Default.SharedPromptSuffix))
                 {
-                    systemPrompt += "\n你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，除非用户明确要求详细解释。";
+                    systemPrompt += "\n" + RenderPromptPlaceholders(_config.Default.SharedPromptSuffix, message);
                 }
 
                 var userParts = isSharedMode && message is GroupIncomingMessage groupMessage
@@ -946,6 +950,43 @@ public sealed class AiChatPlugin : PluginBase
         }
 
         return result;
+    }
+
+    private static string RenderPromptPlaceholders(string prompt, IncomingMessage message)
+    {
+        var now = DateTimeOffset.Now;
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["time"] = now.ToString("yyyy-MM-dd HH:mm:ss zzz"),
+            ["date"] = now.ToString("yyyy-MM-dd"),
+            ["userid"] = string.Empty,
+            ["groupname"] = string.Empty,
+            ["groupid"] = string.Empty,
+            ["nickname"] = string.Empty,
+            ["card"] = string.Empty
+        };
+
+        switch (message)
+        {
+            case GroupIncomingMessage group:
+                values["userid"] = group.SenderId.ToString();
+                values["groupname"] = group.Group.GroupName;
+                values["groupid"] = group.Group.GroupId.ToString();
+                values["nickname"] = group.GroupMember.Nickname;
+                values["card"] = group.GroupMember.Card;
+                break;
+            case FriendIncomingMessage friend:
+                values["userid"] = friend.SenderId.ToString();
+                values["nickname"] = friend.Friend.Nickname;
+                break;
+        }
+
+        foreach (var (key, value) in values)
+        {
+            prompt = prompt.Replace("{" + key + "}", value, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return prompt;
     }
 
     /// <summary>
