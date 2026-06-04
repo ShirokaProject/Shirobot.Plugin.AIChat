@@ -717,7 +717,7 @@ public sealed class AiChatPlugin : PluginBase
                     await ApplyModelAsync(message.SenderId, arg, isAdmin: Context.IsAdmin(message.SenderId),
                         async reply =>
                         {
-                            var currentShared = convo.SharedModel ?? _config.Default.Model;
+                            var currentShared = FormatSelectedModel(convo.SharedModel, includeDefaultMark: true);
                             var fullReply = $"{reply}\n当前共享模型: {currentShared}";
                             var resp = await Context.Message.ReplyAsync(message, fullReply).ConfigureAwait(false);
                             ScheduleRecall(message.Group.GroupId, resp.MessageSeq, 30);
@@ -747,9 +747,9 @@ public sealed class AiChatPlugin : PluginBase
                     return;
                 }
 
-                convo.SharedModel = target.Name;
+                convo.SharedModel = GetModelDisplayId(target);
                 _conversations.SaveMetadata(convo);
-                await ReplyToGroup(message, $"共享模型已切换到: {target.Name}").ConfigureAwait(false);
+                await ReplyToGroup(message, $"共享模型已切换到: {GetModelDisplayId(target)}").ConfigureAwait(false);
             }
             finally
             {
@@ -790,16 +790,16 @@ public sealed class AiChatPlugin : PluginBase
             {
                 foreach (var m in _config.Models)
                 {
-                    var mark = string.Equals(m.Name, settings.PreferredModel, StringComparison.OrdinalIgnoreCase) ? " *" : "";
+                    var displayId = GetModelDisplayId(m);
+                    var mark = IsSelectedModel(m, settings.PreferredModel) ? " *" : "";
                     var visionMark = m.SupportsVision ? " [vision]" : "";
                     var adminMark = _config.Permissions.AdminOnlyModels.Contains(m.Name, StringComparer.OrdinalIgnoreCase)
                         ? " [admin]" : "";
-                    var providerTag = !string.IsNullOrEmpty(m.Provider) ? $"{m.Provider}-" : "";
                     var displayLabel = !string.IsNullOrEmpty(m.DisplayName) ? $" ({m.DisplayName})" : "";
-                    sb.AppendLine($"  - {providerTag}{m.Name}{displayLabel}{visionMark}{adminMark}{mark}");
+                    sb.AppendLine($"  - {displayId}{displayLabel}{visionMark}{adminMark}{mark}");
                 }
             }
-            sb.AppendLine($"当前偏好: {settings.PreferredModel ?? _config.Default.Model + " (默认)"}");
+            sb.AppendLine($"当前偏好: {FormatSelectedModel(settings.PreferredModel, includeDefaultMark: true)}");
             sb.AppendLine("用法: #model <name>  切换；#model -  恢复默认");
             await reply(sb.ToString().TrimEnd()).ConfigureAwait(false);
             return;
@@ -826,9 +826,9 @@ public sealed class AiChatPlugin : PluginBase
             return;
         }
 
-        settings.PreferredModel = target.Name;
+        settings.PreferredModel = GetModelDisplayId(target);
         await _userSettings.SaveAsync().ConfigureAwait(false);
-        await reply($"已切换到模型: {target.Name}").ConfigureAwait(false);
+        await reply($"已切换到模型: {GetModelDisplayId(target)}").ConfigureAwait(false);
     }
 
     // -------- 工具方法 --------
@@ -1068,14 +1068,31 @@ public sealed class AiChatPlugin : PluginBase
         return match;
     }
 
+    private static string GetModelDisplayId(ModelEntry model) =>
+        string.IsNullOrWhiteSpace(model.Provider) ? model.Name : $"{model.Provider}-{model.Name}";
+
+    private bool IsSelectedModel(ModelEntry model, string? selected)
+    {
+        if (string.IsNullOrWhiteSpace(selected)) return false;
+
+        return string.Equals(model.Name, selected, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(GetModelDisplayId(model), selected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string FormatSelectedModel(string? selected, bool includeDefaultMark)
+    {
+        var isDefault = string.IsNullOrWhiteSpace(selected);
+        var value = isDefault ? _config.Default.Model : selected!;
+        var model = ResolveModel(value);
+        var display = model is null ? value : GetModelDisplayId(model);
+        return isDefault && includeDefaultMark ? display + " (默认)" : display;
+    }
+
     private List<OpenAiMessage> BuildOpenAiMessages(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn)
     {
-        // 永久指令：不受用户 #prompt 影响，始终附加在 system prompt 末尾。
-        const string permanentInstruction = "\n不要使用Markdown格式回答。";
-
         var msgs = new List<OpenAiMessage>(history.Count + 2)
         {
-            new() { Role = "system", Content = systemPrompt + permanentInstruction }
+            new() { Role = "system", Content = systemPrompt }
         };
 
         foreach (var t in history)
@@ -1091,14 +1108,12 @@ public sealed class AiChatPlugin : PluginBase
     /// </summary>
     private List<ChatMessageDescriptor> BuildMessageDescriptors(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn)
     {
-        const string permanentInstruction = "\n不要使用Markdown格式回答。";
-
         var descriptors = new List<ChatMessageDescriptor>(history.Count + 2)
         {
             new()
             {
                 Role = "system",
-                Segments = [new ContentSegment { Kind = SegmentKind.Text, Text = systemPrompt + permanentInstruction }]
+                Segments = [new ContentSegment { Kind = SegmentKind.Text, Text = systemPrompt }]
             }
         };
 
