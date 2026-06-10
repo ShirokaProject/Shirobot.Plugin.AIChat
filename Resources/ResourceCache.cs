@@ -5,19 +5,21 @@ using ShiroBot.SDK.Abstractions;
 namespace ShiroBot.AiChatPlugin.Resources;
 
 /// <summary>
-/// 资源缓存。文件以 <c>{sha256}{ext}</c> 命名落盘，同时生成 <c>{sha256}.b64</c>
-/// 存放完整的 data URL（data:mime;base64,...），后续读取零转换、零大对象分配。
+/// 资源缓存。生成 <c>{sha256}.b64</c> 存放完整的 data URL
+/// （data:mime;base64,...），后续读取零转换、零大对象分配。
 /// </summary>
 internal sealed class ResourceCache
 {
     private readonly string _cacheDir;
+    private readonly int _cacheMaxAgeDays;
 
-    public ResourceCache(string pluginRootDir, string relativeCacheDir)
+    public ResourceCache(string pluginRootDir, string relativeCacheDir, int cacheMaxAgeDays)
     {
         var normalized = relativeCacheDir.Replace('/', Path.DirectorySeparatorChar);
         _cacheDir = Path.IsPathRooted(normalized)
             ? Path.GetFullPath(normalized)
             : Path.GetFullPath(Path.Combine(pluginRootDir, normalized));
+        _cacheMaxAgeDays = cacheMaxAgeDays;
         EnsureDirectoryExists();
         BotLog.Info($"[AiChat] 资源缓存目录: {_cacheDir}");
     }
@@ -25,8 +27,8 @@ internal sealed class ResourceCache
     public string CacheDir => _cacheDir;
 
     /// <summary>
-    /// 把字节流写到缓存，同时生成 .b64 文件存放完整 data URL。
-    /// 返回最终绝对路径（原始文件），写入失败时返回 null。
+    /// 把字节流写到缓存，生成 .b64 文件存放完整 data URL。
+    /// 返回按 hash 推导出的原始文件路径；即使未保留原图，也可用它定位同名 .b64。
     /// </summary>
     public async Task<string?> StoreAsync(byte[] bytes, string extension, string mime)
     {
@@ -54,6 +56,8 @@ internal sealed class ResourceCache
             // 写 .b64 文件：分块编码避免大字符串进 LOH
             await WriteBase64FileAsync(b64Path, bytes, mime).ConfigureAwait(false);
 
+            TryDeleteFile(fullPath);
+
             return fullPath;
         }
         catch (Exception ex)
@@ -61,6 +65,23 @@ internal sealed class ResourceCache
             BotLog.Warning($"[AiChat] 写缓存失败: {ex.Message}");
             return null;
         }
+    }
+
+    public Task CleanupAsync()
+    {
+        return Task.Run(() =>
+        {
+            try
+            {
+                EnsureDirectoryExists();
+                DeleteOriginalImagesWithBase64Cache();
+                DeleteExpiredCacheFiles();
+            }
+            catch (Exception ex)
+            {
+                BotLog.Warning($"[AiChat] 清理资源缓存失败: {ex.Message}");
+            }
+        });
     }
 
     /// <summary>
@@ -125,6 +146,59 @@ internal sealed class ResourceCache
         catch (Exception ex)
         {
             BotLog.Warning($"[AiChat] 创建缓存目录失败 {_cacheDir}: {ex.Message}");
+        }
+    }
+
+    private void DeleteOriginalImagesWithBase64Cache()
+    {
+        foreach (var file in Directory.EnumerateFiles(_cacheDir))
+        {
+            var ext = Path.GetExtension(file);
+            if (!IsImageExtension(ext)) continue;
+
+            var b64Path = Path.Combine(_cacheDir, Path.GetFileNameWithoutExtension(file) + ".b64");
+            if (File.Exists(b64Path)) TryDeleteFile(file);
+        }
+    }
+
+    private void DeleteExpiredCacheFiles()
+    {
+        if (_cacheMaxAgeDays <= 0) return;
+
+        var cutoff = DateTime.UtcNow.AddDays(-_cacheMaxAgeDays);
+        foreach (var file in Directory.EnumerateFiles(_cacheDir))
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(file) < cutoff)
+                {
+                    File.Delete(file);
+                }
+            }
+            catch (Exception ex)
+            {
+                BotLog.Warning($"[AiChat] 删除过期缓存失败 {file}: {ex.Message}");
+            }
+        }
+    }
+
+    private static bool IsImageExtension(string extension) =>
+        extension.Equals(".png", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".webp", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".gif", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".bmp", StringComparison.OrdinalIgnoreCase);
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            BotLog.Warning($"[AiChat] 删除缓存文件失败 {path}: {ex.Message}");
         }
     }
 }

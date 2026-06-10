@@ -68,6 +68,9 @@ public sealed class ResourcesSection
     /// <summary>资源缓存目录，相对插件目录。</summary>
     public string CacheDir { get; set; } = "data/resource_cache";
 
+    /// <summary>缓存保留天数。小于等于 0 表示不按时间清理。</summary>
+    public int CacheMaxAgeDays { get; set; } = 7;
+
     /// <summary>引用/合并转发递归展开深度。</summary>
     public int RecursiveDepth { get; set; } = 3;
 

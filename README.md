@@ -51,12 +51,14 @@ default_chat_mode = "multi"
 
 [history]
 max_turns = 20
+max_tokens = 16000
 persist = true
 
 [resources]
 max_image_bytes = 8388608
 max_inline_text_bytes = 524288
 cache_dir = "data/resource_cache"
+cache_max_age_days = 7
 download_timeout_seconds = 60
 
 [behaviour]
@@ -115,12 +117,13 @@ display_name = "GPT-4o Mini"
 openai-gpt-4o-mini (GPT-4o Mini) [vision]
 ```
 
-切换模型时支持两种写法：
+切换模型时使用列表显示的完整名称：
 
 ```text
-#model gpt-4o-mini
 #model openai-gpt-4o-mini
 ```
+
+如果只输入关键字但没有精确命中，插件会列出匹配的候选模型。
 
 ## 命令
 
@@ -141,6 +144,7 @@ openai-gpt-4o-mini (GPT-4o Mini) [vision]
 #model          查看可用模型
 #model <name>   切换模型
 #model -        恢复默认模型
+#refresh        重新拉取 provider 模型列表
 
 #clear          清空当前会话历史
 ```
@@ -169,4 +173,4 @@ data/
   resource_cache/*            图片/资源缓存
 ```
 
-图片会生成 `.b64` 缓存文件，发送时从磁盘流式写入 HTTP 请求体，避免把完整 base64 图片和完整 JSON body 同时加载到内存。
+图片只保留 `.b64` 缓存文件，发送时从磁盘流式写入 HTTP 请求体，避免把完整 base64 图片和完整 JSON body 同时加载到内存。历史上下文不会重复附带上一轮图片内容。

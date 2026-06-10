@@ -68,7 +68,7 @@ internal sealed class ConversationStore
     /// </summary>
     public async Task AppendTurnsAsync(ConversationState state, ChatTurn userTurn, ChatTurn assistantTurn)
     {
-        state.Turns.Add(StripInlineBytes(userTurn));
+        state.Turns.Add(StripTransientPayloads(userTurn));
         state.Turns.Add(assistantTurn);
 
         var trimmed = TrimAndReturnRemoved(state);
@@ -82,7 +82,7 @@ internal sealed class ConversationStore
             }
             else
             {
-                await AppendToDiskAsync(state.Key, StripInlineBytes(userTurn), assistantTurn).ConfigureAwait(false);
+                await AppendToDiskAsync(state.Key, StripTransientPayloads(userTurn), assistantTurn).ConfigureAwait(false);
             }
         }
     }
@@ -166,25 +166,25 @@ internal sealed class ConversationStore
         }
     }
 
-    private static ChatTurn StripInlineBytes(ChatTurn turn)
+    private static ChatTurn StripTransientPayloads(ChatTurn turn)
     {
-        var hasInline = false;
+        var hasTransient = false;
         foreach (var part in turn.Parts)
         {
-            if (part is ImagePart { InlineBytes: not null })
+            if (part is ImagePart)
             {
-                hasInline = true;
+                hasTransient = true;
                 break;
             }
         }
 
-        if (!hasInline) return turn;
+        if (!hasTransient) return turn;
 
         var stripped = new List<ChatPart>(turn.Parts.Count);
         foreach (var part in turn.Parts)
         {
-            stripped.Add(part is ImagePart img && img.InlineBytes is not null
-                ? img with { InlineBytes = null }
+            stripped.Add(part is ImagePart
+                ? new TextPart("[图片已在上一轮发送给模型，后续上下文不再附带图片内容。]")
                 : part);
         }
 

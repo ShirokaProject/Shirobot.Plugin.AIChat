@@ -65,6 +65,7 @@ public sealed class AiChatPlugin : PluginBase
         FriendCommands.MapPrefix("#prompt", HandleFriendPromptAsync);
         FriendCommands.MapExact("#clear", HandleFriendClearAsync);
         FriendCommands.MapPrefix("#model", HandleFriendModelAsync);
+        FriendCommands.MapExact("#refresh", HandleFriendRefreshAsync);
 
         // 群聊
         GroupCommands.MapExact("#aihelp", HandleGroupHelpAsync);
@@ -73,6 +74,7 @@ public sealed class AiChatPlugin : PluginBase
         GroupCommands.MapPrefix("#prompt", HandleGroupPromptAsync);
         GroupCommands.MapExact("#clear", HandleGroupClearAsync);
         GroupCommands.MapPrefix("#model", HandleGroupModelAsync);
+        GroupCommands.MapExact("#refresh", HandleGroupRefreshAsync);
         GroupCommands.MapMention(_selfId, HandleGroupMentionAsync);
 
         BotLog.Info("[AiChat] 插件已加载。");
@@ -122,6 +124,8 @@ public sealed class AiChatPlugin : PluginBase
         [history]
         # 单会话保留的最大轮次（user+assistant 各算一轮）
         max_turns = 20
+        # 单次请求的软上限 token，超出后按最早 turn 裁剪/压缩上下文
+        max_tokens = 16000
         # 是否落盘到 JSONL
         persist = true
 
@@ -132,6 +136,8 @@ public sealed class AiChatPlugin : PluginBase
         max_inline_text_bytes = 524288
         # 资源缓存目录（相对插件目录）
         cache_dir = "data/resource_cache"
+        # 缓存保留天数；小于等于 0 表示不按时间清理
+        cache_max_age_days = 7
         # HTTP 下载超时（秒）
         download_timeout_seconds = 60
 
@@ -208,13 +214,16 @@ public sealed class AiChatPlugin : PluginBase
             _config.Resources.DownloadTimeoutSeconds,
             _config.Resources.MaxImageBytes,
             _config.Resources.MaxInlineTextBytes);
-        _cache = new ResourceCache(pluginRoot, _config.Resources.CacheDir);
+        _cache = new ResourceCache(
+            pluginRoot,
+            _config.Resources.CacheDir,
+            _config.Resources.CacheMaxAgeDays);
+        _ = _cache.CleanupAsync();
 
         if (initial)
         {
             // 校验：如果默认 model 没在 models 列表里，提示一下但不报错。
-            if (_config.Models.Count > 0 &&
-                !_config.Models.Any(m => string.Equals(m.Name, _config.Default.Model, StringComparison.OrdinalIgnoreCase)))
+            if (_config.Models.Count > 0 && ResolveModel(_config.Default.Model) is null)
             {
                 BotLog.Warning($"[AiChat] 默认模型 {_config.Default.Model} 未在 [[models]] 中注册。");
             }
@@ -225,8 +234,9 @@ public sealed class AiChatPlugin : PluginBase
     /// 从配置了 fetch_models = true 的 provider 自动拉取模型列表，
     /// 合并到 _config.Models 中（不覆盖已手动配置的同名 model）。
     /// </summary>
-    private async Task FetchAndMergeProviderModelsAsync()
+    private async Task<int> FetchAndMergeProviderModelsAsync()
     {
+        var totalAdded = 0;
         foreach (var provider in _config.Providers.Where(p => p.FetchModels))
         {
             try
@@ -259,6 +269,8 @@ public sealed class AiChatPlugin : PluginBase
                     added++;
                 }
 
+                totalAdded += added;
+
                 if (added > 0)
                     BotLog.Info($"[AiChat] 从 {provider.Name} 拉取到 {modelIds.Count} 个模型，新增 {added} 个。");
             }
@@ -267,6 +279,8 @@ public sealed class AiChatPlugin : PluginBase
                 BotLog.Warning($"[AiChat] 从 {provider.Name} 拉取模型列表失败: {ex.Message}");
             }
         }
+
+        return totalAdded;
     }
 
     // -------- 帮助 --------
@@ -296,6 +310,7 @@ public sealed class AiChatPlugin : PluginBase
           #clear         清空当前会话上下文
           #model         查看可用模型
           #model <name>  切换偏好模型(部分模型仅管理员)
+          #refresh       重新拉取模型列表
           #aihelp        显示本帮助
         提示: 在消息里引用图片/文件/或合并转发, AI会一并读取这些资源。
         """;
@@ -439,8 +454,8 @@ public sealed class AiChatPlugin : PluginBase
         {
             convo = isSingleMode ? null : await _conversations.AcquireAsync(key).ConfigureAwait(false);
 
-            var modelName = isSharedMode && convo?.SharedModel is not null
-                ? convo.SharedModel
+            var modelName = isSharedMode
+                ? convo?.SharedModel ?? _config.Default.Model
                 : settings.PreferredModel ?? _config.Default.Model;
             var model = ResolveModel(modelName);
             if (model is null && !string.Equals(modelName, _config.Default.Model, StringComparison.OrdinalIgnoreCase))
@@ -508,10 +523,9 @@ public sealed class AiChatPlugin : PluginBase
                 string assistantText;
                 try
                 {
-                    var hasImageInHistory = convo?.Turns.Any(t => t.Parts.Any(p => p is ImagePart)) == true;
                     var hasImageInCurrent = parts.Any(p => p is ImagePart);
 
-                    if (hasImageInHistory || hasImageInCurrent)
+                    if (hasImageInCurrent)
                     {
                         // 有图片：用流式 body 写入，避免大 string 进 LOH
                         var descriptors = BuildMessageDescriptors(systemPrompt, convo?.Turns ?? [], userTurn);
@@ -683,6 +697,44 @@ public sealed class AiChatPlugin : PluginBase
         await ReplyToGroup(message, hint).ConfigureAwait(false);
     }
 
+    // -------- #refresh --------
+
+    private async Task HandleFriendRefreshAsync(FriendIncomingMessage message)
+    {
+        if (!CheckPermission(message.SenderId, out var deny))
+        {
+            if (deny is not null) await Context.Message.ReplyAsync(message, deny);
+            return;
+        }
+
+        await RefreshModelsAsync(reply => Context.Message.ReplyAsync(message, reply)).ConfigureAwait(false);
+    }
+
+    private async Task HandleGroupRefreshAsync(GroupIncomingMessage message)
+    {
+        if (!CheckPermission(message.SenderId, out var deny))
+        {
+            if (deny is not null) await ReplyToGroup(message, deny);
+            return;
+        }
+
+        await RefreshModelsAsync(reply => ReplyToGroup(message, reply)).ConfigureAwait(false);
+    }
+
+    private async Task RefreshModelsAsync(Func<string, Task> reply)
+    {
+        var providers = _config.Providers.Count(p => p.FetchModels);
+        if (providers == 0)
+        {
+            await reply("没有配置 fetch_models = true 的 provider，无法刷新模型列表。").ConfigureAwait(false);
+            return;
+        }
+
+        var before = _config.Models.Count;
+        var added = await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
+        await reply($"模型列表已刷新。provider={providers}，当前模型数={_config.Models.Count}，新增={added}，刷新前={before}。").ConfigureAwait(false);
+    }
+
     // -------- #model --------
 
     private async Task HandleFriendModelAsync(FriendIncomingMessage message)
@@ -733,10 +785,10 @@ public sealed class AiChatPlugin : PluginBase
                     return;
                 }
 
-                var target = ResolveModel(arg);
+                var target = ResolveModelForSelection(arg);
                 if (target is null)
                 {
-                    await ReplyToGroup(message, $"未找到模型: {arg}。发送 #model 查看可用列表。").ConfigureAwait(false);
+                    await ReplyToGroup(message, BuildModelNotFoundReply(arg)).ConfigureAwait(false);
                     return;
                 }
 
@@ -813,10 +865,10 @@ public sealed class AiChatPlugin : PluginBase
             return;
         }
 
-        var target = ResolveModel(arg);
+        var target = ResolveModelForSelection(arg);
         if (target is null)
         {
-            await reply($"未找到模型: {arg}。发送 #model 查看可用列表。").ConfigureAwait(false);
+            await reply(BuildModelNotFoundReply(arg)).ConfigureAwait(false);
             return;
         }
 
@@ -865,7 +917,7 @@ public sealed class AiChatPlugin : PluginBase
 
         foreach (var turn in turnsToCompact)
         {
-            summaryMessages.Add(TurnToMessage(turn));
+            summaryMessages.Add(TurnToMessage(turn, includeImages: false));
         }
 
         summaryMessages.Add(new OpenAiMessage
@@ -1046,6 +1098,7 @@ public sealed class AiChatPlugin : PluginBase
 
     private ModelEntry? ResolveModel(string name)
     {
+        name = name.Trim();
         if (_config.Models.Count == 0)
         {
             // 没有模型注册时退化为只用 default 段
@@ -1056,16 +1109,68 @@ public sealed class AiChatPlugin : PluginBase
             return null;
         }
 
-        // 精确匹配 model name
+        // 优先支持 "provider-name" 格式匹配（列表显示格式）。必须放在裸 name 前，
+        // 避免 provider fetch 拉到同名裸模型时抢先命中错误 provider。
         var match = _config.Models.FirstOrDefault(m =>
-            string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
+            !string.IsNullOrEmpty(m.Provider) &&
+            string.Equals(GetModelDisplayId(m), name, StringComparison.OrdinalIgnoreCase));
         if (match is not null) return match;
 
-        // 支持 "provider-name" 格式匹配（列表显示格式）
+        // 精确匹配 model name
         match = _config.Models.FirstOrDefault(m =>
-            !string.IsNullOrEmpty(m.Provider) &&
-            string.Equals($"{m.Provider}-{m.Name}", name, StringComparison.OrdinalIgnoreCase));
+            string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
         return match;
+    }
+
+    private ModelEntry? ResolveModelForSelection(string name)
+    {
+        name = name.Trim();
+        if (_config.Models.Count == 0)
+        {
+            return string.Equals(name, _config.Default.Model, StringComparison.OrdinalIgnoreCase)
+                ? new ModelEntry { Name = _config.Default.Model }
+                : null;
+        }
+
+        return _config.Models.FirstOrDefault(m =>
+            string.Equals(GetModelDisplayId(m), name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private string BuildModelNotFoundReply(string keyword)
+    {
+        var matches = FindModelCandidates(keyword, maxCount: 12);
+        if (matches.Count == 0)
+        {
+            return $"未找到模型: {keyword}。发送 #model 查看可用列表。";
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"未找到模型: {keyword}");
+        sb.AppendLine("你可能想选:");
+        foreach (var m in matches)
+        {
+            var displayLabel = !string.IsNullOrEmpty(m.DisplayName) ? $" ({m.DisplayName})" : "";
+            sb.AppendLine($"  - {GetModelDisplayId(m)}{displayLabel}");
+        }
+        sb.AppendLine("用法: #model <上面的完整名称>");
+        return sb.ToString().TrimEnd();
+    }
+
+    private List<ModelEntry> FindModelCandidates(string keyword, int maxCount)
+    {
+        keyword = keyword.Trim();
+        if (string.IsNullOrEmpty(keyword)) return [];
+
+        return _config.Models
+            .Where(m =>
+                m.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                GetModelDisplayId(m).Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(m.DisplayName) && m.DisplayName.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+            .OrderBy(m => GetModelDisplayId(m).StartsWith(keyword, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(m => m.Name.StartsWith(keyword, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(GetModelDisplayId, StringComparer.OrdinalIgnoreCase)
+            .Take(maxCount)
+            .ToList();
     }
 
     private static string GetModelDisplayId(ModelEntry model) =>
@@ -1097,9 +1202,9 @@ public sealed class AiChatPlugin : PluginBase
 
         foreach (var t in history)
         {
-            msgs.Add(TurnToMessage(t));
+            msgs.Add(TurnToMessage(t, includeImages: false));
         }
-        msgs.Add(TurnToMessage(currentUserTurn));
+        msgs.Add(TurnToMessage(currentUserTurn, includeImages: true));
         return msgs;
     }
 
@@ -1119,13 +1224,13 @@ public sealed class AiChatPlugin : PluginBase
 
         foreach (var t in history)
         {
-            descriptors.Add(TurnToDescriptor(t));
+            descriptors.Add(TurnToDescriptor(t, includeImages: false));
         }
-        descriptors.Add(TurnToDescriptor(currentUserTurn));
+        descriptors.Add(TurnToDescriptor(currentUserTurn, includeImages: true));
         return descriptors;
     }
 
-    private ChatMessageDescriptor TurnToDescriptor(ChatTurn turn)
+    private ChatMessageDescriptor TurnToDescriptor(ChatTurn turn, bool includeImages)
     {
         if (turn.Role == "assistant")
         {
@@ -1147,6 +1252,12 @@ public sealed class AiChatPlugin : PluginBase
                     break;
 
                 case ImagePart ip:
+                    if (!includeImages)
+                    {
+                        segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = "[图片已省略，历史上下文不再附带图片内容。]" });
+                        break;
+                    }
+
                     // 获取 .b64 文件路径（不读取内容）
                     var b64Path = GetB64FilePath(ip.CachePath);
                     if (b64Path is not null)
@@ -1205,7 +1316,7 @@ public sealed class AiChatPlugin : PluginBase
         return File.Exists(b64Path) ? b64Path : null;
     }
 
-    private OpenAiMessage TurnToMessage(ChatTurn turn)
+    private OpenAiMessage TurnToMessage(ChatTurn turn, bool includeImages)
     {
         // assistant 消息：直接 string 形式（绝大多数模型只生成纯文本）。
         if (turn.Role == "assistant")
@@ -1238,6 +1349,16 @@ public sealed class AiChatPlugin : PluginBase
                     break;
 
                 case ImagePart ip:
+                    if (!includeImages)
+                    {
+                        contentParts.Add(new Dictionary<string, object>
+                        {
+                            ["type"] = "text",
+                            ["text"] = "[图片已省略，历史上下文不再附带图片内容。]"
+                        });
+                        break;
+                    }
+
                     var imageDataUrl = TryReadImageAsDataUrl(ip);
                     if (imageDataUrl is not null)
                     {
