@@ -11,23 +11,19 @@ namespace ShiroBot.AiChatPlugin.OpenAi;
 /// 兼容 OpenAI chat.completions 协议的 HTTP 客户端。
 /// 按 base_url 复用 HttpClient（每个 endpoint 一个实例）。
 /// </summary>
-internal sealed class OpenAiClient
+internal sealed class OpenAiClient(int timeoutSeconds)
 {
     private readonly Dictionary<string, HttpClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ProviderEntry> _providers = new(StringComparer.OrdinalIgnoreCase);
-    private readonly object _clientsLock = new();
-    private readonly TimeSpan _timeout;
-    private readonly JsonSerializerOptions _jsonOptions;
-
-    public OpenAiClient(int timeoutSeconds)
+    private readonly Lock _clientsLock = new();
+    private readonly TimeSpan _timeout = TimeSpan.FromSeconds(Math.Max(5, timeoutSeconds));
+    private readonly JsonSerializerOptions _jsonOptions = new()
     {
-        _timeout = TimeSpan.FromSeconds(Math.Max(5, timeoutSeconds));
-        _jsonOptions = new JsonSerializerOptions
-        {
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-            // content 字段是 object，需要默认 polymorphic 处理 string vs list
-        };
-    }
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // content 字段是 object，需要默认 polymorphic 处理 string vs list
+    };
+
+    // content 字段是 object，需要默认 polymorphic 处理 string vs list
 
     public async Task<string> ChatAsync(
         DefaultSection defaults,
@@ -35,7 +31,7 @@ internal sealed class OpenAiClient
         OpenAiChatRequest request,
         CancellationToken ct = default)
     {
-        var (baseUrl, apiKey) = ResolveEndpoint(defaults, model);
+        var (baseUrl, apiKey) = ResolveEndpoint(model);
 
         if (string.IsNullOrWhiteSpace(baseUrl))
         {
@@ -75,7 +71,7 @@ internal sealed class OpenAiClient
         List<ChatMessageDescriptor> messages,
         CancellationToken ct = default)
     {
-        var (baseUrl, apiKey) = ResolveEndpoint(defaults, model);
+        var (baseUrl, apiKey) = ResolveEndpoint(model);
 
         if (string.IsNullOrWhiteSpace(baseUrl))
             throw new InvalidOperationException("base_url 未配置");
@@ -140,7 +136,7 @@ internal sealed class OpenAiClient
             throw new InvalidOperationException("响应内容为空");
         }
 
-        return content2!;
+        return content2;
     }
 
     private static string? TryExtractErrorMessage(string body)
@@ -247,7 +243,7 @@ internal sealed class OpenAiClient
     /// 2. model 自身有 BaseUrl/ApiKey → 直接用
     /// 不再回退到 DefaultSection。
     /// </summary>
-    private (string baseUrl, string apiKey) ResolveEndpoint(DefaultSection defaults, ModelEntry model)
+    private (string baseUrl, string apiKey) ResolveEndpoint(ModelEntry model)
     {
         if (!string.IsNullOrWhiteSpace(model.Provider) && _providers.TryGetValue(model.Provider, out var provider))
         {
@@ -309,7 +305,7 @@ internal sealed class OpenAiClient
                     {
                         var modelId = id.GetString();
                         if (!string.IsNullOrWhiteSpace(modelId))
-                            models.Add(modelId!);
+                            models.Add(modelId);
                     }
                 }
             }

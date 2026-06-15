@@ -37,7 +37,7 @@ internal sealed class UserSettingsStore
         => _byUser.GetOrAdd(userId, _ => new UserSettings());
 
     public UserSettings? Get(long userId)
-        => _byUser.TryGetValue(userId, out var s) ? s : null;
+        => _byUser.GetValueOrDefault(userId);
 
     public async Task SaveAsync()
     {
@@ -94,7 +94,7 @@ internal sealed class UserSettingsStore
 
             foreach (var (k, v) in raw)
             {
-                if (long.TryParse(k, out var uid) && v is not null)
+                if (long.TryParse(k, out var uid))
                 {
                     result[uid] = v;
                 }

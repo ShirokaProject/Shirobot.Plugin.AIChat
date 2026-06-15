@@ -14,7 +14,7 @@ internal sealed class OpenAiChatRequest
     public List<OpenAiMessage> Messages { get; set; } = [];
 
     [JsonPropertyName("stream")]
-    public bool Stream { get; set; } = false;
+    public bool Stream { get; set; }
 
     [JsonPropertyName("temperature")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

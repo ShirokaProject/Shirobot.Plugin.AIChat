@@ -1,4 +1,4 @@
-using System.Buffers;
+
 using System.Text;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
@@ -12,16 +12,16 @@ using ShiroBot.SDK.Plugin;
 
 namespace ShiroBot.AiChatPlugin;
 
+
+[BotPlugin(id: "AiChatPlugin",
+    Name = "AI聊天插件",
+    Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
+    Version = "1.0.0",
+    GithubRepo = "greepar/ShiroBot.Plugin.AiChat",
+    IsPluginSingleFile = false)]
 public sealed class AiChatPlugin : PluginBase
 {
     public override string Name => "AiChatPlugin";
-    public override BotComponentMetadata Metadata { get; } = new()
-    {
-        Name = "AI 聊天插件",
-        Version = "1.0.0",
-        Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-        IsPluginSingleFile = false
-    };
 
     private AiChatPluginConfig _config = new();
     private IDisposable? _configWatchSubscription;
@@ -951,7 +951,7 @@ public sealed class AiChatPlugin : PluginBase
         }
         catch (Exception ex)
         {
-            // compact 失败不影响正常对话，降级为旧的截断行为
+            // compact 失败不影响正常对话，降级为旧截断行为
             BotLog.Warning($"[AiChat] Context compact 失败，回退到截断: {ex.Message}");
         }
     }
@@ -1267,7 +1267,7 @@ public sealed class AiChatPlugin : PluginBase
                     else if (ip.InlineBytes is { Length: > 0 })
                     {
                         // fallback: 内存中有 inline bytes，生成 data URL
-                        var mime = Resources.MimeGuesser.SniffImageMime(ip.InlineBytes)
+                        var mime = MimeGuesser.SniffImageMime(ip.InlineBytes)
                                    ?? (ip.Mime.StartsWith("image/", StringComparison.Ordinal) ? ip.Mime : "image/png");
                         var dataUrl = $"data:{mime};base64,{Convert.ToBase64String(ip.InlineBytes)}";
                         segments.Add(new ContentSegment { Kind = SegmentKind.Image, InlineDataUrl = dataUrl });
@@ -1421,7 +1421,7 @@ public sealed class AiChatPlugin : PluginBase
         // 没有图片时，单段纯文本可以塌缩为 string 形式（最大兼容）
         if (contentParts.Count == 1 &&
             contentParts[0].TryGetValue("type", out var t) &&
-            t is string s && s == "text" &&
+            t is string and "text" &&
             contentParts[0].TryGetValue("text", out var textObj) &&
             textObj is string textStr)
         {
@@ -1458,7 +1458,7 @@ public sealed class AiChatPlugin : PluginBase
             // 回退：InlineBytes（仅在缓存写入失败时存在）
             if (ip.InlineBytes is { Length: > 0 } inline)
             {
-                var mime = Resources.MimeGuesser.SniffImageMime(inline)
+                var mime = MimeGuesser.SniffImageMime(inline)
                            ?? (ip.Mime.StartsWith("image/", StringComparison.Ordinal) ? ip.Mime : "image/png");
 
                 // 分块编码避免大字符串进 LOH

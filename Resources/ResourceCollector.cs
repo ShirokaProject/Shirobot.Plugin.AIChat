@@ -13,21 +13,12 @@ namespace ShiroBot.AiChatPlugin.Resources;
 /// 把一条 <see cref="IncomingMessage"/> 的 segments、引用消息和合并转发递归
 /// 抽取为 <see cref="ChatPart"/> 列表。
 /// </summary>
-internal sealed class ResourceCollector
+internal sealed class ResourceCollector(
+    IBotContext bot,
+    ResourceFetcher fetcher,
+    ResourceCache cache,
+    ResourcesSection config)
 {
-    private readonly IBotContext _bot;
-    private readonly ResourceFetcher _fetcher;
-    private readonly ResourceCache _cache;
-    private readonly ResourcesSection _config;
-
-    public ResourceCollector(IBotContext bot, ResourceFetcher fetcher, ResourceCache cache, ResourcesSection config)
-    {
-        _bot = bot;
-        _fetcher = fetcher;
-        _cache = cache;
-        _config = config;
-    }
-
     /// <summary>
     /// 友聊入口。peerId 即对方 uid。
     /// </summary>
@@ -88,7 +79,7 @@ internal sealed class ResourceCollector
 
                 case ReplyIncomingSegment reply:
                     FlushText(textBuf, parts);
-                    if (depth < _config.RecursiveDepth)
+                    if (depth < config.RecursiveDepth)
                     {
                         var nested = await ExpandReplyAsync(reply, scene, peerId, depth + 1, ct).ConfigureAwait(false);
                         if (nested.Count > 0)
@@ -102,7 +93,7 @@ internal sealed class ResourceCollector
 
                 case ForwardIncomingSegment forward:
                     FlushText(textBuf, parts);
-                    if (depth < _config.RecursiveDepth)
+                    if (depth < config.RecursiveDepth)
                     {
                         var nested = await ExpandForwardAsync(forward, scene, peerId, depth + 1, ct).ConfigureAwait(false);
                         if (nested.Count > 0)
@@ -168,7 +159,7 @@ internal sealed class ResourceCollector
         {
             try
             {
-                var resp = await _bot.Message.GetResourceTempUrlAsync(image.ResourceId).ConfigureAwait(false);
+                var resp = await bot.Message.GetResourceTempUrlAsync(image.ResourceId).ConfigureAwait(false);
                 url = resp.Url;
             }
             catch (Exception ex)
@@ -180,7 +171,7 @@ internal sealed class ResourceCollector
 
         try
         {
-            var (bytes, contentType) = await _fetcher.DownloadImageAsync(url, ct).ConfigureAwait(false);
+            var (bytes, contentType) = await fetcher.DownloadImageAsync(url, ct).ConfigureAwait(false);
             if (bytes.Length == 0)
             {
                 BotLog.Warning("[AiChat] 下载到的图片为空。");
@@ -191,7 +182,7 @@ internal sealed class ResourceCollector
             var fallbackExt = TryParseExtensionFromUrl(url);
             var mime = MimeGuesser.ResolveImageMime(bytes, contentType, fallbackExt);
             var ext = MimeGuesser.ExtensionForMime(mime);
-            var path = await _cache.StoreAsync(bytes, ext, mime).ConfigureAwait(false);
+            var path = await cache.StoreAsync(bytes, ext, mime).ConfigureAwait(false);
 
             // 即使缓存写入失败 (path 为 null)，也把字节内联起来，保证本轮请求仍然能把图片发出去。
             return new ImagePart(path, mime, bytes.Length, InlineBytes: path is null ? bytes : null);
@@ -225,8 +216,8 @@ internal sealed class ResourceCollector
         CancellationToken ct)
     {
         // 仅当扩展名属于文本类、且大小符合限制时才尝试下载并读入正文。
-        var isLikelyText = MimeGuesser.IsLikelyTextExtension(file.FileName, _config.InlineTextExtensions);
-        var withinSize = file.FileSize <= _config.MaxInlineTextBytes;
+        var isLikelyText = MimeGuesser.IsLikelyTextExtension(file.FileName, config.InlineTextExtensions);
+        var withinSize = file.FileSize <= config.MaxInlineTextBytes;
 
         if (!isLikelyText || !withinSize)
         {
@@ -238,20 +229,20 @@ internal sealed class ResourceCollector
             string downloadUrl;
             if (scene == ChatScene.Friend)
             {
-                var resp = await _bot.File.GetPrivateFileDownloadUrlAsync(
+                var resp = await bot.File.GetPrivateFileDownloadUrlAsync(
                     new GetPrivateFileDownloadUrlRequest(peerId, file.FileId, file.FileHash ?? string.Empty))
                     .ConfigureAwait(false);
                 downloadUrl = resp.DownloadUrl;
             }
             else
             {
-                var resp = await _bot.File.GetGroupFileDownloadUrlAsync(
+                var resp = await bot.File.GetGroupFileDownloadUrlAsync(
                     new GetGroupFileDownloadUrlRequest(peerId, file.FileId))
                     .ConfigureAwait(false);
                 downloadUrl = resp.DownloadUrl;
             }
 
-            var (bytes, _) = await _fetcher.DownloadTextFileAsync(downloadUrl, ct).ConfigureAwait(false);
+            var (bytes, _) = await fetcher.DownloadTextFileAsync(downloadUrl, ct).ConfigureAwait(false);
 
             var text = TryDecodeText(bytes);
             if (text is null)
@@ -260,9 +251,9 @@ internal sealed class ResourceCollector
             }
 
             var truncated = false;
-            if (text.Length > _config.MaxFileExcerptChars)
+            if (text.Length > config.MaxFileExcerptChars)
             {
-                text = text[.._config.MaxFileExcerptChars];
+                text = text[..config.MaxFileExcerptChars];
                 truncated = true;
             }
 
@@ -318,7 +309,7 @@ internal sealed class ResourceCollector
             var sceneEnum = scene == ChatScene.Friend
                 ? GetMessageRequestMessageScene.Friend
                 : GetMessageRequestMessageScene.Group;
-            var resp = await _bot.Message.GetMessageAsync(sceneEnum, peerId, reply.MessageSeq).ConfigureAwait(false);
+            var resp = await bot.Message.GetMessageAsync(sceneEnum, peerId, reply.MessageSeq).ConfigureAwait(false);
 
             var segments = ExtractSegments(resp.Message);
             if (segments is not null)
@@ -344,7 +335,7 @@ internal sealed class ResourceCollector
         var aggregated = new List<ChatPart>();
         try
         {
-            var resp = await _bot.Message.GetForwardedMessagesAsync(forward.ForwardId).ConfigureAwait(false);
+            var resp = await bot.Message.GetForwardedMessagesAsync(forward.ForwardId).ConfigureAwait(false);
             foreach (var msg in resp.Messages)
             {
                 var who = string.IsNullOrEmpty(msg.SenderName) ? "unknown" : msg.SenderName;

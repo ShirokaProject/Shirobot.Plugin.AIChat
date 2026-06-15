@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
-using ShiroBot.SDK.Abstractions;
 
 namespace ShiroBot.AiChatPlugin.OpenAi;
 
@@ -52,7 +51,7 @@ internal sealed class StreamingChatContent : HttpContent
         await writer.WriteAsync(JsonEncode(msg.Role)).ConfigureAwait(false);
         await writer.WriteAsync(",\"content\":").ConfigureAwait(false);
 
-        if (!msg.HasImage && msg.Segments.Count == 1 && msg.Segments[0].Kind == SegmentKind.Text)
+        if (msg is { HasImage: false, Segments: [{ Kind: SegmentKind.Text }] })
         {
             // 纯文本消息：content 为 string
             await writer.WriteAsync(JsonEncode(msg.Segments[0].Text ?? "")).ConfigureAwait(false);

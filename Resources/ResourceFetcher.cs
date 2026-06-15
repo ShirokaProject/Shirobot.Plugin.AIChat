@@ -32,7 +32,7 @@ internal sealed class ResourceFetcher
     public async Task<(byte[] Bytes, string? ContentType)> DownloadTextFileAsync(string url, CancellationToken ct = default)
         => await DownloadAsync(url, _maxInlineTextBytes, ct).ConfigureAwait(false);
 
-    public async Task<(byte[] Bytes, string? ContentType)> DownloadAsync(string url, long maxBytes, CancellationToken ct = default)
+    private async Task<(byte[] Bytes, string? ContentType)> DownloadAsync(string url, long maxBytes, CancellationToken ct = default)
     {
         try
         {
