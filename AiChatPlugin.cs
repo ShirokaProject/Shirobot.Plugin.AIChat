@@ -16,14 +16,14 @@ namespace ShiroBot.AiChatPlugin;
 [BotPlugin(id: "AiChatPlugin",
     Name = "AI聊天插件",
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.0.0",
+    Author = "greepar",
+    Category = PluginCategory.Chat,
+    Version = "1.1.0",
     GithubRepo = "greepar/ShiroBot.Plugin.AiChat",
     IsPluginSingleFile = false)]
 public sealed class AiChatPlugin : PluginBase
 {
-    public override string Name => "AiChatPlugin";
-
-    private AiChatPluginConfig _config = new();
+    private PluginConfig _config = new();
     private IDisposable? _configWatchSubscription;
     private long _selfId;
 
@@ -40,10 +40,10 @@ public sealed class AiChatPlugin : PluginBase
     protected override async Task LoadAsync()
     {
         EnsureDefaultConfigTemplate();
-        _config = Context.Config.Load<AiChatPluginConfig>();
+        _config = Context.Config.Load<PluginConfig>();
         ApplyConfigDerivatives(initial: true);
 
-        _configWatchSubscription = Context.Config.Watch<AiChatPluginConfig>(updated =>
+        _configWatchSubscription = Context.Config.Watch<PluginConfig>(updated =>
         {
             _config = updated;
             ApplyConfigDerivatives(initial: false);
