@@ -3,7 +3,7 @@ namespace ShiroBot.AiChatPlugin.Config;
 /// <summary>
 /// AiChat 插件配置。
 /// </summary>
-public sealed class AiChatPluginConfig
+public sealed class PluginConfig
 {
     public DefaultSection Default { get; set; } = new();
     public List<ProviderEntry> Providers { get; set; } = [];
