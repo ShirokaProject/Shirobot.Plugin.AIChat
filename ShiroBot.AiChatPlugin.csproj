@@ -14,7 +14,12 @@
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
         </PackageReference>
-        <PackageReference Include="ShiroBot.SDK" Version="0.3.0" />
+        <ProjectReference Include="..\ShiroBot.SDK\ShiroBot.SDK.csproj">
+            <Private>false</Private>
+        </ProjectReference>
+        <ProjectReference Include="..\ShiroBot.Qq.Model\ShiroBot.Qq.Model.csproj">
+            <Private>false</Private>
+        </ProjectReference>
     </ItemGroup>
 
     <Target Name="RepackPlugin" AfterTargets="Publish" Condition="'$(Configuration)'=='Release'">

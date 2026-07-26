@@ -5,9 +5,10 @@ using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.AiChatPlugin.UserState;
-using ShiroBot.Model.Common;
+using ShiroBot.Qq.Model;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Core;
+using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
 namespace ShiroBot.AiChatPlugin;
@@ -25,7 +26,7 @@ public sealed class AiChatPlugin : PluginBase
 
     private AiChatPluginConfig _config = new();
     private IDisposable? _configWatchSubscription;
-    private long _selfId;
+    private string _selfId = string.Empty;
 
     private ConversationStore _conversations = null!;
     private UserSettingsStore _userSettings = null!;
@@ -54,18 +55,18 @@ public sealed class AiChatPlugin : PluginBase
         // 从配置了 fetch_models = true 的 provider 自动拉取模型列表
         await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
 
-        var loginInfo = await Context.System.GetLoginInfoAsync();
-        _selfId = loginInfo.Uin;
-        BotLog.Info($"[AiChat] 登录账号 {loginInfo.Nickname} ({_selfId})");
+        var self = await Context.User.GetSelfAsync();
+        _selfId = self.Id;
+        BotLog.Info($"[AiChat] 登录账号 {self.Name} ({_selfId})");
 
         // 私聊
-        FriendCommands.MapExact("#aihelp", HandleFriendHelpAsync);
-        FriendCommands.MapPrefix("#aimode", HandleFriendAiModeAsync);
-        FriendCommands.MapPrefix("#ai", HandleFriendAiAsync);
-        FriendCommands.MapPrefix("#prompt", HandleFriendPromptAsync);
-        FriendCommands.MapExact("#clear", HandleFriendClearAsync);
-        FriendCommands.MapPrefix("#model", HandleFriendModelAsync);
-        FriendCommands.MapExact("#refresh", HandleFriendRefreshAsync);
+        DirectCommands.MapExact("#aihelp", HandleFriendHelpAsync);
+        DirectCommands.MapPrefix("#aimode", HandleFriendAiModeAsync);
+        DirectCommands.MapPrefix("#ai", HandleFriendAiAsync);
+        DirectCommands.MapPrefix("#prompt", HandleFriendPromptAsync);
+        DirectCommands.MapExact("#clear", HandleFriendClearAsync);
+        DirectCommands.MapPrefix("#model", HandleFriendModelAsync);
+        DirectCommands.MapExact("#refresh", HandleFriendRefreshAsync);
 
         // 群聊
         GroupCommands.MapExact("#aihelp", HandleGroupHelpAsync);
@@ -285,13 +286,13 @@ public sealed class AiChatPlugin : PluginBase
 
     // -------- 帮助 --------
 
-    private Task HandleFriendHelpAsync(FriendIncomingMessage message)
+    private Task HandleFriendHelpAsync(MessageEvent message)
         => Context.Message.ReplyAsync(message, BuildHelpText());
 
-    private async Task HandleGroupHelpAsync(GroupIncomingMessage message)
+    private async Task HandleGroupHelpAsync(MessageEvent message)
     {
         var resp = await Context.Message.ReplyAsync(message, BuildHelpText()).ConfigureAwait(false);
-        ScheduleRecall(message.Group.GroupId, resp.MessageSeq, 30);
+        ScheduleRecall(message.Channel, resp.MessageId, 30);
     }
 
     private static string BuildHelpText() =>
@@ -317,17 +318,17 @@ public sealed class AiChatPlugin : PluginBase
 
     // -------- #ai --------
 
-    private async Task HandleFriendAiModeAsync(FriendIncomingMessage message)
+    private async Task HandleFriendAiModeAsync(MessageEvent message)
     {
         var arg = StripPrefix(message.GetPlainText(), "#aimode");
-        await ApplyAiModeAsync(message.SenderId, arg,
+        await ApplyAiModeAsync(SenderId(message), arg,
             reply => Context.Message.ReplyAsync(message, reply)).ConfigureAwait(false);
     }
 
-    private async Task HandleGroupAiModeAsync(GroupIncomingMessage message)
+    private async Task HandleGroupAiModeAsync(MessageEvent message)
     {
         var arg = StripPrefix(message.GetPlainText(), "#aimode");
-        await ApplyAiModeAsync(message.SenderId, arg,
+        await ApplyAiModeAsync(SenderId(message), arg,
             reply => ReplyToGroup(message, reply)).ConfigureAwait(false);
     }
 
@@ -364,52 +365,50 @@ public sealed class AiChatPlugin : PluginBase
         await reply($"已切换对话模式: {normalized} ({desc})").ConfigureAwait(false);
     }
 
-    private async Task HandleFriendAiAsync(FriendIncomingMessage message)
+    private async Task HandleFriendAiAsync(MessageEvent message)
     {
-        if (!CheckPermission(message.SenderId, out var deny))
+        if (!CheckPermission(SenderId(message), out var deny))
         {
             if (deny is not null) await Context.Message.ReplyAsync(message, deny);
             return;
         }
 
-        var key = ResolveConversationKey(ChatScene.Friend, message.PeerId, message.SenderId);
+        var key = ResolveConversationKey(ChatScene.Friend, PeerId(message), SenderId(message));
         await ProcessAiAsync(message, key, prefixToStrip: "#ai", isGroup: false).ConfigureAwait(false);
     }
 
-    private async Task HandleGroupAiAsync(GroupIncomingMessage message)
+    private async Task HandleGroupAiAsync(MessageEvent message)
     {
-        if (!CheckPermission(message.SenderId, out var deny))
+        if (!CheckPermission(SenderId(message), out var deny))
         {
             if (deny is not null) await ReplyToGroup(message, deny);
             return;
         }
 
-        var key = ResolveConversationKey(ChatScene.Group, message.PeerId, message.SenderId);
+        var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
         await ProcessAiAsync(message, key, prefixToStrip: "#ai", isGroup: true).ConfigureAwait(false);
     }
 
-    private async Task HandleGroupMentionAsync(GroupIncomingMessage message)
+    private async Task HandleGroupMentionAsync(MessageEvent message)
     {
-        if (!CheckPermission(message.SenderId, out var deny))
+        if (!CheckPermission(SenderId(message), out var deny))
         {
             if (deny is not null) await ReplyToGroup(message, deny);
             return;
         }
 
-        var key = ResolveConversationKey(ChatScene.Group, message.PeerId, message.SenderId);
+        var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
         // mention 时不需要去掉前缀，但要确保收集结果不为空
         await ProcessAiAsync(message, key, prefixToStrip: null, isGroup: true).ConfigureAwait(false);
     }
 
-    private async Task ProcessAiAsync(IncomingMessage message, ConversationKey key, string? prefixToStrip, bool isGroup)
+    private async Task ProcessAiAsync(MessageEvent message, ConversationKey key, string? prefixToStrip, bool isGroup)
     {
         var collector = new ResourceCollector(Context, _fetcher, _cache, _config.Resources);
         List<ChatPart> parts;
         try
         {
-            parts = isGroup
-                ? await collector.CollectAsync((GroupIncomingMessage)message).ConfigureAwait(false)
-                : await collector.CollectAsync((FriendIncomingMessage)message).ConfigureAwait(false);
+            parts = await collector.CollectAsync(message).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -439,9 +438,7 @@ public sealed class AiChatPlugin : PluginBase
             return;
         }
 
-        var senderId = isGroup
-            ? ((GroupIncomingMessage)message).SenderId
-            : ((FriendIncomingMessage)message).SenderId;
+        var senderId = SenderId(message);
         var settings = _userSettings.GetOrCreate(senderId);
         var chatMode = settings.ChatMode ?? _config.Default.DefaultChatMode;
 
@@ -515,8 +512,8 @@ public sealed class AiChatPlugin : PluginBase
                     systemPrompt += "\n" + RenderPromptPlaceholders(_config.Default.SharedPromptSuffix, message);
                 }
 
-                var userParts = isSharedMode && message is GroupIncomingMessage groupMessage
-                    ? AddSharedSpeakerPrefix(parts, groupMessage)
+                var userParts = isSharedMode && !message.IsDirect
+                    ? AddSharedSpeakerPrefix(parts, message)
                     : parts;
                 var userTurn = new ChatTurn("user", userParts, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
@@ -584,29 +581,29 @@ public sealed class AiChatPlugin : PluginBase
 
     // -------- #prompt --------
 
-    private async Task HandleFriendPromptAsync(FriendIncomingMessage message)
+    private async Task HandleFriendPromptAsync(MessageEvent message)
     {
         var arg = StripPrefix(message.GetPlainText(), "#prompt");
-        await ApplyPromptAsync(message.SenderId, arg, async reply =>
+        await ApplyPromptAsync(SenderId(message), arg, async reply =>
             await Context.Message.ReplyAsync(message, reply)).ConfigureAwait(false);
     }
 
-    private async Task HandleGroupPromptAsync(GroupIncomingMessage message)
+    private async Task HandleGroupPromptAsync(MessageEvent message)
     {
-        var settings = _userSettings.GetOrCreate(message.SenderId);
+        var settings = _userSettings.GetOrCreate(SenderId(message));
         var mode = settings.ChatMode ?? _config.Default.DefaultChatMode;
         var arg = StripPrefix(message.GetPlainText(), "#prompt");
 
         // shared 模式：修改/重置操作写入共享会话，仅 admin 可操作
         if (mode == "shared")
         {
-            if (!string.IsNullOrEmpty(arg) && !Context.IsAdmin(message.SenderId))
+            if (!string.IsNullOrEmpty(arg) && !Context.IsAdmin(message.Sender.Id))
             {
                 await ReplyToGroup(message, "共享模式下仅管理员可修改 system prompt。").ConfigureAwait(false);
                 return;
             }
 
-            var key = ResolveConversationKey(ChatScene.Group, message.PeerId, message.SenderId);
+            var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
             var convo = await _conversations.AcquireAsync(key).ConfigureAwait(false);
             try
             {
@@ -636,7 +633,7 @@ public sealed class AiChatPlugin : PluginBase
             return;
         }
 
-        await ApplyPromptAsync(message.SenderId, arg, async reply =>
+        await ApplyPromptAsync(SenderId(message), arg, async reply =>
             await ReplyToGroup(message, reply)).ConfigureAwait(false);
     }
 
@@ -671,26 +668,26 @@ public sealed class AiChatPlugin : PluginBase
 
     // -------- #clear --------
 
-    private async Task HandleFriendClearAsync(FriendIncomingMessage message)
+    private async Task HandleFriendClearAsync(MessageEvent message)
     {
-        var key = ResolveConversationKey(ChatScene.Friend, message.PeerId, message.SenderId);
+        var key = ResolveConversationKey(ChatScene.Friend, PeerId(message), SenderId(message));
         _conversations.Clear(key);
         await Context.Message.ReplyAsync(message, "已清空当前会话。").ConfigureAwait(false);
     }
 
-    private async Task HandleGroupClearAsync(GroupIncomingMessage message)
+    private async Task HandleGroupClearAsync(MessageEvent message)
     {
-        var settings = _userSettings.GetOrCreate(message.SenderId);
+        var settings = _userSettings.GetOrCreate(SenderId(message));
         var mode = settings.ChatMode ?? _config.Default.DefaultChatMode;
 
         // shared 模式下只有 owner/admin 能清空共享会话
-        if (mode == "shared" && !Context.IsAdmin(message.SenderId))
+        if (mode == "shared" && !Context.IsAdmin(message.Sender.Id))
         {
             await ReplyToGroup(message, "共享模式下仅管理员可清空会话。").ConfigureAwait(false);
             return;
         }
 
-        var key = ResolveConversationKey(ChatScene.Group, message.PeerId, message.SenderId);
+        var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
         _conversations.Clear(key);
 
         var hint = mode == "shared" ? "已清空本群共享会话。" : "已清空你在本群的会话。";
@@ -699,9 +696,9 @@ public sealed class AiChatPlugin : PluginBase
 
     // -------- #refresh --------
 
-    private async Task HandleFriendRefreshAsync(FriendIncomingMessage message)
+    private async Task HandleFriendRefreshAsync(MessageEvent message)
     {
-        if (!CheckPermission(message.SenderId, out var deny))
+        if (!CheckPermission(SenderId(message), out var deny))
         {
             if (deny is not null) await Context.Message.ReplyAsync(message, deny);
             return;
@@ -710,9 +707,9 @@ public sealed class AiChatPlugin : PluginBase
         await RefreshModelsAsync(reply => Context.Message.ReplyAsync(message, reply)).ConfigureAwait(false);
     }
 
-    private async Task HandleGroupRefreshAsync(GroupIncomingMessage message)
+    private async Task HandleGroupRefreshAsync(MessageEvent message)
     {
-        if (!CheckPermission(message.SenderId, out var deny))
+        if (!CheckPermission(SenderId(message), out var deny))
         {
             if (deny is not null) await ReplyToGroup(message, deny);
             return;
@@ -737,42 +734,42 @@ public sealed class AiChatPlugin : PluginBase
 
     // -------- #model --------
 
-    private async Task HandleFriendModelAsync(FriendIncomingMessage message)
+    private async Task HandleFriendModelAsync(MessageEvent message)
     {
         var arg = StripPrefix(message.GetPlainText(), "#model");
-        await ApplyModelAsync(message.SenderId, arg, isAdmin: Context.IsAdmin(message.SenderId),
+        await ApplyModelAsync(SenderId(message), arg, isAdmin: Context.IsAdmin(message.Sender.Id),
             reply => Context.Message.ReplyAsync(message, reply)).ConfigureAwait(false);
     }
 
-    private async Task HandleGroupModelAsync(GroupIncomingMessage message)
+    private async Task HandleGroupModelAsync(MessageEvent message)
     {
-        var settings = _userSettings.GetOrCreate(message.SenderId);
+        var settings = _userSettings.GetOrCreate(SenderId(message));
         var mode = settings.ChatMode ?? _config.Default.DefaultChatMode;
         var arg = StripPrefix(message.GetPlainText(), "#model");
 
         // shared 模式：修改操作写入共享会话，仅 admin 可操作
         if (mode == "shared")
         {
-            if (!string.IsNullOrEmpty(arg) && !Context.IsAdmin(message.SenderId))
+            if (!string.IsNullOrEmpty(arg) && !Context.IsAdmin(message.Sender.Id))
             {
                 await ReplyToGroup(message, "共享模式下仅管理员可切换模型。").ConfigureAwait(false);
                 return;
             }
 
-            var key = ResolveConversationKey(ChatScene.Group, message.PeerId, message.SenderId);
+            var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
             var convo = await _conversations.AcquireAsync(key).ConfigureAwait(false);
             try
             {
                 if (string.IsNullOrEmpty(arg))
                 {
                     // 查看列表，30s 后撤回
-                    await ApplyModelAsync(message.SenderId, arg, isAdmin: Context.IsAdmin(message.SenderId),
+                    await ApplyModelAsync(SenderId(message), arg, isAdmin: Context.IsAdmin(message.Sender.Id),
                         async reply =>
                         {
                             var currentShared = FormatSelectedModel(convo.SharedModel, includeDefaultMark: true);
                             var fullReply = $"{reply}\n当前共享模型: {currentShared}";
                             var resp = await Context.Message.ReplyAsync(message, fullReply).ConfigureAwait(false);
-                            ScheduleRecall(message.Group.GroupId, resp.MessageSeq, 30);
+                            ScheduleRecall(message.Channel, resp.MessageId, 30);
                         }).ConfigureAwait(false);
                     return;
                 }
@@ -793,7 +790,7 @@ public sealed class AiChatPlugin : PluginBase
                 }
 
                 if (_config.Permissions.AdminOnlyModels.Contains(target.Name, StringComparer.OrdinalIgnoreCase) &&
-                    !Context.IsAdmin(message.SenderId))
+                    !Context.IsAdmin(message.Sender.Id))
                 {
                     await ReplyToGroup(message, $"模型 {target.Name} 仅管理员可切换。").ConfigureAwait(false);
                     return;
@@ -813,16 +810,16 @@ public sealed class AiChatPlugin : PluginBase
         // 非 shared 模式
         if (string.IsNullOrEmpty(arg))
         {
-            await ApplyModelAsync(message.SenderId, arg, isAdmin: Context.IsAdmin(message.SenderId),
+            await ApplyModelAsync(SenderId(message), arg, isAdmin: Context.IsAdmin(message.Sender.Id),
                 async reply =>
                 {
                     var resp = await Context.Message.ReplyAsync(message, reply).ConfigureAwait(false);
-                    ScheduleRecall(message.Group.GroupId, resp.MessageSeq, 30);
+                    ScheduleRecall(message.Channel, resp.MessageId, 30);
                 }).ConfigureAwait(false);
             return;
         }
 
-        await ApplyModelAsync(message.SenderId, arg, isAdmin: Context.IsAdmin(message.SenderId),
+        await ApplyModelAsync(SenderId(message), arg, isAdmin: Context.IsAdmin(message.Sender.Id),
             reply => ReplyToGroup(message, reply)).ConfigureAwait(false);
     }
 
@@ -956,6 +953,12 @@ public sealed class AiChatPlugin : PluginBase
         }
     }
 
+    private static long SenderId(MessageEvent message) =>
+        long.TryParse(message.Sender.Id, out var id) ? id : message.Sender.Id.GetHashCode();
+
+    private static long PeerId(MessageEvent message) =>
+        long.TryParse(message.Channel.Id, out var id) ? id : message.Channel.Id.GetHashCode();
+
     private bool CheckPermission(long userId, out string? denyReason)
     {
         denyReason = null;
@@ -972,14 +975,10 @@ public sealed class AiChatPlugin : PluginBase
         return true;
     }
 
-    private static List<ChatPart> AddSharedSpeakerPrefix(List<ChatPart> parts, GroupIncomingMessage message)
+    private static List<ChatPart> AddSharedSpeakerPrefix(List<ChatPart> parts, MessageEvent message)
     {
-        var displayName = !string.IsNullOrWhiteSpace(message.GroupMember.Card)
-            ? message.GroupMember.Card
-            : !string.IsNullOrWhiteSpace(message.GroupMember.Nickname)
-                ? message.GroupMember.Nickname
-                : message.SenderId.ToString();
-        var prefix = $"[{displayName}/{message.SenderId}] ";
+        var displayName = message.Member?.DisplayName ?? message.Sender.Name ?? message.Sender.Id;
+        var prefix = $"[{displayName}/{message.Sender.Id}] ";
 
         var result = new List<ChatPart>(parts.Count + 1);
         var prefixed = false;
@@ -1004,7 +1003,7 @@ public sealed class AiChatPlugin : PluginBase
         return result;
     }
 
-    private static string RenderPromptPlaceholders(string prompt, IncomingMessage message)
+    private static string RenderPromptPlaceholders(string prompt, MessageEvent message)
     {
         var now = DateTimeOffset.Now;
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -1018,19 +1017,17 @@ public sealed class AiChatPlugin : PluginBase
             ["card"] = string.Empty
         };
 
-        switch (message)
+        values["userid"] = message.Sender.Id;
+        if (message.IsDirect)
         {
-            case GroupIncomingMessage group:
-                values["userid"] = group.SenderId.ToString();
-                values["groupname"] = group.Group.GroupName;
-                values["groupid"] = group.Group.GroupId.ToString();
-                values["nickname"] = group.GroupMember.Nickname;
-                values["card"] = group.GroupMember.Card;
-                break;
-            case FriendIncomingMessage friend:
-                values["userid"] = friend.SenderId.ToString();
-                values["nickname"] = friend.Friend.Nickname;
-                break;
+            values["nickname"] = message.Sender.Name ?? string.Empty;
+        }
+        else
+        {
+            values["groupname"] = message.Channel.Name ?? string.Empty;
+            values["groupid"] = message.Channel.Id;
+            values["nickname"] = message.Sender.Name ?? string.Empty;
+            values["card"] = message.Member?.Nick ?? string.Empty;
         }
 
         foreach (var (key, value) in values)
@@ -1488,34 +1485,36 @@ public sealed class AiChatPlugin : PluginBase
         }
     }
 
-    private async Task ReplyAsync(IncomingMessage message, bool isGroup, string text)
+    private async Task ReplyAsync(MessageEvent message, bool isGroup, string text)
     {
         if (isGroup)
         {
-            await ReplyToGroup((GroupIncomingMessage)message, text).ConfigureAwait(false);
+            await ReplyToGroup(message, text).ConfigureAwait(false);
         }
         else
         {
-            await Context.Message.ReplyAsync((FriendIncomingMessage)message, text).ConfigureAwait(false);
+            await Context.Message.ReplyAsync(message, text).ConfigureAwait(false);
         }
     }
 
-    private Task ReplyToGroup(GroupIncomingMessage message, string text)
+    private Task ReplyToGroup(MessageEvent message, string text)
     {
-        return _config.Behaviour.ReplyWithQuote ? Context.Message.QuoteReplyAsync(message, new TextOutgoingSegment(text)) : Context.Message.ReplyAsync(message, text);
+        return _config.Behaviour.ReplyWithQuote
+            ? Context.Message.QuoteReplyAsync(message, text)
+            : Context.Message.ReplyAsync(message, text);
     }
 
     /// <summary>
     /// 延迟指定秒数后撤回群消息。fire-and-forget，失败静默。
     /// </summary>
-    private void ScheduleRecall(long groupId, long messageSeq, int delaySeconds)
+    private void ScheduleRecall(Channel channel, string messageId, int delaySeconds)
     {
         _ = Task.Run(async () =>
         {
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(delaySeconds)).ConfigureAwait(false);
-                await Context.Message.RecallGroupMessageAsync(groupId, messageSeq).ConfigureAwait(false);
+                await Context.Message.DeleteMessageAsync(channel, messageId).ConfigureAwait(false);
             }
             catch
             {
