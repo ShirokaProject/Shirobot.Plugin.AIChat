@@ -5,54 +5,15 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-        <HostPluginDir>..\ShiroBot\bin\Debug\$(TargetFramework)\plugins\$(AssemblyName)\</HostPluginDir>
+        <HostPluginDir>..\..\ShiroBot\Core\bin\Debug\$(TargetFramework)\plugins\$(AssemblyName)\</HostPluginDir>
         <Configurations>Debug;DebugPlugin;DebugAdapter;DebugAll;Release</Configurations>
+        <ShiroBotPluginPackagingEnabled>true</ShiroBotPluginPackagingEnabled>
+        <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram</ShiroBotPluginSharedAssemblies>
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="ILRepack.Lib.MSBuild.Task" Version="2.0.45">
-            <PrivateAssets>all</PrivateAssets>
-            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-        </PackageReference>
-        <ProjectReference Include="..\ShiroBot.SDK\ShiroBot.SDK.csproj">
-            <Private>false</Private>
-        </ProjectReference>
-        <ProjectReference Include="..\ShiroBot.Qq.Model\ShiroBot.Qq.Model.csproj">
-            <Private>false</Private>
-        </ProjectReference>
+        <PackageReference Include="ShiroBot.SDK" Version="0.9.1" />
     </ItemGroup>
-
-    <Target Name="RepackPlugin" AfterTargets="Publish" Condition="'$(Configuration)'=='Release'">
-        <PropertyGroup>
-            <MergedPluginFile>$(PublishDir)$(AssemblyName).merged.dll</MergedPluginFile>
-        </PropertyGroup>
-
-        <ItemGroup>
-            <RepackInput Include="$(PublishDir)$(AssemblyName).dll" />
-            <RepackDependency Include="$(PublishDir)*.dll"
-                              Exclude="$(PublishDir)$(AssemblyName).dll;
-                                       $(PublishDir)ShiroBot.SDK.dll;
-                                       $(PublishDir)ShiroBot.Model.dll;
-                                       $(PublishDir)Microsoft*.dll;
-                                       $(PublishDir)System*.dll;
-                                       $(PublishDir)mscorlib.dll;
-                                       $(PublishDir)netstandard.dll" />
-            <RepackInput Include="@(RepackDependency)" />
-        </ItemGroup>
-
-        <ILRepack
-                TargetKind="Dll"
-                OutputFile="$(MergedPluginFile)"
-                InputAssemblies="@(RepackInput)"
-                LibraryPath="$(PublishDir)"
-                Internalize="true"
-                Parallel="true"
-                DebugInfo="true" />
-
-        <Copy SourceFiles="$(MergedPluginFile)" DestinationFiles="$(PublishDir)$(AssemblyName).dll" OverwriteReadOnlyFiles="true" />
-        <Delete Files="$(MergedPluginFile)" />
-        <Delete Files="@(RepackDependency)" />
-    </Target>
 
     <Target Name="CopyPluginToHost"
             AfterTargets="Build"
@@ -61,9 +22,12 @@
 
         <ItemGroup>
             <PluginDebugOutput Include="$(TargetDir)**\*"
-                               Exclude="$(TargetDir)ShiroBot.SDK.dll;$(TargetDir)ShiroBot.SDK.pdb;$(TargetDir)ShiroBot.Model.dll;$(TargetDir)ShiroBot.Model.pdb" />
+                               Exclude="$(TargetDir)ShiroBot.SDK.dll;$(TargetDir)ShiroBot.SDK.pdb;$(TargetDir)ShiroBot.Model.QQ.dll;$(TargetDir)ShiroBot.Model.QQ.pdb;$(TargetDir)Avalonia*.dll;$(TargetDir)Avalonia*.pdb;$(TargetDir)HarfBuzzSharp.dll;$(TargetDir)HarfBuzzSharp.pdb;$(TargetDir)MicroCom.Runtime.dll;$(TargetDir)MicroCom.Runtime.pdb;$(TargetDir)SkiaSharp.dll;$(TargetDir)SkiaSharp.pdb;$(TargetDir)runtimes\**\*" />
+            <HostProvidedOutput Include="$(HostPluginDir)Avalonia*.dll;$(HostPluginDir)Avalonia*.pdb;$(HostPluginDir)HarfBuzzSharp.dll;$(HostPluginDir)HarfBuzzSharp.pdb;$(HostPluginDir)MicroCom.Runtime.dll;$(HostPluginDir)MicroCom.Runtime.pdb;$(HostPluginDir)SkiaSharp.dll;$(HostPluginDir)SkiaSharp.pdb" />
         </ItemGroup>
 
+        <Delete Files="@(HostProvidedOutput)" />
+        <RemoveDir Directories="$(HostPluginDir)runtimes" />
         <Copy SourceFiles="@(PluginDebugOutput)"
               DestinationFiles="@(PluginDebugOutput->'$(HostPluginDir)%(RecursiveDir)%(Filename)%(Extension)')"
               SkipUnchangedFiles="true" />

@@ -44,6 +44,18 @@ jobs:
             ls -la "$PUBLISH_DIR"
             exit 1
           fi
+
+          unexpected_dlls=()
+          for dll in "$PUBLISH_DIR"/*.dll; do
+            [ -e "$dll" ] || continue
+            [ "$dll" = "$PLUGIN_DLL" ] || unexpected_dlls+=("$dll")
+          done
+          if [ "${#unexpected_dlls[@]}" -ne 0 ]; then
+            echo "Publish output contains DLLs other than the single-file plugin:"
+            printf '%s\n' "${unexpected_dlls[@]}"
+            exit 1
+          fi
+
           mkdir -p release
           cp "$PLUGIN_DLL" release/
 

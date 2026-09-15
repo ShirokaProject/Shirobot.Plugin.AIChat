@@ -1,7 +1,7 @@
 using System.Text;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
-using ShiroBot.Qq.Model;
+using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
@@ -116,7 +116,7 @@ internal sealed class ResourceCollector(
     {
         switch (raw.Payload)
         {
-            case QqForwardIncoming forward when depth < config.RecursiveDepth:
+            case QIncomingForward forward when depth < config.RecursiveDepth:
                 FlushText(textBuf, parts);
                 var nested = await ExpandForwardAsync(forward, context, depth + 1, ct).ConfigureAwait(false);
                 if (nested.Count > 0)
@@ -127,19 +127,19 @@ internal sealed class ResourceCollector(
                 }
                 break;
 
-            case QqMarketFaceIncoming market:
+            case QIncomingMarketFace market:
                 textBuf.Append($"[商城表情:{market.Url}]");
                 break;
 
-            case QqLightAppIncoming:
+            case QIncomingLightApp:
                 textBuf.Append("[小程序卡片]");
                 break;
 
-            case QqXmlIncoming:
+            case QIncomingXml:
                 textBuf.Append("[XML卡片]");
                 break;
 
-            case QqMarkdownIncoming markdown:
+            case QIncomingMarkdown markdown:
                 textBuf.Append(markdown.Content);
                 break;
 
@@ -271,7 +271,7 @@ internal sealed class ResourceCollector(
         }
     }
 
-    /// <summary>入站文件段的下载 URL:优先直接用 Uri;QQ 平台经 IQqFileApi 换取。</summary>
+    /// <summary>入站文件段的下载 URL:优先直接用 Uri;QQ 平台经 IQFileApi 换取。</summary>
     private async Task<string?> ResolveFileDownloadUrlAsync(FileSegment file, MessageEvent context)
     {
         if (!string.IsNullOrWhiteSpace(file.Uri))
@@ -284,7 +284,7 @@ internal sealed class ResourceCollector(
             return null;
         }
 
-        var qqFile = bot.GetAdapterExtension<IQqFileApi>();
+        var qqFile = bot.GetAdapterExtension<IQFileApi>();
         if (qqFile is null || !long.TryParse(context.Channel.Id, out var peerId))
         {
             return null;
@@ -293,8 +293,8 @@ internal sealed class ResourceCollector(
         if (context.IsDirect)
         {
             // QQ 私聊文件需要 fileHash,从 Raw 里的原始段找
-            var fileHash = (context.Raw as QqIncomingMessage)?
-                .Segments.OfType<QqFileIncoming>()
+            var fileHash = (context.Raw as QIncomingMessage)?
+                .Segments.OfType<QIncomingFile>()
                 .FirstOrDefault(item => item.FileId == file.ResourceId)?.FileHash ?? string.Empty;
             return await qqFile.GetPrivateFileDownloadUrlAsync(peerId, file.ResourceId, fileHash).ConfigureAwait(false);
         }
@@ -355,13 +355,13 @@ internal sealed class ResourceCollector(
     }
 
     private async Task<List<ChatPart>> ExpandForwardAsync(
-        QqForwardIncoming forward,
+        QIncomingForward forward,
         MessageEvent context,
         int depth,
         CancellationToken ct)
     {
         var aggregated = new List<ChatPart>();
-        var qqMessage = bot.GetAdapterExtension<IQqMessageApi>();
+        var qqMessage = bot.GetAdapterExtension<IQMessageApi>();
         if (qqMessage is null)
         {
             return aggregated;
@@ -388,7 +388,7 @@ internal sealed class ResourceCollector(
 
     /// <summary>合并转发内部消息用 QQ 原生段,做一次轻量转换(文本/图片,其余占位)。</summary>
     private async Task<List<ChatPart>> CollectQqSegmentsAsync(
-        IReadOnlyList<QqIncomingSegment> segments,
+        IReadOnlyList<QIncomingSegment> segments,
         CancellationToken ct)
     {
         var parts = new List<ChatPart>();
@@ -399,13 +399,13 @@ internal sealed class ResourceCollector(
             ct.ThrowIfCancellationRequested();
             switch (seg)
             {
-                case QqTextIncoming text:
+                case QIncomingText text:
                     textBuf.Append(text.Text);
                     break;
-                case QqMentionIncoming mention:
+                case QIncomingMention mention:
                     textBuf.Append('@').Append(mention.Name).Append(' ');
                     break;
-                case QqImageIncoming image:
+                case QIncomingImage image:
                     FlushText(textBuf, parts);
                     var imagePart = await TryDownloadImageAsync(
                         new ImageSegment(image.TempUrl) { ResourceId = image.ResourceId, Summary = image.Summary },
@@ -415,13 +415,13 @@ internal sealed class ResourceCollector(
                         parts.Add(imagePart);
                     }
                     break;
-                case QqFaceIncoming face:
+                case QIncomingFace face:
                     textBuf.Append($"[表情:{face.FaceId}]");
                     break;
-                case QqVideoIncoming:
+                case QIncomingVideo:
                     textBuf.Append("[视频]");
                     break;
-                case QqRecordIncoming:
+                case QIncomingRecord:
                     textBuf.Append("[语音]");
                     break;
                 default:

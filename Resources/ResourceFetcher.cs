@@ -5,15 +5,15 @@ namespace ShiroBot.AiChatPlugin.Resources;
 /// <summary>
 /// HTTP 下载器。共享一个 HttpClient 实例。
 /// </summary>
-internal sealed class ResourceFetcher
+internal sealed class ResourceFetcher : IDisposable
 {
     private readonly HttpClient _http;
     private readonly long _maxImageBytes;
     private readonly long _maxInlineTextBytes;
 
-    public ResourceFetcher(int timeoutSeconds, long maxImageBytes, long maxInlineTextBytes)
+    public ResourceFetcher(int timeoutSeconds, long maxImageBytes, long maxInlineTextBytes, string httpProxy)
     {
-        _http = new HttpClient
+        _http = new HttpClient(HttpProxy.CreateHandler(httpProxy))
         {
             Timeout = TimeSpan.FromSeconds(Math.Max(5, timeoutSeconds))
         };
@@ -22,6 +22,8 @@ internal sealed class ResourceFetcher
         _maxImageBytes = maxImageBytes;
         _maxInlineTextBytes = maxInlineTextBytes;
     }
+
+    public void Dispose() => _http.Dispose();
 
     /// <summary>
     /// 下载并返回 (字节流, contentType)。超过 imageMaxBytes 会抛 <see cref="InvalidOperationException"/>。

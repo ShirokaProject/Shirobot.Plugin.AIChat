@@ -39,6 +39,9 @@ internal sealed class OpenAiResponseMessage
 
     [JsonPropertyName("content")]
     public string? Content { get; set; }
+
+    [JsonPropertyName("tool_calls")]
+    public List<OpenAiToolCall>? ToolCalls { get; set; }
 }
 
 internal sealed class OpenAiError

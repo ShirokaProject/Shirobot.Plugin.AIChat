@@ -5,11 +5,15 @@ using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.AiChatPlugin.UserState;
-using ShiroBot.Qq.Model;
+using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
+
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.2.0")]
+[assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.1")]
+[assembly: ShiroBotApiCompatibility("0.9", "0.9")]
 
 namespace ShiroBot.AiChatPlugin;
 
@@ -17,16 +21,17 @@ namespace ShiroBot.AiChatPlugin;
 [BotPlugin(id: "AiChatPlugin",
     Name = "AI聊天插件",
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.0.0",
+    Version = "1.2.0",
     GithubRepo = "greepar/ShiroBot.Plugin.AiChat",
-    IsPluginSingleFile = false)]
+    IsPluginSingleFile = true,
+    SharedAssemblies = "ShiroBot.Model.QQ")]
 public sealed class AiChatPlugin : PluginBase
 {
     public override string Name => "AiChatPlugin";
 
     private AiChatPluginConfig _config = new();
     private IDisposable? _configWatchSubscription;
-    private string _selfId = string.Empty;
+    private readonly Dictionary<string, string> _selfNames = new(StringComparer.OrdinalIgnoreCase);
 
     private ConversationStore _conversations = null!;
     private UserSettingsStore _userSettings = null!;
@@ -34,6 +39,7 @@ public sealed class AiChatPlugin : PluginBase
     private ResourceFetcher _fetcher = null!;
     private ResourceCache _cache = null!;
     private SemaphoreSlim _globalConcurrency = null!;
+    private TavilySearchClient? _tavily;
 
     private string PluginRoot => Path.GetDirectoryName(Context.Config.ConfigPath)
                                  ?? AppContext.BaseDirectory;
@@ -55,10 +61,6 @@ public sealed class AiChatPlugin : PluginBase
         // 从配置了 fetch_models = true 的 provider 自动拉取模型列表
         await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
 
-        var self = await Context.User.GetSelfAsync();
-        _selfId = self.Id;
-        BotLog.Info($"[AiChat] 登录账号 {self.Name} ({_selfId})");
-
         // 私聊
         DirectCommands.MapExact("#aihelp", HandleFriendHelpAsync);
         DirectCommands.MapPrefix("#aimode", HandleFriendAiModeAsync);
@@ -76,7 +78,7 @@ public sealed class AiChatPlugin : PluginBase
         GroupCommands.MapExact("#clear", HandleGroupClearAsync);
         GroupCommands.MapPrefix("#model", HandleGroupModelAsync);
         GroupCommands.MapExact("#refresh", HandleGroupRefreshAsync);
-        GroupCommands.MapMention(_selfId, HandleGroupMentionAsync);
+        GroupCommands.MapWhen(message => !string.IsNullOrWhiteSpace(message.SelfId) && message.HasMention(message.SelfId), HandleGroupMentionAsync);
 
         BotLog.Info("[AiChat] 插件已加载。");
     }
@@ -111,12 +113,16 @@ public sealed class AiChatPlugin : PluginBase
         [default]
         # 默认模型名（需在 [[models]] 或 provider fetch 中存在）
         model = "gpt-4o-mini"
-        # 默认 system prompt。支持占位符: {time}, {date}, {groupname}, {groupid}, {userid}, {nickname}, {card}
-        default_prompt = "当前时间: {time}\n你是一个乐于助人的助手。"
-        # shared 模式额外追加的 system prompt。支持同样的占位符；留空则不追加。
-        shared_prompt_suffix = "你正在群聊 {groupname} 中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。"
+        # 默认 system prompt。保持稳定以提高上游前缀缓存命中率；动态时间和会话信息会附在每条用户消息末尾。
+        default_prompt = "你是一个乐于助人的助手。"
+        # shared 模式额外追加的稳定 system prompt；留空则不追加。
+        shared_prompt_suffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。"
         # 请求超时（秒）
-        timeout_seconds = 120
+        timeout_seconds = 60
+        # 超时或临时网络失败时的总尝试次数（含首次请求）
+        retry_on_timeout_max_attempts = 3
+        # 重试前的基础等待毫秒数；后续重试线性递增
+        retry_on_timeout_delay_ms = 1000
         # 全局最大并发请求数
         max_concurrency = 4
         # 默认对话模式: single(单次) / multi(用户独立多轮) / shared(群聊共享)
@@ -129,6 +135,8 @@ public sealed class AiChatPlugin : PluginBase
         max_tokens = 16000
         # 是否落盘到 JSONL
         persist = true
+        # 后续请求中重新发送图片的最近用户轮次数；0 表示只保留文字摘要
+        image_memory_turns = 1
 
         [resources]
         # 单张图片最大字节
@@ -157,6 +165,18 @@ public sealed class AiChatPlugin : PluginBase
         deny_users = []
         # 这些模型仅 owner/admin 可切换
         admin_only_models = []
+
+        [tavily]
+        # Tavily API key。留空时不会向模型暴露网络搜索工具。
+        api_key = ""
+        # 单次搜索返回的最大结果数（1-5）
+        max_results = 5
+        # 搜索深度: basic / advanced
+        search_depth = "basic"
+
+        [network]
+        # 所有上游 HTTP 请求共用的可选代理，例如 http://127.0.0.1:7890；留空直连
+        http_proxy = ""
 
         # ─── Provider 定义 ───────────────────────────────────────────
         # 每个 provider 有独立的 base_url 和 api_key。
@@ -209,16 +229,21 @@ public sealed class AiChatPlugin : PluginBase
         }
 
         // 这些是无状态的，重建无副作用。
-        _openAi = new OpenAiClient(_config.Default.TimeoutSeconds);
+        _openAi?.Dispose();
+        _openAi = new OpenAiClient(_config.Default.TimeoutSeconds, _config.Network.HttpProxy);
         _openAi.RegisterProviders(_config.Providers);
+        _fetcher?.Dispose();
         _fetcher = new ResourceFetcher(
             _config.Resources.DownloadTimeoutSeconds,
             _config.Resources.MaxImageBytes,
-            _config.Resources.MaxInlineTextBytes);
+            _config.Resources.MaxInlineTextBytes,
+            _config.Network.HttpProxy);
         _cache = new ResourceCache(
             pluginRoot,
             _config.Resources.CacheDir,
             _config.Resources.CacheMaxAgeDays);
+        _tavily?.Dispose();
+        _tavily = new TavilySearchClient(_config.Tavily, _config.Network.HttpProxy);
         _ = _cache.CleanupAsync();
 
         if (initial)
@@ -374,7 +399,7 @@ public sealed class AiChatPlugin : PluginBase
         }
 
         var key = ResolveConversationKey(ChatScene.Friend, PeerId(message), SenderId(message));
-        await ProcessAiAsync(message, key, prefixToStrip: "#ai", isGroup: false).ConfigureAwait(false);
+        await ProcessAiAsync(message, key, prefixToStrip: "#ai", isGroup: false, invokedByMention: false).ConfigureAwait(false);
     }
 
     private async Task HandleGroupAiAsync(MessageEvent message)
@@ -386,7 +411,7 @@ public sealed class AiChatPlugin : PluginBase
         }
 
         var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
-        await ProcessAiAsync(message, key, prefixToStrip: "#ai", isGroup: true).ConfigureAwait(false);
+        await ProcessAiAsync(message, key, prefixToStrip: "#ai", isGroup: true, invokedByMention: false).ConfigureAwait(false);
     }
 
     private async Task HandleGroupMentionAsync(MessageEvent message)
@@ -398,17 +423,25 @@ public sealed class AiChatPlugin : PluginBase
         }
 
         var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
-        // mention 时不需要去掉前缀，但要确保收集结果不为空
-        await ProcessAiAsync(message, key, prefixToStrip: null, isGroup: true).ConfigureAwait(false);
+        // 移除触发本次路由的自身 @，避免模型把机器人名称误认成第三方。
+        await ProcessAiAsync(message, key, prefixToStrip: null, isGroup: true, invokedByMention: true).ConfigureAwait(false);
     }
 
-    private async Task ProcessAiAsync(MessageEvent message, ConversationKey key, string? prefixToStrip, bool isGroup)
+    private async Task ProcessAiAsync(
+        MessageEvent message,
+        ConversationKey key,
+        string? prefixToStrip,
+        bool isGroup,
+        bool invokedByMention)
     {
         var collector = new ResourceCollector(Context, _fetcher, _cache, _config.Resources);
         List<ChatPart> parts;
         try
         {
-            parts = await collector.CollectAsync(message).ConfigureAwait(false);
+            var input = invokedByMention
+                ? message with { Segments = message.Segments.Where(segment => segment is not MentionSegment mention || mention.UserId != message.SelfId).ToArray() }
+                : message;
+            parts = await collector.CollectAsync(input).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -420,6 +453,10 @@ public sealed class AiChatPlugin : PluginBase
         if (!string.IsNullOrEmpty(prefixToStrip))
         {
             StripPrefixFromFirstTextPart(parts, prefixToStrip);
+        }
+        if (invokedByMention)
+        {
+            parts.Add(new TextPart("[交互方式: 用户正在@你，触发用的@已从原始内容移除。请直接把后续内容视为对你说的话，不要把你的名称当作第三方。]"));
         }
 
         // 诊断：把这次提取到的资源种类和数量打日志，便于排查"图片被吞"的问题。
@@ -500,50 +537,58 @@ public sealed class AiChatPlugin : PluginBase
             await _globalConcurrency.WaitAsync().ConfigureAwait(false);
             try
             {
+                var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
                 var systemPrompt = isSharedMode && convo?.SharedPrompt is not null
                     ? convo.SharedPrompt
                     : !string.IsNullOrWhiteSpace(settings.SystemPrompt)
                         ? settings.SystemPrompt
                         : _config.Default.DefaultPrompt;
-                systemPrompt = RenderPromptPlaceholders(systemPrompt, message);
                 if (isSharedMode && !string.IsNullOrWhiteSpace(_config.Default.SharedPromptSuffix))
                 {
-                    systemPrompt += "\n" + RenderPromptPlaceholders(_config.Default.SharedPromptSuffix, message);
+                    systemPrompt += "\n" + _config.Default.SharedPromptSuffix;
+                }
+                systemPrompt += $"\n你的当前机器人名称是“{selfName}”。在群聊中介绍自己、回应问候或被询问身份时，应使用这个名称；不要笼统自称“AI助手”或“人工智能助手”，除非用户明确询问你的技术性质。";
+                if (_tavily?.IsConfigured == true)
+                {
+                    systemPrompt += "\n你可以按需使用 tavily_search 搜索网络。仅当用户明确要求联网/搜索，或问题依赖最新、实时、外部可验证信息时才调用；不要为闲聊、写作、翻译、编程、常识或已有上下文可回答的问题搜索。每次回复最多搜索一次。拿到结果后基于结果回答，并在合适时附上来源 URL。";
                 }
 
                 var userParts = isSharedMode && !message.IsDirect
                     ? AddSharedSpeakerPrefix(parts, message)
                     : parts;
-                var userTurn = new ChatTurn("user", userParts, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                var userTimestamp = message.Timestamp == default ? DateTimeOffset.UtcNow : message.Timestamp;
+                userParts = AppendUserContext(userParts, message, selfName);
+                var userTurn = new ChatTurn("user", userParts, userTimestamp.ToUnixTimeMilliseconds());
 
                 string assistantText;
                 try
                 {
                     var hasImageInCurrent = parts.Any(p => p is ImagePart);
-
-                    if (hasImageInCurrent)
+                    var requestHistory = (convo?.Turns ?? []).ToList();
+                    assistantText = await ExecuteWithRetryAsync(async () =>
                     {
-                        // 有图片：用流式 body 写入，避免大 string 进 LOH
-                        var descriptors = BuildMessageDescriptors(systemPrompt, convo?.Turns ?? [], userTurn);
-                        assistantText = await _openAi.ChatStreamingBodyAsync(_config.Default, model, descriptors).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        // 纯文本：用普通序列化（更简单、有诊断日志）
-                        var openAiMessages = BuildOpenAiMessages(systemPrompt, convo?.Turns ?? [], userTurn);
-                        var request = new OpenAiChatRequest
+                        if (hasImageInCurrent)
                         {
-                            Model = model.Name,
-                            Messages = openAiMessages,
-                            Stream = false
-                        };
-                        assistantText = await _openAi.ChatAsync(_config.Default, model, request).ConfigureAwait(false);
-                    }
+                            // 每次重试重建请求体，避免复用已发送的 HttpContent。
+                            var descriptors = BuildMessageDescriptors(systemPrompt, requestHistory, userTurn);
+                            return await _openAi.ChatStreamingBodyAsync(_config.Default, model, descriptors).ConfigureAwait(false);
+                        }
+
+                        var openAiMessages = BuildOpenAiMessages(systemPrompt, requestHistory, userTurn);
+                        return _tavily?.IsConfigured == true
+                            ? await ChatWithTavilyAsync(model, openAiMessages).ConfigureAwait(false)
+                            : await _openAi.ChatAsync(_config.Default, model, new OpenAiChatRequest
+                            {
+                                Model = model.Name,
+                                Messages = openAiMessages,
+                                Stream = false
+                            }).ConfigureAwait(false);
+                    }, () => TrimRequestHistoryForRetry(requestHistory)).ConfigureAwait(false);
                 }
                 catch (TaskCanceledException)
                 {
-                    await ReplyAsync(message, isGroup, "[AiChat] 请求超时。").ConfigureAwait(false);
+                    await ReplyAsync(message, isGroup, "[AiChat] 请求超时，已完成重试仍未收到响应。").ConfigureAwait(false);
                     return;
                 }
                 catch (Exception ex)
@@ -959,6 +1004,27 @@ public sealed class AiChatPlugin : PluginBase
     private static long PeerId(MessageEvent message) =>
         long.TryParse(message.Channel.Id, out var id) ? id : message.Channel.Id.GetHashCode();
 
+    private async Task<string> ResolveSelfNameAsync(MessageEvent message)
+    {
+        var key = message.Platform + ":" + message.SelfId;
+        lock (_selfNames)
+        {
+            if (_selfNames.TryGetValue(key, out var cached)) return cached;
+        }
+
+        try
+        {
+            var self = await Context.User.GetSelfAsync().ConfigureAwait(false);
+            var name = string.IsNullOrWhiteSpace(self.Name) ? self.Id : self.Name;
+            lock (_selfNames) _selfNames[key] = name;
+            return name;
+        }
+        catch
+        {
+            return string.IsNullOrWhiteSpace(message.SelfId) ? "机器人" : message.SelfId;
+        }
+    }
+
     private bool CheckPermission(long userId, out string? denyReason)
     {
         denyReason = null;
@@ -1003,39 +1069,19 @@ public sealed class AiChatPlugin : PluginBase
         return result;
     }
 
-    private static string RenderPromptPlaceholders(string prompt, MessageEvent message)
+    private static List<ChatPart> AppendUserContext(
+        List<ChatPart> parts,
+        MessageEvent message,
+        string selfName)
     {
-        var now = DateTimeOffset.Now;
-        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["time"] = now.ToString("yyyy-MM-dd HH:mm:ss zzz"),
-            ["date"] = now.ToString("yyyy-MM-dd"),
-            ["userid"] = string.Empty,
-            ["groupname"] = string.Empty,
-            ["groupid"] = string.Empty,
-            ["nickname"] = string.Empty,
-            ["card"] = string.Empty
-        };
+        var context = message.IsDirect
+            ? $"[会话上下文: 机器人={selfName}; 私聊; 用户={message.Sender.Name ?? message.Sender.Id}/{message.Sender.Id}]"
+            : $"[会话上下文: 机器人={selfName}; 群={message.Channel.Name ?? message.Channel.Id}/{message.Channel.Id}; 用户={message.Member?.DisplayName ?? message.Sender.Name ?? message.Sender.Id}/{message.Sender.Id}]";
 
-        values["userid"] = message.Sender.Id;
-        if (message.IsDirect)
-        {
-            values["nickname"] = message.Sender.Name ?? string.Empty;
-        }
-        else
-        {
-            values["groupname"] = message.Channel.Name ?? string.Empty;
-            values["groupid"] = message.Channel.Id;
-            values["nickname"] = message.Sender.Name ?? string.Empty;
-            values["card"] = message.Member?.Nick ?? string.Empty;
-        }
-
-        foreach (var (key, value) in values)
-        {
-            prompt = prompt.Replace("{" + key + "}", value, StringComparison.OrdinalIgnoreCase);
-        }
-
-        return prompt;
+        var result = new List<ChatPart>(parts.Count + 1);
+        result.AddRange(parts);
+        result.Add(new TextPart(context));
+        return result;
     }
 
     /// <summary>
@@ -1190,6 +1236,130 @@ public sealed class AiChatPlugin : PluginBase
         return isDefault && includeDefaultMark ? display + " (默认)" : display;
     }
 
+    private async Task<string> ExecuteWithRetryAsync(Func<Task<string>> operation, Action? onEmptyResponse = null)
+    {
+        var maxAttempts = Math.Clamp(_config.Default.RetryOnTimeoutMaxAttempts, 1, 5);
+        var delayMs = Math.Clamp(_config.Default.RetryOnTimeoutDelayMs, 100, 10_000);
+
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await operation().ConfigureAwait(false);
+            }
+            catch (Exception ex) when ((ex is TaskCanceledException or HttpRequestException or EmptyUpstreamResponseException) && attempt < maxAttempts)
+            {
+                if (ex is EmptyUpstreamResponseException)
+                {
+                    onEmptyResponse?.Invoke();
+                }
+
+                var delay = TimeSpan.FromMilliseconds(delayMs * attempt);
+                var reason = ex is EmptyUpstreamResponseException ? "空响应" : ex.GetType().Name;
+                BotLog.Warning($"[AiChat] 上游请求第 {attempt}/{maxAttempts} 次失败 ({reason})，{delay.TotalMilliseconds:0}ms 后重试。");
+                await Task.Delay(delay).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static void TrimRequestHistoryForRetry(List<ChatTurn> history)
+    {
+        if (history.Count < 2) return;
+
+        var removeCount = history.Count / 2;
+        if (removeCount % 2 != 0) removeCount--;
+        if (removeCount < 2) return;
+
+        history.RemoveRange(0, removeCount);
+        BotLog.Warning($"[AiChat] 空响应重试：已从本次请求上下文移除最旧 {removeCount} turns，剩余 {history.Count} turns。");
+    }
+
+    private async Task<string> ChatWithTavilyAsync(ModelEntry model, List<OpenAiMessage> messages)
+    {
+        var tavily = _tavily!;
+        for (var round = 0; round < 2; round++)
+        {
+            var response = await _openAi.ChatWithToolsAsync(model, new OpenAiChatRequest
+            {
+                Model = model.Name,
+                Messages = messages,
+                // Only the first completion may ask to search. The follow-up must synthesize the result.
+                Tools = round == 0 ? [CreateTavilyTool()] : null,
+                Stream = false
+            }).ConfigureAwait(false);
+
+            if (response.ToolCalls is not { Count: > 0 })
+                return string.IsNullOrWhiteSpace(response.Content)
+                    ? throw new EmptyUpstreamResponseException()
+                    : response.Content;
+
+            messages.Add(new OpenAiMessage
+            {
+                Role = "assistant",
+                Content = response.Content ?? "",
+                ToolCalls = response.ToolCalls
+            });
+
+            var searchExecuted = false;
+            foreach (var call in response.ToolCalls)
+            {
+                var result = call.Function?.Name == "tavily_search" && !searchExecuted
+                    ? await ExecuteTavilySearchAsync(tavily, call.Function.Arguments).ConfigureAwait(false)
+                    : "Only one web search is allowed per user message.";
+                searchExecuted |= call.Function?.Name == "tavily_search";
+                messages.Add(new OpenAiMessage
+                {
+                    Role = "tool",
+                    ToolCallId = call.Id,
+                    Content = result
+                });
+            }
+        }
+
+        return "[AiChat] 网络搜索已达到本轮调用上限。";
+    }
+
+    private static OpenAiTool CreateTavilyTool() => new()
+    {
+        Function = new OpenAiToolFunction
+        {
+            Name = "tavily_search",
+            Description = "Search the web only when the user explicitly requests a search or the answer requires current, real-time, or externally verifiable information. Do not use for casual chat, writing, translation, coding, general knowledge, or questions answerable from the conversation.",
+            Parameters = new
+            {
+                type = "object",
+                additionalProperties = false,
+                required = new[] { "query" },
+                properties = new
+                {
+                    query = new { type = "string", description = "A focused web search query." }
+                }
+            }
+        }
+    };
+
+    private static async Task<string> ExecuteTavilySearchAsync(TavilySearchClient tavily, string arguments)
+    {
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(arguments);
+            if (!document.RootElement.TryGetProperty("query", out var queryElement) ||
+                string.IsNullOrWhiteSpace(queryElement.GetString()))
+                return "Search query was missing.";
+
+            return await tavily.SearchAsync(queryElement.GetString()!, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return "Search arguments were invalid.";
+        }
+        catch (Exception ex)
+        {
+            BotLog.Warning($"[AiChat] Tavily search failed: {ex.Message}");
+            return "Web search failed.";
+        }
+    }
+
     private List<OpenAiMessage> BuildOpenAiMessages(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn)
     {
         var msgs = new List<OpenAiMessage>(history.Count + 2)
@@ -1197,9 +1367,9 @@ public sealed class AiChatPlugin : PluginBase
             new() { Role = "system", Content = systemPrompt }
         };
 
-        foreach (var t in history)
+        for (var i = 0; i < history.Count; i++)
         {
-            msgs.Add(TurnToMessage(t, includeImages: false));
+            msgs.Add(TurnToMessage(history[i], includeImages: ShouldIncludeHistoryImages(history, i)));
         }
         msgs.Add(TurnToMessage(currentUserTurn, includeImages: true));
         return msgs;
@@ -1219,12 +1389,27 @@ public sealed class AiChatPlugin : PluginBase
             }
         };
 
-        foreach (var t in history)
+        for (var i = 0; i < history.Count; i++)
         {
-            descriptors.Add(TurnToDescriptor(t, includeImages: false));
+            descriptors.Add(TurnToDescriptor(history[i], includeImages: ShouldIncludeHistoryImages(history, i)));
         }
         descriptors.Add(TurnToDescriptor(currentUserTurn, includeImages: true));
         return descriptors;
+    }
+
+    private bool ShouldIncludeHistoryImages(IReadOnlyList<ChatTurn> history, int index)
+    {
+        if (_config.History.ImageMemoryTurns <= 0 || history[index].Role != "user") return false;
+
+        var newerUserTurns = 0;
+        for (var i = history.Count - 1; i >= index; i--)
+        {
+            if (history[i].Role != "user") continue;
+            if (i == index) return newerUserTurns < _config.History.ImageMemoryTurns;
+            newerUserTurns++;
+        }
+
+        return false;
     }
 
     private ChatMessageDescriptor TurnToDescriptor(ChatTurn turn, bool includeImages)
@@ -1294,6 +1479,8 @@ public sealed class AiChatPlugin : PluginBase
                     break;
             }
         }
+
+        AppendUserTimestamp(segments, turn);
 
         if (segments.Count == 0)
             segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = "" });
@@ -1399,6 +1586,8 @@ public sealed class AiChatPlugin : PluginBase
             }
         }
 
+        AppendUserTimestamp(contentParts, turn);
+
         // 关键: 一旦有图片，必须用数组形式，绝不能塌缩成字符串，
         // 否则模型完全看不到图片，只会收到一段纯文本。
         if (hasImage)
@@ -1432,6 +1621,27 @@ public sealed class AiChatPlugin : PluginBase
 
         return new OpenAiMessage { Role = turn.Role, Content = contentParts };
     }
+
+    private static void AppendUserTimestamp(List<ContentSegment> segments, ChatTurn turn)
+    {
+        if (turn.Role != "user") return;
+
+        segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = FormatUserTimestamp(turn.Timestamp) });
+    }
+
+    private static void AppendUserTimestamp(List<Dictionary<string, object>> contentParts, ChatTurn turn)
+    {
+        if (turn.Role != "user") return;
+
+        contentParts.Add(new Dictionary<string, object>
+        {
+            ["type"] = "text",
+            ["text"] = FormatUserTimestamp(turn.Timestamp)
+        });
+    }
+
+    private static string FormatUserTimestamp(long timestamp) =>
+        $"[消息时间: {DateTimeOffset.FromUnixTimeMilliseconds(timestamp).LocalDateTime:yyyy-MM-dd HH:mm:ss zzz}]";
 
     /// <summary>
     /// 把图片转成完整的 data URL。优先级：

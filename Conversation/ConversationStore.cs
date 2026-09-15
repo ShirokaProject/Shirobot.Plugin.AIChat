@@ -171,7 +171,7 @@ internal sealed class ConversationStore
         var hasTransient = false;
         foreach (var part in turn.Parts)
         {
-            if (part is ImagePart)
+            if (part is ImagePart { CachePath: null })
             {
                 hasTransient = true;
                 break;
@@ -183,7 +183,7 @@ internal sealed class ConversationStore
         var stripped = new List<ChatPart>(turn.Parts.Count);
         foreach (var part in turn.Parts)
         {
-            stripped.Add(part is ImagePart
+            stripped.Add(part is ImagePart { CachePath: null }
                 ? new TextPart("[图片已在上一轮发送给模型，后续上下文不再附带图片内容。]")
                 : part);
         }

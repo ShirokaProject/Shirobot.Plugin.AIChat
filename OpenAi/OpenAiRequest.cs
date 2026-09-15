@@ -23,6 +23,10 @@ internal sealed class OpenAiChatRequest
     [JsonPropertyName("max_tokens")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? MaxTokens { get; set; }
+
+    [JsonPropertyName("tools")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<OpenAiTool>? Tools { get; set; }
 }
 
 internal sealed class OpenAiMessage
@@ -37,4 +41,38 @@ internal sealed class OpenAiMessage
     /// </summary>
     [JsonPropertyName("content")]
     public object Content { get; set; } = "";
+
+    [JsonPropertyName("tool_call_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ToolCallId { get; set; }
+
+    [JsonPropertyName("tool_calls")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<OpenAiToolCall>? ToolCalls { get; set; }
+}
+
+internal sealed class OpenAiTool
+{
+    [JsonPropertyName("type")] public string Type { get; init; } = "function";
+    [JsonPropertyName("function")] public required OpenAiToolFunction Function { get; init; }
+}
+
+internal sealed class OpenAiToolFunction
+{
+    [JsonPropertyName("name")] public required string Name { get; init; }
+    [JsonPropertyName("description")] public required string Description { get; init; }
+    [JsonPropertyName("parameters")] public required object Parameters { get; init; }
+}
+
+internal sealed class OpenAiToolCall
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = "";
+    [JsonPropertyName("type")] public string Type { get; set; } = "function";
+    [JsonPropertyName("function")] public OpenAiToolCallFunction? Function { get; set; }
+}
+
+internal sealed class OpenAiToolCallFunction
+{
+    [JsonPropertyName("name")] public string Name { get; set; } = "";
+    [JsonPropertyName("arguments")] public string Arguments { get; set; } = "{}";
 }
