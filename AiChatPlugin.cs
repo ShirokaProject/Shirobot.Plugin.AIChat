@@ -21,8 +21,8 @@ namespace ShiroBot.AiChatPlugin;
 [BotPlugin(id: "AiChatPlugin",
     Name = "AI聊天插件",
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.2.0",
-    GithubRepo = "greepar/ShiroBot.Plugin.AiChat",
+    Version = "1.2.1",
+    GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
 public sealed class AiChatPlugin : PluginBase
