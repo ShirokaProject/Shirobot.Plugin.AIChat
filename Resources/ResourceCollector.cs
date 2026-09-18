@@ -1,16 +1,15 @@
 using System.Text;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
-using ShiroBot.Model.Common;
-using ShiroBot.Model.File.Requests;
-using ShiroBot.Model.Message.Requests;
+using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
+using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
 namespace ShiroBot.AiChatPlugin.Resources;
 
 /// <summary>
-/// 把一条 <see cref="IncomingMessage"/> 的 segments、引用消息和合并转发递归
+/// 把一条 <see cref="MessageEvent"/> 的 segments、引用消息和合并转发递归
 /// 抽取为 <see cref="ChatPart"/> 列表。
 /// </summary>
 internal sealed class ResourceCollector(
@@ -19,19 +18,12 @@ internal sealed class ResourceCollector(
     ResourceCache cache,
     ResourcesSection config)
 {
-    /// <summary>
-    /// 友聊入口。peerId 即对方 uid。
-    /// </summary>
-    public Task<List<ChatPart>> CollectAsync(FriendIncomingMessage message, CancellationToken ct = default)
-        => CollectSegmentsAsync(message.Segments, ChatScene.Friend, message.PeerId, depth: 0, ct);
-
-    public Task<List<ChatPart>> CollectAsync(GroupIncomingMessage message, CancellationToken ct = default)
-        => CollectSegmentsAsync(message.Segments, ChatScene.Group, message.PeerId, depth: 0, ct);
+    public Task<List<ChatPart>> CollectAsync(MessageEvent message, CancellationToken ct = default)
+        => CollectSegmentsAsync(message.Segments, message, depth: 0, ct);
 
     private async Task<List<ChatPart>> CollectSegmentsAsync(
-        IReadOnlyList<IncomingSegment> segments,
-        ChatScene scene,
-        long peerId,
+        IReadOnlyList<MessageSegment> segments,
+        MessageEvent context,
         int depth,
         CancellationToken ct)
     {
@@ -43,23 +35,23 @@ internal sealed class ResourceCollector(
             ct.ThrowIfCancellationRequested();
             switch (seg)
             {
-                case TextIncomingSegment text:
+                case TextSegment text:
                     textBuf.Append(text.Text);
                     break;
 
-                case MentionIncomingSegment mention:
+                case MentionSegment mention:
                     // 按 "@昵称 " 形式保留语义
-                    if (!string.IsNullOrEmpty(mention.Name))
+                    if (!string.IsNullOrEmpty(mention.DisplayName))
                     {
-                        textBuf.Append('@').Append(mention.Name).Append(' ');
+                        textBuf.Append('@').Append(mention.DisplayName).Append(' ');
                     }
                     break;
 
-                case MentionAllIncomingSegment:
+                case MentionAllSegment:
                     textBuf.Append("@全体成员 ");
                     break;
 
-                case ImageIncomingSegment image:
+                case ImageSegment image:
                     FlushText(textBuf, parts);
                     var imagePart = await TryDownloadImageAsync(image, ct).ConfigureAwait(false);
                     if (imagePart is not null)
@@ -68,71 +60,93 @@ internal sealed class ResourceCollector(
                     }
                     break;
 
-                case FileIncomingSegment file:
+                case FileSegment file:
                     FlushText(textBuf, parts);
-                    var filePart = await TryDownloadFileAsync(file, scene, peerId, ct).ConfigureAwait(false);
+                    var filePart = await TryDownloadFileAsync(file, context, ct).ConfigureAwait(false);
                     if (filePart is not null)
                     {
                         parts.Add(filePart);
                     }
                     break;
 
-                case ReplyIncomingSegment reply:
+                case QuoteSegment quote:
                     FlushText(textBuf, parts);
                     if (depth < config.RecursiveDepth)
                     {
-                        var nested = await ExpandReplyAsync(reply, scene, peerId, depth + 1, ct).ConfigureAwait(false);
+                        var nested = await ExpandReplyAsync(quote, context, depth + 1, ct).ConfigureAwait(false);
                         if (nested.Count > 0)
                         {
-                            parts.Add(new TextPart($"[引用消息 #{reply.MessageSeq} 来自 {reply.SenderName ?? reply.SenderId.ToString()}]"));
+                            parts.Add(new TextPart($"[引用消息 #{quote.MessageId}]"));
                             parts.AddRange(nested);
                             parts.Add(new TextPart("[引用结束]"));
                         }
                     }
                     break;
 
-                case ForwardIncomingSegment forward:
-                    FlushText(textBuf, parts);
-                    if (depth < config.RecursiveDepth)
-                    {
-                        var nested = await ExpandForwardAsync(forward, scene, peerId, depth + 1, ct).ConfigureAwait(false);
-                        if (nested.Count > 0)
-                        {
-                            parts.Add(new TextPart($"[合并转发: {forward.Title} - {forward.Summary}]"));
-                            parts.AddRange(nested);
-                            parts.Add(new TextPart("[合并转发结束]"));
-                        }
-                    }
+                case EmojiSegment face:
+                    textBuf.Append($"[表情:{face.Name ?? face.Id}]");
                     break;
 
-                case FaceIncomingSegment face:
-                    textBuf.Append($"[表情:{face.FaceId}]");
-                    break;
-
-                case MarketFaceIncomingSegment market:
-                    textBuf.Append($"[商城表情:{market.Url}]");
-                    break;
-
-                case VideoIncomingSegment:
+                case VideoSegment:
                     textBuf.Append("[视频]");
                     break;
 
-                case RecordIncomingSegment:
+                case AudioSegment:
                     textBuf.Append("[语音]");
                     break;
 
-                case LightAppIncomingSegment:
-                    textBuf.Append("[小程序卡片]");
-                    break;
-
-                case XmlIncomingSegment:
-                    textBuf.Append("[XML卡片]");
+                case RawSegment raw:
+                    await HandleRawSegmentAsync(raw, context, depth, textBuf, parts, ct).ConfigureAwait(false);
                     break;
             }
         }
 
         FlushText(textBuf, parts);
         return parts;
+    }
+
+    /// <summary>平台特有段:QQ 的合并转发展开,其余降级为占位文本。</summary>
+    private async Task HandleRawSegmentAsync(
+        RawSegment raw,
+        MessageEvent context,
+        int depth,
+        StringBuilder textBuf,
+        List<ChatPart> parts,
+        CancellationToken ct)
+    {
+        switch (raw.Payload)
+        {
+            case QIncomingForward forward when depth < config.RecursiveDepth:
+                FlushText(textBuf, parts);
+                var nested = await ExpandForwardAsync(forward, context, depth + 1, ct).ConfigureAwait(false);
+                if (nested.Count > 0)
+                {
+                    parts.Add(new TextPart($"[合并转发: {forward.Title} - {forward.Summary}]"));
+                    parts.AddRange(nested);
+                    parts.Add(new TextPart("[合并转发结束]"));
+                }
+                break;
+
+            case QIncomingMarketFace market:
+                textBuf.Append($"[商城表情:{market.Url}]");
+                break;
+
+            case QIncomingLightApp:
+                textBuf.Append("[小程序卡片]");
+                break;
+
+            case QIncomingXml:
+                textBuf.Append("[XML卡片]");
+                break;
+
+            case QIncomingMarkdown markdown:
+                textBuf.Append(markdown.Content);
+                break;
+
+            default:
+                textBuf.Append($"[{raw.Kind}]");
+                break;
+        }
     }
 
     private static void FlushText(StringBuilder buf, List<ChatPart> parts)
@@ -152,15 +166,14 @@ internal sealed class ResourceCollector(
         parts.Add(new TextPart(text));
     }
 
-    private async Task<ChatPart?> TryDownloadImageAsync(ImageIncomingSegment image, CancellationToken ct)
+    private async Task<ChatPart?> TryDownloadImageAsync(ImageSegment image, CancellationToken ct)
     {
-        var url = image.TempUrl;
-        if (string.IsNullOrWhiteSpace(url))
+        var url = image.Uri;
+        if (string.IsNullOrWhiteSpace(url) && !string.IsNullOrWhiteSpace(image.ResourceId))
         {
             try
             {
-                var resp = await bot.Message.GetResourceTempUrlAsync(image.ResourceId).ConfigureAwait(false);
-                url = resp.Url;
+                url = await bot.Message.GetResourceUrlAsync(image.ResourceId).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -171,7 +184,7 @@ internal sealed class ResourceCollector(
 
         try
         {
-            var (bytes, contentType) = await fetcher.DownloadImageAsync(url, ct).ConfigureAwait(false);
+            var (bytes, contentType) = await fetcher.DownloadImageAsync(url!, ct).ConfigureAwait(false);
             if (bytes.Length == 0)
             {
                 BotLog.Warning("[AiChat] 下载到的图片为空。");
@@ -179,7 +192,7 @@ internal sealed class ResourceCollector(
             }
 
             // 用魔数 + Content-Type + URL 扩展名三重确认 mime，保证不会落到 octet-stream。
-            var fallbackExt = TryParseExtensionFromUrl(url);
+            var fallbackExt = TryParseExtensionFromUrl(url!);
             var mime = MimeGuesser.ResolveImageMime(bytes, contentType, fallbackExt);
             var ext = MimeGuesser.ExtensionForMime(mime);
             var path = await cache.StoreAsync(bytes, ext, mime).ConfigureAwait(false);
@@ -210,36 +223,28 @@ internal sealed class ResourceCollector(
     }
 
     private async Task<ChatPart?> TryDownloadFileAsync(
-        FileIncomingSegment file,
-        ChatScene scene,
-        long peerId,
+        FileSegment file,
+        MessageEvent context,
         CancellationToken ct)
     {
+        var fileName = file.FileName ?? "unknown";
+        var fileSize = file.FileSize ?? 0;
+
         // 仅当扩展名属于文本类、且大小符合限制时才尝试下载并读入正文。
-        var isLikelyText = MimeGuesser.IsLikelyTextExtension(file.FileName, config.InlineTextExtensions);
-        var withinSize = file.FileSize <= config.MaxInlineTextBytes;
+        var isLikelyText = MimeGuesser.IsLikelyTextExtension(fileName, config.InlineTextExtensions);
+        var withinSize = fileSize <= config.MaxInlineTextBytes;
 
         if (!isLikelyText || !withinSize)
         {
-            return new FileMetaPart(file.FileName, file.FileSize, file.FileHash);
+            return new FileMetaPart(fileName, fileSize, null);
         }
 
         try
         {
-            string downloadUrl;
-            if (scene == ChatScene.Friend)
+            var downloadUrl = await ResolveFileDownloadUrlAsync(file, context).ConfigureAwait(false);
+            if (downloadUrl is null)
             {
-                var resp = await bot.File.GetPrivateFileDownloadUrlAsync(
-                    new GetPrivateFileDownloadUrlRequest(peerId, file.FileId, file.FileHash ?? string.Empty))
-                    .ConfigureAwait(false);
-                downloadUrl = resp.DownloadUrl;
-            }
-            else
-            {
-                var resp = await bot.File.GetGroupFileDownloadUrlAsync(
-                    new GetGroupFileDownloadUrlRequest(peerId, file.FileId))
-                    .ConfigureAwait(false);
-                downloadUrl = resp.DownloadUrl;
+                return new FileMetaPart(fileName, fileSize, null);
             }
 
             var (bytes, _) = await fetcher.DownloadTextFileAsync(downloadUrl, ct).ConfigureAwait(false);
@@ -247,7 +252,7 @@ internal sealed class ResourceCollector(
             var text = TryDecodeText(bytes);
             if (text is null)
             {
-                return new FileMetaPart(file.FileName, file.FileSize, file.FileHash);
+                return new FileMetaPart(fileName, fileSize, null);
             }
 
             var truncated = false;
@@ -257,13 +262,44 @@ internal sealed class ResourceCollector(
                 truncated = true;
             }
 
-            return new FileTextPart(file.FileName, file.FileSize, text, truncated);
+            return new FileTextPart(fileName, fileSize, text, truncated);
         }
         catch (Exception ex)
         {
-            BotLog.Warning($"[AiChat] 文件读取失败 {file.FileName}: {ex.Message}");
-            return new FileMetaPart(file.FileName, file.FileSize, file.FileHash);
+            BotLog.Warning($"[AiChat] 文件读取失败 {fileName}: {ex.Message}");
+            return new FileMetaPart(fileName, fileSize, null);
         }
+    }
+
+    /// <summary>入站文件段的下载 URL:优先直接用 Uri;QQ 平台经 IQFileApi 换取。</summary>
+    private async Task<string?> ResolveFileDownloadUrlAsync(FileSegment file, MessageEvent context)
+    {
+        if (!string.IsNullOrWhiteSpace(file.Uri))
+        {
+            return file.Uri;
+        }
+
+        if (string.IsNullOrWhiteSpace(file.ResourceId))
+        {
+            return null;
+        }
+
+        var qqFile = bot.GetAdapterExtension<IQFileApi>();
+        if (qqFile is null || !long.TryParse(context.Channel.Id, out var peerId))
+        {
+            return null;
+        }
+
+        if (context.IsDirect)
+        {
+            // QQ 私聊文件需要 fileHash,从 Raw 里的原始段找
+            var fileHash = (context.Raw as QIncomingMessage)?
+                .Segments.OfType<QIncomingFile>()
+                .FirstOrDefault(item => item.FileId == file.ResourceId)?.FileHash ?? string.Empty;
+            return await qqFile.GetPrivateFileDownloadUrlAsync(peerId, file.ResourceId, fileHash).ConfigureAwait(false);
+        }
+
+        return await qqFile.GetGroupFileDownloadUrlAsync(peerId, file.ResourceId).ConfigureAwait(false);
     }
 
     private static string? TryDecodeText(byte[] bytes)
@@ -297,50 +333,48 @@ internal sealed class ResourceCollector(
     }
 
     private async Task<List<ChatPart>> ExpandReplyAsync(
-        ReplyIncomingSegment reply,
-        ChatScene scene,
-        long peerId,
+        QuoteSegment quote,
+        MessageEvent context,
         int depth,
         CancellationToken ct)
     {
-        // 优先用 GetMessageAsync 拿完整原消息，失败时回退到 reply.Segments。
         try
         {
-            var sceneEnum = scene == ChatScene.Friend
-                ? GetMessageRequestMessageScene.Friend
-                : GetMessageRequestMessageScene.Group;
-            var resp = await bot.Message.GetMessageAsync(sceneEnum, peerId, reply.MessageSeq).ConfigureAwait(false);
-
-            var segments = ExtractSegments(resp.Message);
-            if (segments is not null)
+            var original = await bot.Message.GetMessageAsync(context.Channel, quote.MessageId).ConfigureAwait(false);
+            if (original is not null)
             {
-                return await CollectSegmentsAsync(segments, scene, peerId, depth, ct).ConfigureAwait(false);
+                return await CollectSegmentsAsync(original.Segments, original, depth, ct).ConfigureAwait(false);
             }
         }
         catch (Exception ex)
         {
-            BotLog.Warning($"[AiChat] 获取引用原消息失败 #{reply.MessageSeq}: {ex.Message}");
+            BotLog.Warning($"[AiChat] 获取引用原消息失败 #{quote.MessageId}: {ex.Message}");
         }
 
-        return await CollectSegmentsAsync(reply.Segments, scene, peerId, depth, ct).ConfigureAwait(false);
+        return [];
     }
 
     private async Task<List<ChatPart>> ExpandForwardAsync(
-        ForwardIncomingSegment forward,
-        ChatScene scene,
-        long peerId,
+        QIncomingForward forward,
+        MessageEvent context,
         int depth,
         CancellationToken ct)
     {
         var aggregated = new List<ChatPart>();
+        var qqMessage = bot.GetAdapterExtension<IQMessageApi>();
+        if (qqMessage is null)
+        {
+            return aggregated;
+        }
+
         try
         {
-            var resp = await bot.Message.GetForwardedMessagesAsync(forward.ForwardId).ConfigureAwait(false);
-            foreach (var msg in resp.Messages)
+            var messages = await qqMessage.GetForwardedMessagesAsync(forward.ForwardId).ConfigureAwait(false);
+            foreach (var msg in messages)
             {
                 var who = string.IsNullOrEmpty(msg.SenderName) ? "unknown" : msg.SenderName;
                 aggregated.Add(new TextPart($"[{who}]:"));
-                var inner = await CollectSegmentsAsync(msg.Segments, scene, peerId, depth, ct).ConfigureAwait(false);
+                var inner = await CollectQqSegmentsAsync(msg.Segments, ct).ConfigureAwait(false);
                 aggregated.AddRange(inner);
             }
         }
@@ -352,12 +386,51 @@ internal sealed class ResourceCollector(
         return aggregated;
     }
 
-    private static IReadOnlyList<IncomingSegment>? ExtractSegments(IncomingMessage msg)
-        => msg switch
+    /// <summary>合并转发内部消息用 QQ 原生段,做一次轻量转换(文本/图片,其余占位)。</summary>
+    private async Task<List<ChatPart>> CollectQqSegmentsAsync(
+        IReadOnlyList<QIncomingSegment> segments,
+        CancellationToken ct)
+    {
+        var parts = new List<ChatPart>();
+        var textBuf = new StringBuilder();
+
+        foreach (var seg in segments)
         {
-            FriendIncomingMessage f => f.Segments,
-            GroupIncomingMessage g => g.Segments,
-            TempIncomingMessage t => t.Segments,
-            _ => null
-        };
+            ct.ThrowIfCancellationRequested();
+            switch (seg)
+            {
+                case QIncomingText text:
+                    textBuf.Append(text.Text);
+                    break;
+                case QIncomingMention mention:
+                    textBuf.Append('@').Append(mention.Name).Append(' ');
+                    break;
+                case QIncomingImage image:
+                    FlushText(textBuf, parts);
+                    var imagePart = await TryDownloadImageAsync(
+                        new ImageSegment(image.TempUrl) { ResourceId = image.ResourceId, Summary = image.Summary },
+                        ct).ConfigureAwait(false);
+                    if (imagePart is not null)
+                    {
+                        parts.Add(imagePart);
+                    }
+                    break;
+                case QIncomingFace face:
+                    textBuf.Append($"[表情:{face.FaceId}]");
+                    break;
+                case QIncomingVideo:
+                    textBuf.Append("[视频]");
+                    break;
+                case QIncomingRecord:
+                    textBuf.Append("[语音]");
+                    break;
+                default:
+                    textBuf.Append($"[{seg.GetType().Name}]");
+                    break;
+            }
+        }
+
+        FlushText(textBuf, parts);
+        return parts;
+    }
 }

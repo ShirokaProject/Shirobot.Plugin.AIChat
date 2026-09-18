@@ -12,14 +12,23 @@ public sealed class PluginConfig
     public ResourcesSection Resources { get; set; } = new();
     public BehaviourSection Behaviour { get; set; } = new();
     public PermissionsSection Permissions { get; set; } = new();
+    public TavilySection Tavily { get; set; } = new();
+    public NetworkSection Network { get; set; } = new();
 }
 
 public sealed class DefaultSection
 {
     public string Model { get; set; } = "gpt-4o-mini";
-    public string DefaultPrompt { get; set; } = "当前时间: {time}\n你是一个乐于助人的助手。";
-    public string SharedPromptSuffix { get; set; } = "你正在群聊 {groupname} 中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。";
-    public int TimeoutSeconds { get; set; } = 120;
+    public string DefaultPrompt { get; set; } = "你是一个乐于助人的助手。";
+    public string SharedPromptSuffix { get; set; } = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。";
+    /// <summary>单次上游请求的超时秒数。</summary>
+    public int TimeoutSeconds { get; set; } = 60;
+
+    /// <summary>超时或瞬时网络失败时的总尝试次数，包含首次请求。</summary>
+    public int RetryOnTimeoutMaxAttempts { get; set; } = 3;
+
+    /// <summary>重试前的基础等待毫秒数；后续重试线性递增。</summary>
+    public int RetryOnTimeoutDelayMs { get; set; } = 1000;
     public int MaxConcurrency { get; set; } = 4;
 
     /// <summary>默认对话模式：single / multi / shared。</summary>
@@ -42,6 +51,9 @@ public sealed class HistorySection
     /// 是否落盘到 JSONL。
     /// </summary>
     public bool Persist { get; set; } = true;
+
+    /// <summary>在后续请求中重新发送图片的最近用户轮次数。0 表示只保留文字摘要。</summary>
+    public int ImageMemoryTurns { get; set; } = 1;
 }
 
 public sealed class ResourcesSection
@@ -100,4 +112,21 @@ public sealed class PermissionsSection
 
     /// <summary>这些模型仅 owner/admin 可切换。</summary>
     public string[] AdminOnlyModels { get; set; } = [];
+}
+
+public sealed class TavilySection
+{
+    /// <summary>留空时不注册网络搜索工具，也不向模型透露该能力。</summary>
+    public string ApiKey { get; set; } = "";
+
+    public int MaxResults { get; set; } = 5;
+
+    public string SearchDepth { get; set; } = "basic";
+
+}
+
+public sealed class NetworkSection
+{
+    /// <summary>所有上游 HTTP 请求共用的可选 HTTP/HTTPS 代理地址。</summary>
+    public string HttpProxy { get; set; } = "";
 }

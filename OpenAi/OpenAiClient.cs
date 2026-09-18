@@ -7,16 +7,22 @@ using ShiroBot.SDK.Abstractions;
 
 namespace ShiroBot.AiChatPlugin.OpenAi;
 
+internal sealed class EmptyUpstreamResponseException : Exception
+{
+    public EmptyUpstreamResponseException() : base("响应内容为空") { }
+}
+
 /// <summary>
 /// 兼容 OpenAI chat.completions 协议的 HTTP 客户端。
 /// 按 base_url 复用 HttpClient（每个 endpoint 一个实例）。
 /// </summary>
-internal sealed class OpenAiClient(int timeoutSeconds)
+internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisposable
 {
     private readonly Dictionary<string, HttpClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ProviderEntry> _providers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _clientsLock = new();
     private readonly TimeSpan _timeout = TimeSpan.FromSeconds(Math.Max(5, timeoutSeconds));
+    private readonly string _httpProxy = httpProxy;
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -61,6 +67,22 @@ internal sealed class OpenAiClient(int timeoutSeconds)
         return await SendAndParseAsync(http, httpReq, ct).ConfigureAwait(false);
     }
 
+    public async Task<OpenAiResponseMessage> ChatWithToolsAsync(
+        ModelEntry model,
+        OpenAiChatRequest request,
+        CancellationToken ct = default)
+    {
+        var (baseUrl, apiKey) = ResolveEndpoint(model);
+        if (string.IsNullOrWhiteSpace(baseUrl)) throw new InvalidOperationException("base_url 未配置");
+        if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("api_key 未配置");
+
+        using var httpReq = new HttpRequestMessage(HttpMethod.Post, JoinUrl(baseUrl, "chat/completions"));
+        httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        httpReq.Content = new StringContent(JsonSerializer.Serialize(request, _jsonOptions), Encoding.UTF8, "application/json");
+        return await SendAndParseMessageAsync(GetClient(baseUrl), httpReq, ct).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// 流式请求：用 StreamingChatContent 直接把图片从 .b64 文件流式写入 HTTP body，
     /// 不在内存中持有完整的 data URL string。
@@ -94,6 +116,14 @@ internal sealed class OpenAiClient(int timeoutSeconds)
 
     private async Task<string> SendAndParseAsync(HttpClient http, HttpRequestMessage httpReq, CancellationToken ct)
     {
+        var message = await SendAndParseMessageAsync(http, httpReq, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(message.Content))
+            throw new EmptyUpstreamResponseException();
+        return message.Content;
+    }
+
+    private async Task<OpenAiResponseMessage> SendAndParseMessageAsync(HttpClient http, HttpRequestMessage httpReq, CancellationToken ct)
+    {
         using var resp = await http.SendAsync(httpReq, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
         var raw = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -110,8 +140,8 @@ internal sealed class OpenAiClient(int timeoutSeconds)
         {
             var content = ParseSseStreamContent(raw);
             if (string.IsNullOrWhiteSpace(content))
-                throw new InvalidOperationException("流式响应内容为空");
-            return content;
+                throw new EmptyUpstreamResponseException();
+            return new OpenAiResponseMessage { Role = "assistant", Content = content };
         }
 
         OpenAiChatResponse? parsed;
@@ -130,13 +160,8 @@ internal sealed class OpenAiClient(int timeoutSeconds)
             throw new InvalidOperationException(errMsg);
         }
 
-        var content2 = parsed?.Choices?.FirstOrDefault()?.Message?.Content;
-        if (string.IsNullOrWhiteSpace(content2))
-        {
-            throw new InvalidOperationException("响应内容为空");
-        }
-
-        return content2;
+        return parsed?.Choices?.FirstOrDefault()?.Message
+               ?? throw new EmptyUpstreamResponseException();
     }
 
     private static string? TryExtractErrorMessage(string body)
@@ -220,7 +245,7 @@ internal sealed class OpenAiClient(int timeoutSeconds)
                 return existing;
             }
 
-            var client = new HttpClient
+            var client = new HttpClient(HttpProxy.CreateHandler(_httpProxy))
             {
                 Timeout = _timeout,
             };
@@ -266,6 +291,15 @@ internal sealed class OpenAiClient(int timeoutSeconds)
                 if (!string.IsNullOrWhiteSpace(p.Name))
                     _providers[p.Name] = p;
             }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_clientsLock)
+        {
+            foreach (var client in _clients.Values) client.Dispose();
+            _clients.Clear();
         }
     }
 
