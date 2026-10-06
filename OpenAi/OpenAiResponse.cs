@@ -40,6 +40,11 @@ internal sealed class OpenAiResponseMessage
     [JsonPropertyName("content")]
     public string? Content { get; set; }
 
+    // 仅用于本次请求内工具轮次的协议回传，不作为可见回复或持久化历史。
+    [JsonPropertyName("reasoning_content")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReasoningContent { get; set; }
+
     [JsonPropertyName("tool_calls")]
     public List<OpenAiToolCall>? ToolCalls { get; set; }
 }

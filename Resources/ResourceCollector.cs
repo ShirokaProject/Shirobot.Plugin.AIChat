@@ -175,7 +175,7 @@ internal sealed class ResourceCollector(
             {
                 url = await bot.Message.GetResourceUrlAsync(image.ResourceId).ConfigureAwait(false);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 BotLog.Warning($"[AiChat] 获取图片临时URL失败: {ex.Message}");
                 return new TextPart($"[图片(无法获取临时URL): {image.Summary}]");
@@ -200,7 +200,7 @@ internal sealed class ResourceCollector(
             // 即使缓存写入失败 (path 为 null)，也把字节内联起来，保证本轮请求仍然能把图片发出去。
             return new ImagePart(path, mime, bytes.Length, InlineBytes: path is null ? bytes : null);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             BotLog.Warning($"[AiChat] 下载图片失败: {ex.Message}");
             return new TextPart($"[图片(下载失败): {image.Summary}]");
@@ -264,7 +264,7 @@ internal sealed class ResourceCollector(
 
             return new FileTextPart(fileName, fileSize, text, truncated);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             BotLog.Warning($"[AiChat] 文件读取失败 {fileName}: {ex.Message}");
             return new FileMetaPart(fileName, fileSize, null);
@@ -340,13 +340,13 @@ internal sealed class ResourceCollector(
     {
         try
         {
-            var original = await bot.Message.GetMessageAsync(context.Channel, quote.MessageId).ConfigureAwait(false);
+            var original = await bot.Message.GetMessageAsync(context.Channel, quote.MessageId).WaitAsync(ct).ConfigureAwait(false);
             if (original is not null)
             {
                 return await CollectSegmentsAsync(original.Segments, original, depth, ct).ConfigureAwait(false);
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             BotLog.Warning($"[AiChat] 获取引用原消息失败 #{quote.MessageId}: {ex.Message}");
         }
@@ -369,7 +369,7 @@ internal sealed class ResourceCollector(
 
         try
         {
-            var messages = await qqMessage.GetForwardedMessagesAsync(forward.ForwardId).ConfigureAwait(false);
+            var messages = await qqMessage.GetForwardedMessagesAsync(forward.ForwardId).WaitAsync(ct).ConfigureAwait(false);
             foreach (var msg in messages)
             {
                 var who = string.IsNullOrEmpty(msg.SenderName) ? "unknown" : msg.SenderName;
@@ -378,7 +378,7 @@ internal sealed class ResourceCollector(
                 aggregated.AddRange(inner);
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             BotLog.Warning($"[AiChat] 展开合并转发失败 {forward.ForwardId}: {ex.Message}");
         }

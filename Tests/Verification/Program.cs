@@ -1,0 +1,305 @@
+using System.Net;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using ShiroBot.AiChatPlugin;
+using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Conversation;
+using ShiroBot.AiChatPlugin.OpenAi;
+using ShiroBot.AiChatPlugin.Tools;
+using ShiroBot.Model.QQ;
+using ShiroBot.SDK.Models;
+using ShiroBot.SDK.Abstractions;
+using ShiroBot.SDK.Plugin;
+using Tomlyn;
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+static void Set(AiChatPlugin plugin, string field, object value) =>
+    typeof(AiChatPlugin).GetField(field, BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(plugin, value);
+static object Invoke(AiChatPlugin plugin, string method, params object[] args) =>
+    typeof(AiChatPlugin).GetMethod(method, BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(plugin, args)!;
+static OpenAiClient Client(StubHandler handler)
+{
+    var client = new OpenAiClient(10, "");
+    var clients = (Dictionary<string, HttpClient>)typeof(OpenAiClient)
+        .GetField("_clients", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(client)!;
+    clients["https://example.invalid/v1"] = new HttpClient(handler);
+    return client;
+}
+static ModelEntry Model(string name) => new()
+{
+    Name = name, BaseUrl = "https://example.invalid/v1", ApiKey = "test"
+};
+static string Completion(string text) => JsonSerializer.Serialize(new
+{
+    choices = new[] { new { message = new { role = "assistant", content = text } } }
+});
+
+if (args.Contains("--live-blog-fetch"))
+{
+    using var fetch = new HttpFetchTool(new HttpFetchSection { MaxTextChars = 40000, SummarizeLongText = false });
+    using var home = JsonDocument.Parse(await fetch.ExecuteAsync("{\"url\":\"https://blog.greepar.uk/\"}"));
+    var link = home.RootElement.GetProperty("links").EnumerateArray().Single(l => l.GetProperty("text").GetString() == "友情链接");
+    var target = link.GetProperty("url").GetString()!;
+    Check(target == "https://blog.greepar.uk/friendlink/", "Homepage must provide the actual friend-link URL.");
+    using var friends = JsonDocument.Parse(await fetch.ExecuteAsync(JsonSerializer.Serialize(new { url = target })));
+    Check(friends.RootElement.GetProperty("text").GetString()!.Contains("PVPGOOD") &&
+        friends.RootElement.GetProperty("links").EnumerateArray().Any(l => l.GetProperty("url").GetString() == "https://2x.nz/"),
+        "Following the extracted link must return friend names and URLs.");
+    Console.WriteLine("PASS: live blog homepage -> extracted friendlink URL -> friend names and site links.");
+    return;
+}
+
+if (args.Contains("--live-qq-fetch"))
+{
+    using var fetch = new HttpFetchTool(new HttpFetchSection { MaxTextChars = 40000, SummarizeLongText = false });
+    using var result = JsonDocument.Parse(await fetch.ExecuteAsync("{\"url\":\"https://bot.q.qq.com/wiki/develop/api-v2/openapi/emoji/model.html\"}"));
+    var text = result.RootElement.GetProperty("text").GetString()!;
+    Check(text.Contains("doge") && text.Contains("表情"), "Live official QQ page must return emoji table text via secure fetch.");
+    Console.WriteLine($"PASS: live QQ emoji page through secure fetch with Fake-IP DNS; extracted {text.Length} characters, including emoji table.");
+    return;
+}
+
+var options = new TomlSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+var template = (string)typeof(AiChatPlugin).GetField("DefaultConfigTemplate", BindingFlags.NonPublic | BindingFlags.Static)!.GetRawConstantValue()!;
+var config = TomlSerializer.Deserialize<PluginConfig>(template, options)!;
+Check(config.ToolUse.Tavily is { Enabled: true } && config.History.CompactPrompt == HistorySection.DefaultCompactPrompt,
+    "Default template must deserialize nested tool config and compact prompt.");
+Check(typeof(PluginConfig).GetProperty("Tavily") is null, "Root config must not expose the removed legacy Tavily section.");
+var toolsConfig = new PluginConfig();
+toolsConfig.ToolUse.HttpFetch.Enabled = false;
+toolsConfig.ToolUse.Tavily.ApiKey = "test";
+using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(registry.HasTools, "Nested Tavily must register.");
+toolsConfig.ToolUse.Tavily.Enabled = false;
+using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(!registry.HasTools, "Disabled Tavily must not register.");
+toolsConfig.ToolUse.Enabled = false;
+toolsConfig.ToolUse.Tavily.Enabled = true;
+using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(!registry.HasTools && registry.SystemPrompt == "", "Disabled tools must not advertise capabilities.");
+Console.WriteLine("PASS: TOML template, nested Tavily config, removed legacy entry and tool disable");
+
+var plugin = new AiChatPlugin();
+var primary = Model("primary");
+var backup = Model("backup");
+config = new PluginConfig { Models = [primary, backup] };
+config.Default.FallbackModel = "backup";
+config.Default.RetryOnTimeoutMaxAttempts = 2;
+config.Default.RetryOnTimeoutDelayMs = 100;
+Set(plugin, "_config", config);
+var handler = new StubHandler(body => body.GetProperty("model").GetString() == "primary"
+    ? Completion("") : Completion("fallback answer"));
+using (var client = Client(handler))
+{
+    Func<ModelEntry, Task<string>> operation = model => client.ChatAsync(config.Default, model,
+        new OpenAiChatRequest { Model = model.Name, Messages = [new OpenAiMessage { Content = "question" }] });
+    var answer = await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, operation, (Action)(() => { }), CancellationToken.None);
+    Check(answer == "fallback answer" && handler.Requests.Select(r => r.GetProperty("model").GetString())
+        .SequenceEqual(["primary", "primary", "backup"]), "Fallback must run after primary retries.");
+}
+config.Default.FallbackModel = "primary";
+var attempts = 0;
+try
+{
+    Func<ModelEntry, Task<string>> fail = _ => { attempts++; throw new InvalidOperationException("failure"); };
+    await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, fail, (Action)(() => { }), CancellationToken.None);
+    throw new Exception("Expected failure for identical fallback.");
+}
+catch (InvalidOperationException) { Check(attempts == 1, "Same fallback must not retry itself."); }
+config.Default.FallbackModel = "missing";
+attempts = 0;
+try
+{
+    Func<ModelEntry, Task<string>> fail = _ => { attempts++; throw new InvalidOperationException("failure"); };
+    await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, fail, (Action)(() => { }), CancellationToken.None);
+    throw new Exception("Expected failure for unregistered fallback.");
+}
+catch (InvalidOperationException) { Check(attempts == 1, "Missing fallback must preserve primary error."); }
+Console.WriteLine("PASS: empty-response retries then fallback, identical and missing fallback guards");
+
+handler = new StubHandler(_ => """
+    {"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"private reasoning payload","tool_calls":[
+    {"id":"a","type":"function","function":{"name":"first","arguments":"{}"}},
+    {"id":"b","type":"function","function":{"name":"second","arguments":"{}"}},
+    {"id":"c","type":"function","function":{"name":"first","arguments":"{}"}},
+    {"id":"d","type":"function","function":{"name":"unknown","arguments":"{}"}}
+    ]}}]}
+    """);
+using (var client = Client(handler))
+using (var registry = new ChatToolRegistry())
+{
+    var toolLog = new ToolLogChecks.CaptureLogger();
+    using var logScope = BotLog.BeginScope(toolLog);
+    var first = new FakeTool("first");
+    var second = new FakeTool("second");
+    registry.Register(first);
+    registry.Register(second);
+    handler.Respond = body => handler.Requests.Count == 1 ? handler.RespondInitial : Completion("tool answer");
+    var answer = await registry.ChatAsync(client, primary, [new OpenAiMessage { Content = "question" }], 1);
+    Check(answer == "tool answer" && first.Calls == 1 && second.Calls == 1, "Tools must dispatch independently and respect individual limits.");
+    Check(handler.Requests[0].GetProperty("tools").GetArrayLength() == 2 && !handler.Requests[1].TryGetProperty("tools", out _), "Final round must omit tools.");
+    var assistantWithTools = handler.Requests[1].GetProperty("messages").EnumerateArray().Single(m => m.GetProperty("role").GetString() == "assistant");
+    Check(assistantWithTools.GetProperty("reasoning_content").GetString() == "private reasoning payload" && !answer.Contains("private reasoning payload"),
+        "JSON tool response reasoning must pass back unchanged without entering visible reply.");
+    var results = handler.Requests[1].GetProperty("messages").EnumerateArray().Where(m => m.GetProperty("role").GetString() == "tool").ToArray();
+    Check(results.Length == 4 && results[2].GetProperty("content").GetString()!.Contains("limit") && results[3].GetProperty("content").GetString()!.Contains("Unknown"), "All calls need matching tool replies, including rejected calls.");
+    Check(toolLog.Lines.Count(l => l.Contains("ToolUse 开始")) == 2 && toolLog.Lines.Count(l => l.Contains("ToolUse 完成")) == 2 &&
+        toolLog.Lines.Count(l => l.Contains("ToolUse 拒绝")) == 2, "Every executed and rejected tool call must be logged independently.");
+}
+using (var tool = new TavilySearchTool(new TavilySection(), ""))
+    Check((await tool.ExecuteAsync("{\"query\":42}")).Contains("invalid"), "Non-string query must return a validation error.");
+Console.WriteLine("PASS: two independent tools, call limits, unknown tools, final answer and argument validation");
+
+handler = new StubHandler(_ => Completion("custom summary"));
+using (var client = Client(handler))
+{
+    config.History.MaxTurns = 4;
+    config.History.CompactPrompt = "custom compact prompt";
+    Set(plugin, "_openAi", client);
+    Set(plugin, "_conversations", new ConversationStore(Path.GetTempPath(), false, 4));
+    var state = new ConversationState(new ConversationKey(ChatScene.Friend, 1, 1));
+    for (var i = 0; i < 8; i++) state.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart($"turn {i}")], i));
+    await (Task)Invoke(plugin, "TryCompactConversationAsync", state, primary);
+    Check(handler.Requests[0].GetProperty("messages")[0].GetProperty("content").GetString() == "custom compact prompt", "Compact must send configured system prompt.");
+    Check(state.Turns.Count == 5 && state.Turns[0].Parts.OfType<TextPart>().Single().Text.Contains("custom summary"), "Compact must replace old turns with summary.");
+}
+Console.WriteLine("PASS: compact custom prompt and history replacement");
+
+var messageContext = DispatchProxy.Create<IMessageContext, TestProxy>();
+var context = DispatchProxy.Create<IBotContext, TestProxy>();
+((TestProxy)(object)context).Call = (method, _) => method.Name == "get_Message" ? messageContext : throw new NotSupportedException();
+typeof(PluginBase).GetProperty("Context", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, context);
+MethodInfo? sentMethod = null;
+object?[] sentArgs = [];
+((TestProxy)(object)messageContext).Call = (method, args) => { sentMethod = method; sentArgs = args!; return Task.FromResult(new SentMessage("sent")); };
+var message = new MessageEvent { Platform = "qq", SelfId = "123", MessageId = "1", Channel = Channel.Group("456"), Sender = new User("789"), Segments = [] };
+config.Behaviour.FoldAboveChars = 2;
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message, true, "中😀文");
+Check(sentMethod!.Name == "SendMessageAsync" && ((IReadOnlyList<MessageSegment>)sentArgs[1]!).OfType<RawSegment>().Single().Payload is QOutgoingForward forward && forward.Messages.Single().Segments.OfType<QOutgoingText>().Single().Text == "中😀文", "Long QQ reply must fold and retain full text.");
+var folded = (QOutgoingForward)((IReadOnlyList<MessageSegment>)sentArgs[1]!).OfType<RawSegment>().Single().Payload;
+Check(folded.Preview!.Single() == "中😀文" && folded.Summary == "点击查看全部", "Folded card must preview actual reply text and show the requested footer.");
+var preview = (string)typeof(AiChatPlugin).GetMethod("CreateReplyPreview", BindingFlags.Static | BindingFlags.NonPublic)!
+    .Invoke(null, [string.Concat(Enumerable.Repeat("😀", 121)) + "\ncontinued"])!;
+Check(preview.EnumerateRunes().Count() == 121 && preview.EndsWith('…'), "Preview must truncate without splitting Unicode characters.");
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message, true, "中😀");
+Check(sentMethod!.Name == "QuoteReplyAsync", "Unicode character count at threshold must not fold.");
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message with { Platform = "discord" }, true, "long text");
+Check(sentMethod!.Name == "QuoteReplyAsync", "Other platforms must retain ordinary replies.");
+config.Behaviour.FoldAboveChars = 0;
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message, true, "long text");
+Check(sentMethod!.Name == "QuoteReplyAsync", "Zero threshold must disable folding.");
+config.Behaviour.FoldAboveChars = 2;
+var sends = new List<string>();
+((TestProxy)(object)messageContext).Call = (method, _) =>
+{
+    sends.Add(method.Name);
+    return Task.FromResult(new SentMessage(method.Name == "SendMessageAsync" ? "" : "sent"));
+};
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message, true, "long text");
+Check(sends.SequenceEqual(["SendMessageAsync", "QuoteReplyAsync"]), "Unsupported or failed forwards must fall back to ordinary text.");
+Console.WriteLine("PASS: folded payload, Unicode boundary, other platforms, disabled folding and send failure fallback");
+
+((TestProxy)(object)messageContext).Call = (method, args) =>
+{
+    sentMethod = method; sentArgs = args!;
+    return Task.FromResult(new SentMessage("sent"));
+};
+config.Behaviour.ReplyWithMention = true;
+config.Behaviour.FoldAboveChars = 0;
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message, true, "answer");
+var mentionSegments = (IReadOnlyList<MessageSegment>)sentArgs[1]!;
+Check(sentMethod!.Name == "QuoteReplyAsync" && mentionSegments[0] is MentionSegment { UserId: "789" } &&
+    mentionSegments.OfType<TextSegment>().Single().Text == " answer", "Mention and quote must be compatible, with mention before text.");
+config.Behaviour.ReplyWithQuote = false;
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message, true, "answer");
+Check(sentMethod!.Name == "ReplyAsync" && ((IReadOnlyList<MessageSegment>)sentArgs[1]!)[0] is MentionSegment,
+    "Mention must also work without quote.");
+config.Behaviour.FoldAboveChars = 2;
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message, true, "folded answer");
+mentionSegments = (IReadOnlyList<MessageSegment>)sentArgs[1]!;
+Check(sentMethod!.Name == "SendMessageAsync" && mentionSegments[0] is MentionSegment &&
+    mentionSegments.OfType<RawSegment>().Single().Payload is QOutgoingForward,
+    "Folded card must mention the sender outside the forwarded content.");
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message with { Channel = Channel.Direct("789") }, false, "answer");
+Check(sentMethod!.Name == "SendMessageAsync" && !((IReadOnlyList<MessageSegment>)sentArgs[1]!).OfType<MentionSegment>().Any(),
+    "Private folded cards must not contain a mention.");
+config.Behaviour.FoldAboveChars = 0;
+await (Task)Invoke(plugin, "ReplyAssistantAsync", message with { Channel = Channel.Direct("789") }, false, "answer");
+Check(sentMethod!.Name == "ReplyAsync" && sentArgs[1] is string, "Private replies must not contain a mention.");
+Console.WriteLine("PASS: mention with/without quote, folded-card mention and no mention in private replies");
+
+config.Behaviour.AutoReplyDirectMessages = false;
+Set(plugin, "_config", config);
+var direct = message with { Channel = Channel.Direct("789"), Segments = [new TextSegment("你好")] };
+Check(!(bool)Invoke(plugin, "ShouldAutoReplyDirectMessage", direct), "Private auto reply must default off.");
+config.Behaviour.AutoReplyDirectMessages = true;
+Check((bool)Invoke(plugin, "ShouldAutoReplyDirectMessage", direct), "Ordinary private text must auto reply when enabled.");
+Check((bool)Invoke(plugin, "ShouldAutoReplyDirectMessage", direct with { Segments = [new ImageSegment("https://example.invalid/image")] }),
+    "Private images must not require a text prefix.");
+foreach (var command in new[] { "#ai question", "#clear", "  #unknown", "/help" })
+    Check(!(bool)Invoke(plugin, "ShouldAutoReplyDirectMessage", direct with { Segments = [new TextSegment(command)] }),
+        "Commands must not enter the auto reply route.");
+Check(!(bool)Invoke(plugin, "ShouldAutoReplyDirectMessage", message), "Group messages must not trigger private auto reply.");
+Console.WriteLine("PASS: private auto reply switch, ordinary text and image triggers, group and command exclusions");
+
+Check(config.Permissions.ClearAdminOnly && typeof(PermissionsSection).GetProperty("AllowUsers") is null && typeof(PermissionsSection).GetProperty("DenyUsers") is null,
+    "Only administrative restrictions remain; clear defaults to admin-only.");
+config.OwnerPrompt.Enabled = false;
+Check((string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt") == "base prompt", "Owner prompt must default off.");
+config.OwnerPrompt.Enabled = true;
+config.OwnerPrompt.Template = "主人是 789，QQ 123456，机器人使用 ShiroBot。{自定义文字}\n第二行";
+var identity = (string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt");
+Check(identity == "base prompt\n" + config.OwnerPrompt.Template, "Owner text must be appended verbatim, including braces and newlines.");
+var admin = false;
+((TestProxy)(object)context).Call = (method, _) => method.Name switch { "IsAdmin" => admin, "get_Message" => messageContext, _ => throw new NotSupportedException() };
+Check(!await (Task<bool>)Invoke(plugin, "CanClearAsync", direct) && !await (Task<bool>)Invoke(plugin, "CanClearAsync", message),
+    "Owner prompt identity must not grant clear permissions in direct or group messages.");
+// Handler tests use uninitialized stores deliberately: denial must happen before any state mutation.
+await (Task)Invoke(plugin, "HandleFriendClearAsync", direct);
+await (Task)Invoke(plugin, "HandleGroupClearAsync", message);
+admin = true;
+Check(await (Task<bool>)Invoke(plugin, "CanClearAsync", direct), "Host administrator must be allowed.");
+admin = false; config.Permissions.ClearAdminOnly = false;
+Check(await (Task<bool>)Invoke(plugin, "CanClearAsync", direct), "Disabled restriction must allow clearing personal conversations.");
+config.Permissions.ClearAdminOnly = true; config.OwnerPrompt.Enabled = false;
+Console.WriteLine("PASS: route-only access config, admin clear guard before mutation, optional owner template and no prompt-based privilege grants");
+
+await RichReplyChecks.RunAsync();
+await RecallChecks.RunAsync();
+await FetchTimerChecks.RunAsync();
+await ToolLogChecks.RunAsync();
+
+sealed class StubHandler : HttpMessageHandler
+{
+    public List<JsonElement> Requests { get; } = [];
+    public string RespondInitial { get; }
+    public Func<JsonElement, string> Respond { get; set; }
+    public StubHandler(Func<JsonElement, string> respond)
+    {
+        Respond = respond;
+        using var doc = JsonDocument.Parse("{\"model\":\"primary\"}");
+        RespondInitial = respond(doc.RootElement);
+    }
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        using var doc = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
+        Requests.Add(doc.RootElement.Clone());
+        return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(Respond(doc.RootElement), Encoding.UTF8, "application/json") };
+    }
+}
+sealed class FakeTool(string name) : IChatTool
+{
+    public int Calls { get; private set; }
+    public string? LastArguments { get; private set; }
+    public OpenAiTool Definition => new() { Function = new() { Name = name, Description = name, Parameters = new { type = "object" } } };
+    public string SystemPrompt => name;
+    public int MaxCallsPerTurn => 1;
+    public Task<string> ExecuteAsync(string arguments, CancellationToken ct = default) { Calls++; LastArguments = arguments; return Task.FromResult(name + " result"); }
+    public void Dispose() { }
+}
+public class TestProxy : DispatchProxy
+{
+    public Func<MethodInfo, object?[]?, object?> Call { get; set; } = null!;
+    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) => Call(targetMethod!, args);
+}

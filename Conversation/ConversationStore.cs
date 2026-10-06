@@ -37,10 +37,10 @@ internal sealed class ConversationStore
     /// 从磁盘加载会话状态（turns + metadata），调用方处理完后应调用 <see cref="ReleaseAsync"/>。
     /// 返回的 state 只在当前请求生命周期内有效。
     /// </summary>
-    public async Task<ConversationState> AcquireAsync(ConversationKey key)
+    public async Task<ConversationState> AcquireAsync(ConversationKey key, CancellationToken ct = default)
     {
         var lk = _locks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
-        await lk.WaitAsync().ConfigureAwait(false);
+        await lk.WaitAsync(ct).ConfigureAwait(false);
 
         var state = new ConversationState(key);
         if (_persist)
