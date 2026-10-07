@@ -26,7 +26,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.2.1",
+    Version = "1.3.0",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
