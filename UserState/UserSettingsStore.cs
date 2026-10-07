@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using ShiroBot.SDK.Abstractions;
+using ShiroBot.SDK.Models;
 
 namespace ShiroBot.AiChatPlugin.UserState;
 
@@ -12,7 +13,7 @@ namespace ShiroBot.AiChatPlugin.UserState;
 internal sealed class UserSettingsStore
 {
     private readonly string _filePath;
-    private readonly ConcurrentDictionary<long, UserSettings> _byUser;
+    private readonly ConcurrentDictionary<string, UserSettings> _byUser;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly JsonSerializerOptions _jsonOptions;
 
@@ -30,21 +31,24 @@ internal sealed class UserSettingsStore
             DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
         };
 
-        _byUser = new ConcurrentDictionary<long, UserSettings>(LoadFromDisk());
+        _byUser = new ConcurrentDictionary<string, UserSettings>(LoadFromDisk());
     }
 
-    public UserSettings GetOrCreate(long userId)
-        => _byUser.GetOrAdd(userId, _ => new UserSettings());
+    public UserSettings GetOrCreate(UserReference user)
+        => _byUser.GetOrAdd(Key(user), _ => new UserSettings());
 
-    public UserSettings? Get(long userId)
-        => _byUser.GetValueOrDefault(userId);
+    public UserSettings? Get(UserReference user)
+        => _byUser.GetValueOrDefault(Key(user));
+
+    private static string Key(UserReference user) =>
+        new UserReference(user.InstanceId.ToUpperInvariant(), user.UserId).ToConfigString();
 
     public async Task SaveAsync()
     {
         await _writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            var snapshot = _byUser.ToDictionary(p => p.Key.ToString(), p => p.Value);
+            var snapshot = _byUser.ToDictionary(p => p.Key, p => p.Value);
             var json = JsonSerializer.Serialize(snapshot, _jsonOptions);
 
             var tempPath = _filePath + ".tmp";
@@ -70,9 +74,9 @@ internal sealed class UserSettingsStore
         }
     }
 
-    private Dictionary<long, UserSettings> LoadFromDisk()
+    private Dictionary<string, UserSettings> LoadFromDisk()
     {
-        var result = new Dictionary<long, UserSettings>();
+        var result = new Dictionary<string, UserSettings>();
         if (!File.Exists(_filePath))
         {
             return result;
@@ -94,10 +98,7 @@ internal sealed class UserSettingsStore
 
             foreach (var (k, v) in raw)
             {
-                if (long.TryParse(k, out var uid))
-                {
-                    result[uid] = v;
-                }
+                result[k] = v;
             }
         }
         catch (Exception ex)

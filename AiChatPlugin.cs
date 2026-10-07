@@ -15,7 +15,7 @@ using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
 [assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.2.0")]
-[assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.7")]
+[assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 [assembly: ShiroBotApiCompatibility("0.9.2", "0.9.2")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -421,9 +421,9 @@ public sealed class AiChatPlugin : PluginBase
             reply => ReplyToGroup(message, reply)).ConfigureAwait(false);
     }
 
-    private async Task ApplyAiModeAsync(long userId, string arg, Func<string, Task> reply)
+    private async Task ApplyAiModeAsync(string userId, string arg, Func<string, Task> reply)
     {
-        var settings = _userSettings.GetOrCreate(userId);
+        var settings = _userSettings.GetOrCreate(ScopedUser(userId));
 
         if (string.IsNullOrEmpty(arg))
         {
@@ -622,7 +622,7 @@ public sealed class AiChatPlugin : PluginBase
         }
 
         var senderId = SenderId(message);
-        var settings = _userSettings.GetOrCreate(senderId);
+        var settings = _userSettings.GetOrCreate(ScopedUser(senderId));
         var chatMode = settings.ChatMode ?? _config.Default.DefaultChatMode;
 
         // 选择模型：shared 模式用共享会话的公共设置，否则用个人偏好
@@ -820,7 +820,7 @@ public sealed class AiChatPlugin : PluginBase
 
     private async Task HandleGroupPromptAsync(MessageEvent message)
     {
-        var settings = _userSettings.GetOrCreate(SenderId(message));
+        var settings = _userSettings.GetOrCreate(ScopedUser(SenderId(message)));
         var mode = settings.ChatMode ?? _config.Default.DefaultChatMode;
         var arg = StripPrefix(message.GetPlainText(), "#prompt");
 
@@ -867,9 +867,9 @@ public sealed class AiChatPlugin : PluginBase
             await ReplyToGroup(message, reply)).ConfigureAwait(false);
     }
 
-    private async Task ApplyPromptAsync(long userId, string arg, Func<string, Task> reply)
+    private async Task ApplyPromptAsync(string userId, string arg, Func<string, Task> reply)
     {
-        var settings = _userSettings.GetOrCreate(userId);
+        var settings = _userSettings.GetOrCreate(ScopedUser(userId));
 
         if (string.IsNullOrEmpty(arg))
         {
@@ -923,7 +923,7 @@ public sealed class AiChatPlugin : PluginBase
     private async Task HandleGroupClearAsync(MessageEvent message)
     {
         if (!await CanClearAsync(message).ConfigureAwait(false)) return;
-        var settings = _userSettings.GetOrCreate(SenderId(message));
+        var settings = _userSettings.GetOrCreate(ScopedUser(SenderId(message)));
         var mode = settings.ChatMode ?? _config.Default.DefaultChatMode;
 
         // shared 模式下只有 owner/admin 能清空共享会话
@@ -977,7 +977,7 @@ public sealed class AiChatPlugin : PluginBase
 
     private async Task HandleGroupModelAsync(MessageEvent message)
     {
-        var settings = _userSettings.GetOrCreate(SenderId(message));
+        var settings = _userSettings.GetOrCreate(ScopedUser(SenderId(message)));
         var mode = settings.ChatMode ?? _config.Default.DefaultChatMode;
         var arg = StripPrefix(message.GetPlainText(), "#model");
 
@@ -1057,9 +1057,9 @@ public sealed class AiChatPlugin : PluginBase
             reply => ReplyToGroup(message, reply)).ConfigureAwait(false);
     }
 
-    private async Task ApplyModelAsync(long userId, string arg, bool isAdmin, Func<string, Task> reply)
+    private async Task ApplyModelAsync(string userId, string arg, bool isAdmin, Func<string, Task> reply)
     {
-        var settings = _userSettings.GetOrCreate(userId);
+        var settings = _userSettings.GetOrCreate(ScopedUser(userId));
 
         if (string.IsNullOrEmpty(arg))
         {
@@ -1189,11 +1189,9 @@ public sealed class AiChatPlugin : PluginBase
         }
     }
 
-    private static long SenderId(MessageEvent message) =>
-        long.TryParse(message.Sender.Id, out var id) ? id : message.Sender.Id.GetHashCode();
+    private static string SenderId(MessageEvent message) => message.Sender.Id;
 
-    private static long PeerId(MessageEvent message) =>
-        long.TryParse(message.Channel.Id, out var id) ? id : message.Channel.Id.GetHashCode();
+    private static string PeerId(MessageEvent message) => message.Channel.Id;
 
     private async Task<string> ResolveSelfNameAsync(MessageEvent message)
     {
@@ -1265,16 +1263,20 @@ public sealed class AiChatPlugin : PluginBase
     /// - multi（默认）: 按用户独立
     /// - shared: 群聊时所有人共享同一个 key（userId 固定为 0）
     /// </summary>
-    private ConversationKey ResolveConversationKey(ChatScene scene, long peerId, long userId)
+    private string SourceInstance() => Context.InstanceId
+        ?? throw new InvalidOperationException("AI conversation requires a source adapter instance.");
+    private UserReference ScopedUser(string userId) => new(SourceInstance(), userId);
+
+    private ConversationKey ResolveConversationKey(ChatScene scene, string peerId, string userId)
     {
-        var settings = _userSettings.GetOrCreate(userId);
+        var settings = _userSettings.GetOrCreate(ScopedUser(userId));
         var mode = settings.ChatMode ?? _config.Default.DefaultChatMode;
 
         return mode switch
         {
-            "single" => new ConversationKey(scene, peerId, -DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
-            "shared" when scene == ChatScene.Group => new ConversationKey(scene, peerId, 0),
-            _ => new ConversationKey(scene, peerId, userId)
+            "single" => new ConversationKey(SourceInstance(), scene, peerId, Guid.NewGuid().ToString("N")),
+            "shared" when scene == ChatScene.Group => new ConversationKey(SourceInstance(), scene, peerId, "0"),
+            _ => new ConversationKey(SourceInstance(), scene, peerId, userId)
         };
     }
 
@@ -1833,10 +1835,10 @@ public sealed class AiChatPlugin : PluginBase
         var threshold = _config.Behaviour.FoldAboveChars;
         if (threshold > 0 && text.EnumerateRunes().Count() > threshold &&
             string.Equals(message.Platform, "qq", StringComparison.OrdinalIgnoreCase) &&
-            long.TryParse(message.SelfId, out var selfId))
+            !string.IsNullOrWhiteSpace(message.SelfId))
         {
             var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
-            var forward = new QOutgoingForward([new QForwardedMessage(selfId, selfName, [new QOutgoingText(text)])])
+            var forward = new QOutgoingForward([new QForwardedMessage(message.SelfId, selfName, [new QOutgoingText(text)])])
             {
                 Title = $"{selfName} 的回复",
                 Preview = [CreateReplyPreview(text)],

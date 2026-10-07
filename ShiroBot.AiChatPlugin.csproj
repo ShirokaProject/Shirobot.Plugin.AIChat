@@ -15,7 +15,7 @@
     <ItemGroup>
         <Compile Remove="Tests/**/*.cs" />
         <InternalsVisibleTo Include="ShiroBot.AiChatPlugin.Verification" />
-        <PackageReference Include="ShiroBot.SDK" Version="0.9.7" />
+        <PackageReference Include="ShiroBot.SDK" Version="0.9.8" />
     </ItemGroup>
 
     <Target Name="CopyPluginToHost"

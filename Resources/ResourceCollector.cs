@@ -285,10 +285,12 @@ internal sealed class ResourceCollector(
         }
 
         var qqFile = bot.GetAdapterExtension<IQFileApi>();
-        if (qqFile is null || !long.TryParse(context.Channel.Id, out var peerId))
+        if (qqFile is null)
         {
             return null;
         }
+
+        var peerId = context.Channel.Id;
 
         if (context.IsDirect)
         {
@@ -345,6 +347,7 @@ internal sealed class ResourceCollector(
             {
                 return await CollectSegmentsAsync(original.Segments, original, depth, ct).ConfigureAwait(false);
             }
+            BotLog.Warning("[AiChat] 适配器未返回引用原消息，无法收集引用中的图片或文件。");
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {

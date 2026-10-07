@@ -158,7 +158,7 @@ using (var client = Client(handler))
     config.History.CompactPrompt = "custom compact prompt";
     Set(plugin, "_openAi", client);
     Set(plugin, "_conversations", new ConversationStore(Path.GetTempPath(), false, 4));
-    var state = new ConversationState(new ConversationKey(ChatScene.Friend, 1, 1));
+    var state = new ConversationState(new ConversationKey("test-instance", ChatScene.Friend, "1", "1"));
     for (var i = 0; i < 8; i++) state.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart($"turn {i}")], i));
     await (Task)Invoke(plugin, "TryCompactConversationAsync", state, primary);
     Check(handler.Requests[0].GetProperty("messages")[0].GetProperty("content").GetString() == "custom compact prompt", "Compact must send configured system prompt.");
@@ -269,6 +269,7 @@ await RichReplyChecks.RunAsync();
 await RecallChecks.RunAsync();
 await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
+await IdentityScopeChecks.RunAsync();
 
 sealed class StubHandler : HttpMessageHandler
 {

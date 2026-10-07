@@ -248,15 +248,15 @@ internal sealed class FakeOfficialApi : IQOfficialMessageApi, IQOfficialDirectMe
     public QOfficialStreamContentType ContentType;
     public FakeOfficialStream Stream { get; } = new();
     public bool CanSendMarkdown(QOfficialMessageTarget target, QOfficialMarkdown markdown, QOfficialKeyboard? keyboard = null) => AllowMarkdown;
-    public Task<string> SendMarkdownAsync(QOfficialMessageTarget target, QOfficialMarkdown markdown, QOfficialKeyboard? keyboard = null, QOfficialMessageReply? reply = null)
+    public Task<string> SendMarkdownAsync(QOfficialMessageTarget target, QOfficialMarkdown markdown, QOfficialKeyboard? keyboard = null, QOfficialMessageReply? reply = null, CancellationToken cancellationToken = default)
     {
         if (FailMarkdown) throw new NotSupportedException("no platform permission");
         LastReply = reply; LastTarget = target; MarkdownSends++;
         LastMarkdown = (markdown as QCustomMarkdown)?.Content;
         return Task.FromResult("markdown-id");
     }
-    public Task AcknowledgeInteractionAsync(string interactionId, QOfficialInteractionResponseCode code = QOfficialInteractionResponseCode.Success) => Task.CompletedTask;
-    public Task SendTypingAsync(QOfficialMessageTarget target, QOfficialMessageReply reply, TimeSpan duration) => Task.CompletedTask;
+    public Task AcknowledgeInteractionAsync(string interactionId, QOfficialInteractionResponseCode code = QOfficialInteractionResponseCode.Success, CancellationToken cancellationToken = default) => Task.CompletedTask;
+    public Task SendTypingAsync(QOfficialMessageTarget target, QOfficialMessageReply reply, TimeSpan duration, CancellationToken cancellationToken = default) => Task.CompletedTask;
     public IQOfficialMessageStream BeginStream(QOfficialMessageTarget target, QOfficialMessageReply reply, QOfficialStreamContentType contentType = QOfficialStreamContentType.Text)
     {
         if (FailBegin) throw new NotSupportedException("stream unavailable");

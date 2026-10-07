@@ -81,7 +81,7 @@ internal static class RecallChecks
             Check(api.Stream.Frames.Count == 0, "Recall before first stream frame must send nothing.");
         }
         var store = new ConversationStore("unused", false, 20);
-        var key = new ConversationKey(ChatScene.Group, 1, 2);
+        var key = new ConversationKey("test-instance", ChatScene.Group, "1", "2");
         await store.AcquireAsync(key);
         using (var pending = registry.Register(message))
         {

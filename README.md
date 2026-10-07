@@ -154,7 +154,9 @@ openai-gpt-4o-mini (GPT-4o Mini) [vision]
 
 `[behaviour].reply_with_mention` 默认为 `false`，Dashboard 中显示为“@发送者回复”。开启后群聊普通文本、折叠卡片和官方 Markdown 回复都会提及原消息发送者，可以与引用回复同时开启；私聊及私聊流式回复不添加 @。
 
-插件使用 NuGet `ShiroBot.SDK 0.9.7`（包含 QQ Model 合同），要求宿主支持 ShiroBot API `0.9.2` 和 QQ Model 包 `0.9.7`。
+插件使用 NuGet `ShiroBot.SDK 0.9.8`（包含 QQ Model 合同），要求宿主至少为 `0.9.8`，并兼容 ShiroBot API `0.9.2`。
+
+用户与会话 ID 以平台提供的字符串原样保存。升级会继续读取原有数字 ID 设置和数字 ID 会话文件；旧版曾将非数字 ID 哈希成整数，无法从哈希恢复原 ID，这些旧文件会保留在数据目录中，但新的请求会使用新的原生 ID 键。
 
 Markdown 和流式能力通过当前适配器的扩展接口探测，不按平台名称判断。Markdown 需要适配器实现 `IQOfficialMessageApi` 并通过 `CanSendMarkdown`；流式需要实现 `IQOfficialDirectMessageApi` 且当前场景可创建流。
 
@@ -297,3 +299,7 @@ template = ""
 ## 许可证
 
 本项目采用 GNU General Public License v3.0（SPDX：`GPL-3.0-only`），完整条款见 [LICENSE](LICENSE)。
+
+### 0.9.8 身份与历史存储
+
+用户偏好和聊天历史按适配器实例隔离，原始用户/会话 ID 保持字符串；会话文件名使用确定性摘要以避免路径字符问题。旧版本未带实例的历史和偏好保留在原文件中，升级后不会自动分配给某个实例，以免多账号共享敏感上下文。新记录使用新的实例键和文件名。
