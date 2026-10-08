@@ -11,10 +11,11 @@ using ShiroBot.AiChatPlugin.Timers;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Core;
+using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.2.0")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.3.1")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 [assembly: ShiroBotApiCompatibility("0.9.2", "0.9.2")]
 
@@ -26,14 +27,13 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.3.0",
+    Version = "1.3.1",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
-public sealed class AiChatPlugin : PluginBase
+public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConfig>
 {
     private PluginConfig _config = new();
-    private IDisposable? _configWatchSubscription;
     private readonly Dictionary<string, string> _selfNames = new(StringComparer.OrdinalIgnoreCase);
 
     private ConversationStore _conversations = null!;
@@ -49,19 +49,30 @@ public sealed class AiChatPlugin : PluginBase
     private string PluginRoot => Path.GetDirectoryName(Context.Config.ConfigPath)
                                  ?? AppContext.BaseDirectory;
 
+    PluginConfig IConfigurableComponent<PluginConfig>.CurrentConfigValue => _config;
+
+    Task<object> IConfigurableComponent.InitializeConfigAsync(
+        IConfigContext context, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureDefaultConfigTemplate();
+        _config = context.Load<PluginConfig>();
+        return Task.FromResult<object>(_config);
+    }
+
+    async Task IConfigurableComponent<PluginConfig>.OnConfigChangedAsync(
+        PluginConfig previous, PluginConfig current, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _config = current;
+        ApplyConfigDerivatives(initial: false);
+        await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
+        BotLog.Info("[AiChat] 配置已热重载。");
+    }
+
     protected override async Task LoadAsync()
     {
-        EnsureDefaultConfigTemplate();
-        _config = Context.Config.Load<PluginConfig>();
         ApplyConfigDerivatives(initial: true);
-
-        _configWatchSubscription = Context.Config.Watch<PluginConfig>(updated =>
-        {
-            _config = updated;
-            ApplyConfigDerivatives(initial: false);
-            _ = Task.Run(FetchAndMergeProviderModelsAsync);
-            BotLog.Info("[AiChat] 配置已热重载。");
-        });
 
         // 从配置了 fetch_models = true 的 provider 自动拉取模型列表
         await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
@@ -95,8 +106,6 @@ public sealed class AiChatPlugin : PluginBase
 
     protected override async Task OnUnloadAsync()
     {
-        _configWatchSubscription?.Dispose();
-        _configWatchSubscription = null;
         if (_timerScheduler is not null) await _timerScheduler.DisposeAsync().ConfigureAwait(false);
         _tools.Dispose();
         BotLog.Info("[AiChat] 插件已卸载。");

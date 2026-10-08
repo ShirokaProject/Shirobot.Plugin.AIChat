@@ -10,6 +10,7 @@ using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Abstractions;
+using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Plugin;
 using Tomlyn;
 
@@ -37,6 +38,54 @@ static string Completion(string text) => JsonSerializer.Serialize(new
 {
     choices = new[] { new { message = new { role = "assistant", content = text } } }
 });
+
+// Verify the same initialization/application contract used by Dashboard and the host watcher.
+{
+    var root = Path.Combine(Path.GetTempPath(), "aichat-config-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    var configPath = Path.Combine(root, "config.toml");
+    File.WriteAllText(configPath, "# existing user configuration");
+    var current = new PluginConfig();
+    var configContext = DispatchProxy.Create<IConfigContext, TestProxy>();
+    ((TestProxy)(object)configContext).Call = (method, _) => method.Name switch
+    {
+        "get_ConfigPath" => configPath,
+        "Load" => current,
+        _ => throw new Exception("Unexpected config operation: " + method.Name)
+    };
+    var bot = DispatchProxy.Create<IBotContext, TestProxy>();
+    ((TestProxy)(object)bot).Call = (method, _) => method.Name == "get_Config"
+        ? configContext : throw new NotSupportedException();
+    var configured = new AiChatPlugin();
+    typeof(PluginBase).GetProperty("Context", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .SetValue(configured, bot);
+    var component = (IConfigurableComponent)configured;
+    Check(ReferenceEquals(await component.InitializeConfigAsync(configContext), current),
+        "Host initialization must expose the loaded config.");
+    Invoke(configured, "ApplyConfigDerivatives", true);
+    var conversations = typeof(AiChatPlugin).GetField("_conversations", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .GetValue(configured);
+    var changed = new PluginConfig();
+    changed.Default.DefaultPrompt = "updated from Dashboard";
+    changed.Behaviour.ReplyWithMention = true;
+    await component.ApplyConfigAsync(changed);
+    Check(ReferenceEquals(component.CurrentConfig, changed) &&
+        ((PluginConfig)component.CurrentConfig!).Behaviour.ReplyWithMention,
+        "Host application must update the runtime configuration.");
+    Check(ReferenceEquals(conversations, typeof(AiChatPlugin)
+        .GetField("_conversations", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(configured)),
+        "Config application must preserve conversation state.");
+    try
+    {
+        await component.ApplyConfigAsync(new PluginConfig(), new CancellationToken(true));
+        throw new Exception("Cancelled config application unexpectedly succeeded.");
+    }
+    catch (OperationCanceledException) { }
+    Check(ReferenceEquals(component.CurrentConfig, changed), "Cancelled application must preserve config.");
+    await configured.OnUnload();
+    Directory.Delete(root, true);
+    Console.WriteLine("PASS: host-managed config initialization, live application, conversation preservation and cancellation");
+}
 
 if (args.Contains("--live-blog-fetch"))
 {
