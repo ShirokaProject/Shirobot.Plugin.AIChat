@@ -13,12 +13,14 @@ internal sealed class StreamingChatContent : HttpContent
     private readonly string _model;
     private readonly List<ChatMessageDescriptor> _messages;
     private readonly bool _stream;
+    private readonly int? _maxCompletionTokens;
 
-    public StreamingChatContent(string model, List<ChatMessageDescriptor> messages, bool stream = false)
+    public StreamingChatContent(string model, List<ChatMessageDescriptor> messages, bool stream = false, int? maxCompletionTokens = null)
     {
         _model = model;
         _messages = messages;
         _stream = stream;
+        _maxCompletionTokens = maxCompletionTokens;
         Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
     }
 
@@ -29,6 +31,8 @@ internal sealed class StreamingChatContent : HttpContent
 
         await writer.WriteAsync("{\"model\":").ConfigureAwait(false);
         await writer.WriteAsync(JsonEncode(_model)).ConfigureAwait(false);
+        if (_maxCompletionTokens is > 0)
+            await writer.WriteAsync($",\"max_completion_tokens\":{_maxCompletionTokens.Value}").ConfigureAwait(false);
         await writer.WriteAsync(_stream ? ",\"stream\":true,\"messages\":[" : ",\"stream\":false,\"messages\":[").ConfigureAwait(false);
 
         for (var i = 0; i < _messages.Count; i++)

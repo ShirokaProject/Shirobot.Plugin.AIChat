@@ -30,7 +30,7 @@ internal sealed class ChatToolRegistry : IDisposable
     public void Register(IChatTool tool) => _tools.Add(tool.Definition.Function.Name, tool);
 
     public async Task<string> ChatAsync(OpenAiClient client, ModelEntry model,
-        List<OpenAiMessage> messages, int maxRounds, Func<string, Task>? onContent = null, CancellationToken ct = default, IReadOnlyList<IChatTool>? contextualTools = null, bool readOnlyOnly = false)
+        List<OpenAiMessage> messages, int maxRounds, Func<string, Task>? onContent = null, CancellationToken ct = default, IReadOnlyList<IChatTool>? contextualTools = null, bool readOnlyOnly = false, int? maxOutputTokens = null)
     {
         var tools = _tools.Where(pair => !readOnlyOnly || pair.Value is IReadOnlyChatTool)
             .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
@@ -50,7 +50,8 @@ internal sealed class ChatToolRegistry : IDisposable
                 Model = model.Name,
                 Messages = messages,
                 Tools = round < maxRounds && available.Count > 0 ? available : null,
-                Stream = false
+                Stream = false,
+                MaxCompletionTokens = maxOutputTokens
             };
             // 只推送正文，工具参数在客户端按 index 拼接后交给注册表执行。
             var response = onContent is null
@@ -74,7 +75,7 @@ internal sealed class ChatToolRegistry : IDisposable
                 foreach (var rejected in response.ToolCalls)
                     messages.Add(new OpenAiMessage { Role = "tool", ToolCallId = rejected.Id, Content = "Tool round limit reached. This call was not executed. Answer from the information already obtained; disclose missing or failed fetches." });
                 messages.Add(new OpenAiMessage { Role = "system", Content = "本次工具调用已达到上限，不能再请求任何工具。请根据已获取的信息回复；没有获取到的内容请明确说明，不要猜测，不要声称已成功读取失败的页面。" });
-                var finalRequest = new OpenAiChatRequest { Model = model.Name, Messages = messages, Stream = false };
+                var finalRequest = new OpenAiChatRequest { Model = model.Name, Messages = messages, Stream = false, MaxCompletionTokens = maxOutputTokens };
                 var final = onContent is null
                     ? await client.ChatWithToolsAsync(model, finalRequest, ct).ConfigureAwait(false)
                     : await client.ChatWithToolsIncrementalAsync(model, finalRequest, text => onContent(visiblePrefix + text), ct).ConfigureAwait(false);

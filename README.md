@@ -1,6 +1,6 @@
 # ShiroBot AIChat Plugin
 
-当前发布：`v1.3.1`。本版本使用 SDK `0.9.8`，需要宿主 `0.9.8` 的新 ABI；旧宿主不兼容。
+当前发布：`v1.3.2`。本版本使用 SDK `0.9.8`，需要宿主 `0.9.8` 的新 ABI；旧宿主不兼容。
 
 ShiroBot 的 OpenAI-compatible AI 聊天插件，支持多 provider、多模型、群聊共享上下文、图片/文件输入、上下文持久化和低内存图片发送。
 
@@ -52,6 +52,7 @@ fallback_model = "" # 文本请求失败时的备用模型，留空禁用
 default_prompt = "你是一个乐于助人的助手。"
 timeout_seconds = 120
 max_concurrency = 4
+max_output_tokens = 8192 # 每次模型请求的最大输出 token 数
 default_chat_mode = "shared"
 
 [history]
@@ -79,6 +80,7 @@ warn_on_no_vision = true
 hint_on_empty_input = true
 
 [permissions]
+# 仅限制群聊 shared 会话的 #clear；single/multi 和私聊始终可由用户本人清空
 clear_admin_only = true
 admin_only_models = []
 
@@ -215,7 +217,7 @@ dotnet run --project Tests/Verification/Verification.csproj -c Release
 在 `shared` 模式下：
 
 - AI 会收到说话者标识，例如 `[群名片/123456] 今天吃什么？`
-- `#prompt`、`#model`、`#clear` 影响共享会话，仅 owner/admin 可修改
+- `#prompt`、`#model` 影响共享会话，仅 owner/admin 可修改；`#clear` 是否限管理员由 `permissions.clear_admin_only` 控制
 - `#aimode` 是用户个人设置，所有人都可以切换自己的模式
 
 ## 数据与缓存
@@ -284,7 +286,7 @@ HTTP 抓取结果同时返回 `links`（最多 60 条带标题的公网 HTTP/HTT
 `tool_use.timer_tool.use_tools_on_delivery` 默认 `true`，配置页显示“定时推送时允许使用查询工具”。开启后到期请求也可以串联已启用的 Tavily、HTTP 抓取工具；只暴露标记为只读查询的工具，禁止再次创建定时任务。仍使用默认模型和全局工具轮数，不携带对话历史。
 
 
-使用范围统一由宿主“路由”管理；插件不再配置 `permissions.allow_users` / `deny_users`。“操作权限”只保留管理员清空会话和模型切换限制。`permissions.clear_admin_only` 默认 `true`，群聊/私聊 `#clear` 都需宿主机器人所有者或管理员身份；关闭后可清空个人会话，共享会话仍仅管理员允许。
+使用范围统一由宿主“路由”管理；插件不再配置 `permissions.allow_users` / `deny_users`。“操作权限”只保留管理员清空共享会话和模型切换限制。`permissions.clear_admin_only` 默认 `true`，仅控制群聊 `shared` 模式的 `#clear`：开启时仅 owner/admin 可清空共享会话，关闭时群成员均可清空。`single`、`multi` 和私聊的个人会话始终由用户本人清空，不受此开关影响。
 
 所有工具默认开启，全局 `tool_use.max_rounds = 3`。HTTP 和 Tavily 每次回复调用上限默认 3；timer_tool 也最多调用 3 次。Tavily API 密钥为空时不注册搜索工具。定时任务默认允许使用已启用的只读查询工具。
 

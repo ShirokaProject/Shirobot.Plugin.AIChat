@@ -20,9 +20,9 @@ internal sealed class OpenAiChatRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? Temperature { get; set; }
 
-    [JsonPropertyName("max_tokens")]
+    [JsonPropertyName("max_completion_tokens")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public int? MaxTokens { get; set; }
+    public int? MaxCompletionTokens { get; set; }
 
     [JsonPropertyName("tools")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

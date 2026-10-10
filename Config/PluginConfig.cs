@@ -56,6 +56,10 @@ public sealed class DefaultSection
     [ConfigField("允许同时处理的 AI 请求数量；修改后重载插件生效。", Label = "最大并发请求数", Min = 1)]
     public int MaxConcurrency { get; set; } = 4;
 
+    /// <summary>单次模型请求允许生成的最大输出 token 数。</summary>
+    [ConfigField("每次模型请求的最大输出 token 数，适用于普通回复和工具调用轮次。", Label = "最大输出 Token", Min = 1)]
+    public int MaxOutputTokens { get; set; } = 8192;
+
     /// <summary>默认对话模式：single / multi / shared。</summary>
     [ConfigField("single：单次；multi：用户独立多轮；shared：群聊共享。", Label = "默认对话模式", Options = new[] { "single", "multi", "shared" })]
     public string DefaultChatMode { get; set; } = "shared";
@@ -169,7 +173,7 @@ public sealed class BehaviourSection
 
 public sealed class PermissionsSection
 {
-    [ConfigField("开启后群聊和私聊 #clear 均仅机器人所有者或管理员可执行。关闭后可清空个人会话；共享会话仍仅管理员可清空。", Label = "仅管理员允许 #clear")]
+    [ConfigField("仅限制 shared 模式的群聊共享会话：开启后仅机器人所有者或管理员可清空；关闭后群成员均可清空。single/multi 个人会话和私聊会话始终由用户本人清空。", Label = "shared 会话仅管理员可清空")]
     public bool ClearAdminOnly { get; set; } = true;
 
 
