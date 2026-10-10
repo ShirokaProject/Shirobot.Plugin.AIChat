@@ -12,7 +12,7 @@ public sealed class UserSettings
     public string? PreferredModel { get; set; }
 
     /// <summary>
-    /// 对话模式。null 表示使用默认（multi）。
+    /// 对话模式。null 表示使用默认（shared）。
     /// single = 单次无记录；multi = 用户独立多轮；shared = 群聊共享上下文。
     /// </summary>
     public string? ChatMode { get; set; }

@@ -148,7 +148,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         # 全局最大并发请求数
         max_concurrency = 4
         # 默认对话模式: single(单次) / multi(用户独立多轮) / shared(群聊共享)
-        default_chat_mode = "multi"
+        default_chat_mode = "shared"
 
         [owner_prompt]
         enabled = false
@@ -400,7 +400,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
           #aimode        查看当前对话模式
           #aimode <模式>  切换对话模式
             single  单次对话，不保留上下文
-            multi   多轮对话，按用户独立记录（默认）
+            multi   多轮对话，按用户独立记录
             shared  群聊共享，同群所有人共享上下文
           #prompt <文本>  设置自己的 system prompt(跨会话)
           #prompt        查看当前 prompt
@@ -1269,7 +1269,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     /// <summary>
     /// 根据用户的 ChatMode 设置决定 ConversationKey：
     /// - single: 返回一个唯一 key（不会命中缓存，等效于无历史）
-    /// - multi（默认）: 按用户独立
+    /// - multi: 按用户独立
     /// - shared: 群聊时所有人共享同一个 key（userId 固定为 0）
     /// </summary>
     private string SourceInstance() => Context.InstanceId

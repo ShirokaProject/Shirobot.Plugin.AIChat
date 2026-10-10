@@ -52,7 +52,7 @@ fallback_model = "" # 文本请求失败时的备用模型，留空禁用
 default_prompt = "你是一个乐于助人的助手。"
 timeout_seconds = 120
 max_concurrency = 4
-default_chat_mode = "multi"
+default_chat_mode = "shared"
 
 [history]
 max_turns = 20
@@ -209,8 +209,8 @@ dotnet run --project Tests/Verification/Verification.csproj -c Release
 ## 对话模式
 
 - `single`：单次无记录，每次请求只带当前消息
-- `multi`：默认模式，按用户独立保存上下文
-- `shared`：群聊共享上下文，同群内所有人共享同一个会话历史
+- `multi`：按用户独立保存上下文
+- `shared`：默认模式，群聊共享上下文，同群内所有人共享同一个会话历史
 
 在 `shared` 模式下：
 

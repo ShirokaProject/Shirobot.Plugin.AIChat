@@ -58,7 +58,7 @@ public sealed class DefaultSection
 
     /// <summary>默认对话模式：single / multi / shared。</summary>
     [ConfigField("single：单次；multi：用户独立多轮；shared：群聊共享。", Label = "默认对话模式", Options = new[] { "single", "multi", "shared" })]
-    public string DefaultChatMode { get; set; } = "multi";
+    public string DefaultChatMode { get; set; } = "shared";
 }
 
 public sealed class HistorySection
