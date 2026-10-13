@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "AIChat DebugAdapter": {
+      "commandName": "Executable",
+      "executablePath": "$(MSBuildProjectDirectory)/.debug-runtime/ShiroBot",
+      "workingDirectory": "$(MSBuildProjectDirectory)/.debug-runtime"
+    }
+  }
+}

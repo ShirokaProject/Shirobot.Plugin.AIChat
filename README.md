@@ -307,3 +307,19 @@ template = ""
 ### 0.9.8 身份与历史存储
 
 用户偏好和聊天历史按适配器实例隔离，原始用户/会话 ID 保持字符串；会话文件名使用确定性摘要以避免路径字符问题。旧版本未带实例的历史和偏好保留在原文件中，升级后不会自动分配给某个实例，以免多账号共享敏感上下文。新记录使用新的实例键和文件名。
+
+## 隔离调试与内存验证
+
+开发工作区与运行目录分开。将宿主与 `ShiroBot.Adapter.Debug` 源码分别放到插件仓库旁的
+`AIChat-debug-host`、`AIChat-debug-adapter`；也可通过 `SHIROBOT_DEBUG_HOST_SOURCE`、
+`SHIROBOT_DEBUG_ADAPTER_SOURCE` 指定位置。执行 `dev/prepare-debug.sh` 构建独立 `.debug-runtime`。
+Rider 使用 `AIChat DebugAdapter` launch profile，Debug 构建只复制插件到该独立目录。
+宿主 API、DebugAdapter 和测试上游建议分别使用 17001、15088、15090 端口。
+调试配置由开发者在 `.debug-runtime` 中创建，不读取或复制生产配置。
+
+`dotnet run --project Tests/Verification/Verification.csproj -c Release` 验证历史图片、工具协议、
+内联 Base64 尾部 padding、请求取消和分配量。模型请求所有路径使用文件流式写入，避免完整 Base64/JSON 副本；
+图片下载仍需要一份有大小限制的原始字节数组。插件卸载取消并等待后台任务，关闭模型和下载 HTTP 客户端。
+
+完整程序集热卸载还要求宿主的配置指纹不使用全局 `JsonSerializerOptions.Default` 缓存插件类型。
+旧宿主可能报告逻辑卸载完成但程序集仍有引用；单独更新插件不能修复宿主已经建立的全局缓存。

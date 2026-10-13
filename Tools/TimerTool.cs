@@ -41,16 +41,16 @@ internal sealed class TimerTool(TimerScheduler scheduler, TimerToolSection confi
         var text = textValue.GetString()!.Trim();
         if (text.Length is 0 or > 2000) return "Reminder text must contain 1 to 2000 characters.";
         // 同一消息的上游重试/回退不会重复预约相同任务。
-        var identity = JsonSerializer.Serialize(new { message.InstanceId, message.Platform, message.Channel, message.MessageId, due = due.ToUniversalTime(), text });
+        var identity = PluginJson.Serialize(new { message.InstanceId, message.Platform, message.Channel, message.MessageId, due = due.ToUniversalTime(), text });
         var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..16].ToLowerInvariant();
-        if (_staged.Any(j => j.Id == id)) return JsonSerializer.Serialize(new { id, at = due, status = "scheduled" });
+        if (_staged.Any(j => j.Id == id)) return PluginJson.Serialize(new { id, at = due, status = "scheduled" });
         var existing = await scheduler.ListAsync(message).ConfigureAwait(false);
-        if (existing.Any(j => j.Id == id)) return JsonSerializer.Serialize(new { id, at = due, status = "scheduled" });
+        if (existing.Any(j => j.Id == id)) return PluginJson.Serialize(new { id, at = due, status = "scheduled" });
         if (existing.Count(j => j.UserId == message.Sender.Id) + _staged.Count >= Math.Clamp(config.MaxPendingPerUser, 1, 100))
             return "Pending reminder limit reached for this user in this conversation.";
         _staged.Add(new TimerJob(id, message.InstanceId, message.Platform, message.Channel.Type, message.Channel.Id,
             message.Sender.Id, message.Member?.DisplayName ?? message.Sender.Name ?? message.Sender.Id, message.MessageId, due, text));
-        return JsonSerializer.Serialize(new { id, at = due, text, status = "scheduled" });
+        return PluginJson.Serialize(new { id, at = due, text, status = "scheduled" });
     }
     public void ResetAttempt() => _staged.Clear();
     public Task CommitAsync(CancellationToken ct) => scheduler.AddAsync(_staged, config, ct);

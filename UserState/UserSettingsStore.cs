@@ -28,7 +28,8 @@ internal sealed class UserSettingsStore
             WriteIndented = true,
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             PropertyNameCaseInsensitive = true,
-            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            TypeInfoResolver = PluginJson.Resolver,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
         };
 
         _byUser = new ConcurrentDictionary<string, UserSettings>(LoadFromDisk());
@@ -49,7 +50,7 @@ internal sealed class UserSettingsStore
         try
         {
             var snapshot = _byUser.ToDictionary(p => p.Key, p => p.Value);
-            var json = JsonSerializer.Serialize(snapshot, _jsonOptions);
+            var json = PluginJson.Serialize(snapshot, _jsonOptions);
 
             var tempPath = _filePath + ".tmp";
             await File.WriteAllTextAsync(tempPath, json).ConfigureAwait(false);
@@ -90,7 +91,7 @@ internal sealed class UserSettingsStore
                 return result;
             }
 
-            var raw = JsonSerializer.Deserialize<Dictionary<string, UserSettings>>(json, _jsonOptions);
+            var raw = PluginJson.Deserialize<Dictionary<string, UserSettings>>(json, _jsonOptions);
             if (raw is null)
             {
                 return result;

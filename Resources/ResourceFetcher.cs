@@ -47,7 +47,9 @@ internal sealed class ResourceFetcher : IDisposable
             }
 
             await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            using var ms = new MemoryStream();
+            var capacity = response.Content.Headers.ContentLength is >= 0 and <= int.MaxValue
+                ? (int)response.Content.Headers.ContentLength.Value : 0;
+            using var ms = new MemoryStream(capacity);
             var buffer = new byte[8192];
             int read;
             while ((read = await stream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
@@ -59,7 +61,9 @@ internal sealed class ResourceFetcher : IDisposable
                 await ms.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
             }
 
-            return (ms.ToArray(), response.Content.Headers.ContentType?.MediaType);
+            var bytes = ms.Length == ms.Capacity && ms.TryGetBuffer(out var data)
+                ? data.Array! : ms.ToArray();
+            return (bytes, response.Content.Headers.ContentType?.MediaType);
         }
         catch (Exception ex) when (ex is not InvalidOperationException)
         {

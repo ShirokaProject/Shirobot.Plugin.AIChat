@@ -50,7 +50,7 @@ internal sealed class HttpFetchTool : IReadOnlyChatTool
             BotLog.Info($"[AiChat] ToolUse http_fetch 长文本摘要开始 source_chars={text.Length} input_chars={input.Length} source_truncated={sourceTruncated}");
             try
             {
-                var summary = await _summarize(JsonSerializer.Serialize(new { source_url = page.Url, source_truncated = sourceTruncated, untrusted_page_text = input }), ct).ConfigureAwait(false);
+                var summary = await _summarize(PluginJson.Serialize(new { source_url = page.Url, source_truncated = sourceTruncated, untrusted_page_text = input }), ct).ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(summary))
                 {
                     text = summary; summarized = true;
@@ -64,7 +64,7 @@ internal sealed class HttpFetchTool : IReadOnlyChatTool
         }
         ct.ThrowIfCancellationRequested();
         var truncated = text.Length > maxChars;
-        return JsonSerializer.Serialize(new { url = page.Url, text = Clip(text, maxChars), links = page.Links, images = page.Images, summarized, truncated, source_truncated = sourceTruncated,
+        return PluginJson.Serialize(new { url = page.Url, text = Clip(text, maxChars), links = page.Links, images = page.Images, summarized, truncated, source_truncated = sourceTruncated,
             trust = "untrusted_external_data" });
     }
     private static string Clip(string text, int limit)
@@ -84,7 +84,7 @@ internal sealed class HttpFetchTool : IReadOnlyChatTool
             for (var redirects = 0; ; redirects++)
             {
                 PublicHttpPolicy.ValidateUrl(url);
-                BotLog.Info($"[AiChat] ToolUse http_fetch 请求 target={JsonSerializer.Serialize(url.GetLeftPart(UriPartial.Path))}");
+                BotLog.Info($"[AiChat] ToolUse http_fetch 请求 target={PluginJson.Serialize(url.GetLeftPart(UriPartial.Path))}");
                 response = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
                 if (response.StatusCode is not (HttpStatusCode.MovedPermanently or HttpStatusCode.Redirect or HttpStatusCode.SeeOther or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect)) break;
                 var next = response.Headers.Location;

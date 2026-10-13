@@ -117,7 +117,7 @@ internal sealed class ChatToolRegistry : IDisposable
     }
 
     private static string DescribeCall(string name, string? callId, string model, int round) =>
-        $"tool={JsonSerializer.Serialize(name)} call_id={JsonSerializer.Serialize(callId)} model={JsonSerializer.Serialize(model)} round={round}";
+        $"tool={PluginJson.Serialize(name)} call_id={PluginJson.Serialize(callId)} model={PluginJson.Serialize(model)} round={round}";
 
     internal static async Task<string> ExecuteLoggedAsync(IChatTool tool, string arguments, string details, CancellationToken ct)
     {

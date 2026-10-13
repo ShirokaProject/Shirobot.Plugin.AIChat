@@ -25,6 +25,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
     private readonly string _httpProxy = httpProxy;
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
+        TypeInfoResolver = PluginJson.Resolver,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         // content 字段是 object，需要默认 polymorphic 处理 string vs list
     };
@@ -55,14 +56,8 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-        var bodyJson = JsonSerializer.Serialize(request, _jsonOptions);
-
-        // 诊断日志
-        var imageOccurrences = CountSubstring(bodyJson, "\"type\":\"image_url\"");
-        var hasDataUrl = bodyJson.Contains("\"url\":\"data:image", StringComparison.Ordinal);
-        BotLog.Info($"[AiChat] 请求 {model.Name}: messages={request.Messages.Count}, image_url 段={imageOccurrences}, 含data:image={hasDataUrl}, body 长度={bodyJson.Length}");
-
-        httpReq.Content = new StringContent(bodyJson, Encoding.UTF8, "application/json");
+        BotLog.Info($"[AiChat] 请求 {model.Name}: messages={request.Messages.Count}, body=streaming");
+        httpReq.Content = new StreamingChatContent(request);
 
         return await SendAndParseAsync(http, httpReq, ct).ConfigureAwait(false);
     }
@@ -79,7 +74,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         using var httpReq = new HttpRequestMessage(HttpMethod.Post, JoinUrl(baseUrl, "chat/completions"));
         httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        httpReq.Content = new StringContent(JsonSerializer.Serialize(request, _jsonOptions), Encoding.UTF8, "application/json");
+        httpReq.Content = new StreamingChatContent(request);
         return await SendAndParseMessageAsync(GetClient(baseUrl), httpReq, ct).ConfigureAwait(false);
     }
 
@@ -100,7 +95,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         using var httpReq = new HttpRequestMessage(HttpMethod.Post, JoinUrl(baseUrl, "chat/completions"));
         httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-        httpReq.Content = new StringContent(JsonSerializer.Serialize(request, _jsonOptions), Encoding.UTF8, "application/json");
+        httpReq.Content = new StreamingChatContent(request);
         return await SendIncrementalMessageAsync(GetClient(baseUrl), httpReq, onContent, ct).ConfigureAwait(false);
     }
 
@@ -186,7 +181,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         {
             // 部分兼容接口忽略 stream:true，返回普通 JSON。
             var raw = firstLine + "\n" + await reader.ReadToEndAsync(timeout.Token).ConfigureAwait(false);
-            var parsed = JsonSerializer.Deserialize<OpenAiChatResponse>(raw, _jsonOptions);
+            var parsed = PluginJson.Deserialize<OpenAiChatResponse>(raw, _jsonOptions);
             if (parsed?.Error?.Message is { } error) throw new InvalidOperationException(error);
             var message = parsed?.Choices?.FirstOrDefault()?.Message ?? throw new EmptyUpstreamResponseException();
             if (!string.IsNullOrWhiteSpace(message.Content)) await onContent(message.Content).ConfigureAwait(false);
@@ -313,7 +308,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         OpenAiChatResponse? parsed;
         try
         {
-            parsed = JsonSerializer.Deserialize<OpenAiChatResponse>(raw, _jsonOptions);
+            parsed = PluginJson.Deserialize<OpenAiChatResponse>(raw, _jsonOptions);
         }
         catch (JsonException ex)
         {

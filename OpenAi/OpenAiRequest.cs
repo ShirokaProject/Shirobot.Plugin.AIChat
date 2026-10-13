@@ -35,8 +35,8 @@ internal sealed class OpenAiMessage
     public string Role { get; set; } = "user";
 
     /// <summary>
-    /// 可以是 string 或 List&lt;Dictionary&lt;string, object&gt;&gt;。
-    /// 用 object 让 System.Text.Json 自然序列化两种情况，
+    /// 可以是 string、ChatMessageDescriptor 或兼容的多模态字典列表。
+    /// 图片描述由 StreamingChatContent 在发送阶段流式展开，
     /// 不依赖 [JsonPolymorphic]，避免 type discriminator 顺序之类的隐形问题。
     /// </summary>
     [JsonPropertyName("content")]

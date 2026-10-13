@@ -35,6 +35,7 @@ internal sealed class ContentSegment
     /// <summary>.b64 文件的绝对路径（Kind == Image 时使用）。</summary>
     public string? B64FilePath { get; init; }
 
-    /// <summary>图片的 data URL 前缀，如 "data:image/png;base64,"（Kind == Image 且无 .b64 文件时的 inline fallback）。</summary>
-    public string? InlineDataUrl { get; init; }
+    /// <summary>Cache-write fallback. Encoded in bounded chunks while sending.</summary>
+    public byte[]? InlineBytes { get; init; }
+    public string? Mime { get; init; }
 }

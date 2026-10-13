@@ -25,7 +25,8 @@ internal sealed class ConversationStore
         _jsonOptions = new JsonSerializerOptions
         {
             WriteIndented = false,
-            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            TypeInfoResolver = PluginJson.Resolver,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
         };
         if (_persist)
         {
@@ -103,7 +104,7 @@ internal sealed class ConversationStore
                 SharedPrompt = state.SharedPrompt,
                 SharedModel = state.SharedModel
             };
-            var json = JsonSerializer.Serialize(meta, _jsonOptions);
+            var json = PluginJson.Serialize(meta, _jsonOptions);
             File.WriteAllText(path, json, Encoding.UTF8);
         }
         catch (Exception ex)
@@ -151,7 +152,7 @@ internal sealed class ConversationStore
             {
                 foreach (var turn in state.Turns)
                 {
-                    await writer.WriteLineAsync(JsonSerializer.Serialize(turn, _jsonOptions)).ConfigureAwait(false);
+                    await writer.WriteLineAsync(PluginJson.Serialize(turn, _jsonOptions)).ConfigureAwait(false);
                 }
             }
 
@@ -218,7 +219,7 @@ internal sealed class ConversationStore
 
                 try
                 {
-                    var turn = JsonSerializer.Deserialize<ChatTurn>(line, _jsonOptions);
+                    var turn = PluginJson.Deserialize<ChatTurn>(line, _jsonOptions);
                     if (turn is not null) state.Turns.Add(turn);
                 }
                 catch (JsonException ex)
@@ -249,7 +250,7 @@ internal sealed class ConversationStore
         try
         {
             var json = File.ReadAllText(path, Encoding.UTF8);
-            var meta = JsonSerializer.Deserialize<ConversationMetadata>(json, _jsonOptions);
+            var meta = PluginJson.Deserialize<ConversationMetadata>(json, _jsonOptions);
             if (meta is not null)
             {
                 state.SharedPrompt = meta.SharedPrompt;
@@ -277,8 +278,8 @@ internal sealed class ConversationStore
                 useAsync: true);
             await using var writer = new StreamWriter(stream, new UTF8Encoding(false));
 
-            await writer.WriteLineAsync(JsonSerializer.Serialize(userTurn, _jsonOptions)).ConfigureAwait(false);
-            await writer.WriteLineAsync(JsonSerializer.Serialize(assistantTurn, _jsonOptions)).ConfigureAwait(false);
+            await writer.WriteLineAsync(PluginJson.Serialize(userTurn, _jsonOptions)).ConfigureAwait(false);
+            await writer.WriteLineAsync(PluginJson.Serialize(assistantTurn, _jsonOptions)).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

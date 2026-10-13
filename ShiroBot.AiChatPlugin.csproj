@@ -7,14 +7,14 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
         <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-        <HostPluginDir>..\..\ShiroBot\Core\bin\Debug\$(TargetFramework)\plugins\$(AssemblyName)\</HostPluginDir>
+        <HostPluginDir>$(MSBuildProjectDirectory)/.debug-runtime/plugins/AiChatPlugin/</HostPluginDir>
         <Configurations>Debug;DebugPlugin;DebugAdapter;DebugAll;Release</Configurations>
         <ShiroBotPluginPackagingEnabled>true</ShiroBotPluginPackagingEnabled>
         <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram</ShiroBotPluginSharedAssemblies>
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Remove="Tests/**/*.cs" />
+        <Compile Remove="Tests/**/*.cs;dev/**/*.cs" />
         <InternalsVisibleTo Include="ShiroBot.AiChatPlugin.Verification" />
         <PackageReference Include="ShiroBot.SDK" Version="0.9.8" />
     </ItemGroup>

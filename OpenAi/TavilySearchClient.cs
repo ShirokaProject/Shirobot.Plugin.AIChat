@@ -27,7 +27,7 @@ internal sealed class TavilySearchClient : IDisposable
 
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.tavily.com/search");
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _config.ApiKey);
-        request.Content = new StringContent(JsonSerializer.Serialize(new
+        request.Content = new StringContent(PluginJson.Serialize(new
         {
             query,
             search_depth = searchDepth,

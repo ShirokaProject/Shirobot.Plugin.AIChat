@@ -34,6 +34,9 @@ namespace ShiroBot.AiChatPlugin;
 public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConfig>
 {
     private PluginConfig _config = new();
+    private readonly CancellationTokenSource _backgroundStop = new();
+    private readonly Lock _backgroundGate = new();
+    private readonly HashSet<Task> _recallTasks = [];
     private readonly Dictionary<string, string> _selfNames = new(StringComparer.OrdinalIgnoreCase);
 
     private ConversationStore _conversations = null!;
@@ -106,8 +109,17 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
     protected override async Task OnUnloadAsync()
     {
+        await _backgroundStop.CancelAsync().ConfigureAwait(false);
+        Task[] recalls;
+        lock (_backgroundGate) recalls = _recallTasks.ToArray();
+        await Task.WhenAll(recalls).ConfigureAwait(false);
+        await _pendingRequests.StopAsync().ConfigureAwait(false);
         if (_timerScheduler is not null) await _timerScheduler.DisposeAsync().ConfigureAwait(false);
+        _openAi?.Dispose();
+        _fetcher?.Dispose();
         _tools.Dispose();
+        _globalConcurrency?.Dispose();
+        _backgroundStop.Dispose();
         BotLog.Info("[AiChat] 插件已卸载。");
     }
 
@@ -583,7 +595,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         try { await ProcessAiCoreAsync(message, key, prefixToStrip, isGroup, invokedByMention, pending).ConfigureAwait(false); }
         catch (Exception) when (pending.Token.IsCancellationRequested)
         {
-            BotLog.Info("[AiChat] 原消息已撤回，放弃尚未回复的请求。");
+            BotLog.Info("[AiChat] 请求已取消，停止处理。");
         }
     }
 
@@ -1594,11 +1606,11 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     }
                     else if (ip.InlineBytes is { Length: > 0 })
                     {
-                        // fallback: 内存中有 inline bytes，生成 data URL
+                        // 缓存失败时保留原字节，发送阶段分块编码
                         var mime = MimeGuesser.SniffImageMime(ip.InlineBytes)
                                    ?? (ip.Mime.StartsWith("image/", StringComparison.Ordinal) ? ip.Mime : "image/png");
-                        var dataUrl = $"data:{mime};base64,{Convert.ToBase64String(ip.InlineBytes)}";
-                        segments.Add(new ContentSegment { Kind = SegmentKind.Image, InlineDataUrl = dataUrl });
+                        segments.Add(new ContentSegment { Kind = SegmentKind.Image,
+                            InlineBytes = ip.InlineBytes, Mime = mime });
                     }
                     else
                     {
@@ -1648,124 +1660,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
     private OpenAiMessage TurnToMessage(ChatTurn turn, bool includeImages)
     {
-        // assistant 消息：直接 string 形式（绝大多数模型只生成纯文本）。
-        if (turn.Role == "assistant")
-        {
-            var combined = string.Concat(turn.Parts.OfType<TextPart>().Select(p => p.Text));
-            return new OpenAiMessage
-            {
-                Role = "assistant",
-                Content = combined
-            };
-        }
-
-        // user 消息：按多模态数组形式组装。每一段都是 { "type": "...", ... } 的扁平字典。
-        var contentParts = new List<Dictionary<string, object>>();
-        var hasImage = false;
-
-        foreach (var p in turn.Parts)
-        {
-            switch (p)
-            {
-                case TextPart tp:
-                    if (!string.IsNullOrEmpty(tp.Text))
-                    {
-                        contentParts.Add(new Dictionary<string, object>
-                        {
-                            ["type"] = "text",
-                            ["text"] = tp.Text
-                        });
-                    }
-                    break;
-
-                case ImagePart ip:
-                    if (!includeImages)
-                    {
-                        contentParts.Add(new Dictionary<string, object>
-                        {
-                            ["type"] = "text",
-                            ["text"] = "[图片已省略，历史上下文不再附带图片内容。]"
-                        });
-                        break;
-                    }
-
-                    var imageDataUrl = TryReadImageAsDataUrl(ip);
-                    if (imageDataUrl is not null)
-                    {
-                        contentParts.Add(new Dictionary<string, object>
-                        {
-                            ["type"] = "image_url",
-                            ["image_url"] = new Dictionary<string, object>
-                            {
-                                ["url"] = imageDataUrl
-                            }
-                        });
-                        hasImage = true;
-                    }
-                    else
-                    {
-                        contentParts.Add(new Dictionary<string, object>
-                        {
-                            ["type"] = "text",
-                            ["text"] = "[图片读取失败]"
-                        });
-                    }
-                    break;
-
-                case FileTextPart ft:
-                    var truncMark = ft.Truncated ? " (已截断)" : "";
-                    contentParts.Add(new Dictionary<string, object>
-                    {
-                        ["type"] = "text",
-                        ["text"] = $"[文件: {ft.Name} ({ft.Size} 字节){truncMark}]\n```\n{ft.Excerpt}\n```"
-                    });
-                    break;
-
-                case FileMetaPart fm:
-                    var hashStr = string.IsNullOrEmpty(fm.Sha256) ? "" : $", sha256={fm.Sha256}";
-                    contentParts.Add(new Dictionary<string, object>
-                    {
-                        ["type"] = "text",
-                        ["text"] = $"[文件: {fm.Name} ({fm.Size} 字节{hashStr}) (二进制内容未加载)]"
-                    });
-                    break;
-            }
-        }
-
-        AppendUserTimestamp(contentParts, turn);
-
-        // 关键: 一旦有图片，必须用数组形式，绝不能塌缩成字符串，
-        // 否则模型完全看不到图片，只会收到一段纯文本。
-        if (hasImage)
-        {
-            if (contentParts.Count == 0)
-            {
-                // 极端情况，加一段空文本占位（应当不会触发）
-                contentParts.Add(new Dictionary<string, object>
-                {
-                    ["type"] = "text",
-                    ["text"] = ""
-                });
-            }
-            return new OpenAiMessage { Role = turn.Role, Content = contentParts };
-        }
-
-        // 没有图片时，单段纯文本可以塌缩为 string 形式（最大兼容）
-        if (contentParts.Count == 1 &&
-            contentParts[0].TryGetValue("type", out var t) &&
-            t is string and "text" &&
-            contentParts[0].TryGetValue("text", out var textObj) &&
-            textObj is string textStr)
-        {
-            return new OpenAiMessage { Role = turn.Role, Content = textStr };
-        }
-
-        if (contentParts.Count == 0)
-        {
-            return new OpenAiMessage { Role = turn.Role, Content = "" };
-        }
-
-        return new OpenAiMessage { Role = turn.Role, Content = contentParts };
+        var descriptor = TurnToDescriptor(turn, includeImages);
+        return new OpenAiMessage { Role = turn.Role, Content = descriptor };
     }
 
     private static void AppendUserTimestamp(List<ContentSegment> segments, ChatTurn turn)
@@ -1788,58 +1684,6 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
     private static string FormatUserTimestamp(long timestamp) =>
         $"[消息时间: {DateTimeOffset.FromUnixTimeMilliseconds(timestamp).LocalDateTime:yyyy-MM-dd HH:mm:ss zzz}]";
-
-    /// <summary>
-    /// 把图片转成完整的 data URL。优先级：
-    /// 1) <see cref="ImagePart.InlineBytes"/>（缓存写盘失败时的兜底）
-    /// 2) <see cref="ImagePart.CachePath"/> 落盘文件
-    /// 任一来源都失败时返回 null，调用方降级为提示文本。
-    /// 这样能保证发给模型的永远是合法的 base64 图片，不会出现空 data URL 或错 mime。
-    /// </summary>
-    /// <summary>
-    /// 把图片转成完整的 data URL。优先从 .b64 缓存文件直接读取（零转换），
-    /// 回退到 InlineBytes 时用 ArrayPool 分块编码。
-    /// </summary>
-    private string? TryReadImageAsDataUrl(ImagePart ip)
-    {
-        try
-        {
-            // 优先从 .b64 缓存读取（零转换，零大对象）
-            var cached = _cache.ReadDataUrl(ip.CachePath);
-            if (cached is not null) return cached;
-
-            // 回退：InlineBytes（仅在缓存写入失败时存在）
-            if (ip.InlineBytes is { Length: > 0 } inline)
-            {
-                var mime = MimeGuesser.SniffImageMime(inline)
-                           ?? (ip.Mime.StartsWith("image/", StringComparison.Ordinal) ? ip.Mime : "image/png");
-
-                // 分块编码避免大字符串进 LOH
-                var base64Length = ((inline.Length + 2) / 3) * 4;
-                var prefix = $"data:{mime};base64,";
-                var sb = new StringBuilder(prefix.Length + base64Length);
-                sb.Append(prefix);
-
-                const int chunkSize = 48 * 1024;
-                var offset = 0;
-                while (offset < inline.Length)
-                {
-                    var count = Math.Min(chunkSize, inline.Length - offset);
-                    sb.Append(Convert.ToBase64String(inline, offset, count));
-                    offset += count;
-                }
-                return sb.ToString();
-            }
-
-            BotLog.Warning($"[AiChat] 图片缺少可用字节源 (cachePath={ip.CachePath ?? "<null>"})");
-            return null;
-        }
-        catch (Exception ex)
-        {
-            BotLog.Warning($"[AiChat] 读取图片失败 {ip.CachePath ?? "<inline>"}: {ex.Message}");
-            return null;
-        }
-    }
 
     private async Task ReplyAssistantAsync(MessageEvent message, bool isGroup, string text)
     {
@@ -1927,17 +1771,24 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     /// </summary>
     private void ScheduleRecall(Channel channel, string messageId, int delaySeconds)
     {
-        _ = Task.Run(async () =>
+        lock (_backgroundGate)
         {
-            try
+            if (_backgroundStop.IsCancellationRequested) return;
+            var token = _backgroundStop.Token;
+            var task = Task.Run(async () =>
             {
-                await Task.Delay(TimeSpan.FromSeconds(delaySeconds)).ConfigureAwait(false);
-                await Context.Message.DeleteMessageAsync(channel, messageId).ConfigureAwait(false);
-            }
-            catch
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token).ConfigureAwait(false);
+                    await Context.Message.DeleteMessageAsync(channel, messageId, token).ConfigureAwait(false);
+                }
+                catch { /* cancellation or missing platform permissions */ }
+            });
+            _recallTasks.Add(task);
+            _ = task.ContinueWith(completed =>
             {
-                // 撤回失败（权限不足等）静默忽略
-            }
-        });
+                lock (_backgroundGate) _recallTasks.Remove(completed);
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
     }
 }

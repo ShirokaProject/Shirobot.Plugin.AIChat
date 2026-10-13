@@ -24,7 +24,7 @@ internal sealed class TimerScheduler : IAsyncDisposable
         _path = Path.Combine(pluginRoot, "data", "timers.json");
         _enabled = enabled; _send = send;
         // 文件损坏时保留原文件并报错，避免悄悄覆盖用户任务。
-        _jobs = File.Exists(_path) ? JsonSerializer.Deserialize<List<TimerJob>>(File.ReadAllText(_path)) ?? [] : [];
+        _jobs = File.Exists(_path) ? PluginJson.Deserialize<List<TimerJob>>(File.ReadAllText(_path)) ?? [] : [];
     }
     public void Start() { _worker ??= Task.Run(RunAsync); }
     internal static bool SameChannel(TimerJob job, MessageEvent message) =>
@@ -63,7 +63,7 @@ internal sealed class TimerScheduler : IAsyncDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
         var temporary = _path + ".tmp";
-        await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(jobs), ct).ConfigureAwait(false);
+        await File.WriteAllTextAsync(temporary, PluginJson.Serialize(jobs), ct).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
         File.Move(temporary, _path, overwrite: true);
     }

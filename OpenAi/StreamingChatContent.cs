@@ -1,143 +1,163 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ShiroBot.AiChatPlugin.OpenAi;
 
-/// <summary>
-/// 自定义 HttpContent，流式写 JSON body。图片 data URL 从 .b64 文件直接流式拷贝到 HTTP 流，
-/// 不在托管堆上产生完整的大 string。
-/// </summary>
+/// <summary>Streams all request variants, including tools and historical images.</summary>
 internal sealed class StreamingChatContent : HttpContent
 {
-    private readonly string _model;
-    private readonly List<ChatMessageDescriptor> _messages;
-    private readonly bool _stream;
-    private readonly int? _maxCompletionTokens;
-
-    public StreamingChatContent(string model, List<ChatMessageDescriptor> messages, bool stream = false, int? maxCompletionTokens = null)
+    private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        _model = model;
-        _messages = messages;
-        _stream = stream;
-        _maxCompletionTokens = maxCompletionTokens;
+        TypeInfoResolver = PluginJson.Resolver,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+    static StreamingChatContent() => JsonOptions.Converters.Add(new AnonymousJsonConverterFactory());
+    private OpenAiChatRequest? _request;
+
+    public StreamingChatContent(OpenAiChatRequest request)
+    {
+        _request = request;
         Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
     }
 
-    protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
-    {
-        // 用不带 BOM 的 UTF-8 编码
-        var writer = new StreamWriter(stream, new UTF8Encoding(false), bufferSize: 8192, leaveOpen: true);
-
-        await writer.WriteAsync("{\"model\":").ConfigureAwait(false);
-        await writer.WriteAsync(JsonEncode(_model)).ConfigureAwait(false);
-        if (_maxCompletionTokens is > 0)
-            await writer.WriteAsync($",\"max_completion_tokens\":{_maxCompletionTokens.Value}").ConfigureAwait(false);
-        await writer.WriteAsync(_stream ? ",\"stream\":true,\"messages\":[" : ",\"stream\":false,\"messages\":[").ConfigureAwait(false);
-
-        for (var i = 0; i < _messages.Count; i++)
+    public StreamingChatContent(string model, List<ChatMessageDescriptor> messages,
+        bool stream = false, int? maxCompletionTokens = null)
+        : this(new OpenAiChatRequest
         {
-            if (i > 0) await writer.WriteAsync(',').ConfigureAwait(false);
-            await WriteMessageAsync(writer, stream, _messages[i]).ConfigureAwait(false);
+            Model = model, Stream = stream, MaxCompletionTokens = maxCompletionTokens,
+            Messages = messages.Select(m => new OpenAiMessage { Role = m.Role, Content = m }).ToList()
+        }) { }
+
+    protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+        => SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+    protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken ct)
+    {
+        var request = _request ?? throw new ObjectDisposedException(nameof(StreamingChatContent));
+        // Small metadata is serialized separately; an image never enters a complete JSON buffer.
+        await WriteAsync(stream, "{\"model\":", ct);
+        await JsonSerializer.SerializeAsync(stream, request.Model, JsonOptions, ct);
+        await WriteAsync(stream, request.Stream ? ",\"stream\":true" : ",\"stream\":false", ct);
+        if (request.Temperature is {} temperature)
+        {
+            await WriteAsync(stream, ",\"temperature\":", ct);
+            await JsonSerializer.SerializeAsync(stream, temperature, JsonOptions, ct);
         }
-
-        await writer.WriteAsync("]}").ConfigureAwait(false);
-        await writer.FlushAsync().ConfigureAwait(false);
-    }
-
-    protected override bool TryComputeLength(out long length)
-    {
-        length = -1;
-        return false; // chunked transfer
-    }
-
-    private static async Task WriteMessageAsync(StreamWriter writer, Stream rawStream, ChatMessageDescriptor msg)
-    {
-        await writer.WriteAsync("{\"role\":").ConfigureAwait(false);
-        await writer.WriteAsync(JsonEncode(msg.Role)).ConfigureAwait(false);
-        await writer.WriteAsync(",\"content\":").ConfigureAwait(false);
-
-        if (msg is { HasImage: false, Segments: [{ Kind: SegmentKind.Text }] })
+        if (request.MaxCompletionTokens is {} tokens)
         {
-            // 纯文本消息：content 为 string
-            await writer.WriteAsync(JsonEncode(msg.Segments[0].Text ?? "")).ConfigureAwait(false);
+            await WriteAsync(stream, ",\"max_completion_tokens\":", ct);
+            await JsonSerializer.SerializeAsync(stream, tokens, JsonOptions, ct);
         }
-        else
+        if (request.Tools is {} tools)
         {
-            // 多模态消息：content 为数组
-            await writer.WriteAsync('[').ConfigureAwait(false);
-            var first = true;
-            foreach (var seg in msg.Segments)
+            await WriteAsync(stream, ",\"tools\":", ct);
+            var schemas = tools.Select(tool => new OpenAiTool
             {
-                if (!first) await writer.WriteAsync(',').ConfigureAwait(false);
-                first = false;
-
-                if (seg.Kind == SegmentKind.Text)
+                Type = tool.Type,
+                Function = new OpenAiToolFunction
                 {
-                    await writer.WriteAsync("{\"type\":\"text\",\"text\":").ConfigureAwait(false);
-                    await writer.WriteAsync(JsonEncode(seg.Text ?? "")).ConfigureAwait(false);
-                    await writer.WriteAsync('}').ConfigureAwait(false);
+                    Name = tool.Function.Name, Description = tool.Function.Description,
+                    Parameters = PluginJson.ToJsonValue(tool.Function.Parameters)!
                 }
-                else // Image
-                {
-                    await writer.WriteAsync("{\"type\":\"image_url\",\"image_url\":{\"url\":\"").ConfigureAwait(false);
-
-                    // Flush writer buffer 到底层 stream，然后直接写文件内容
-                    await writer.FlushAsync().ConfigureAwait(false);
-
-                    if (seg.B64FilePath is not null && File.Exists(seg.B64FilePath))
-                    {
-                        // 从 .b64 文件流式拷贝（文件内容就是 data:mime;base64,...）
-                        // data URL 字符集不需要 JSON 转义，可以直接写入
-                        await using var fs = new FileStream(seg.B64FilePath, FileMode.Open, FileAccess.Read,
-                            FileShare.Read, bufferSize: 16384, useAsync: true);
-                        await fs.CopyToAsync(rawStream).ConfigureAwait(false);
-                        await rawStream.FlushAsync().ConfigureAwait(false);
-                    }
-                    else if (seg.InlineDataUrl is not null)
-                    {
-                        // fallback: 已经在内存里的 data URL（仅缓存写入失败时）
-                        var bytes = Encoding.UTF8.GetBytes(seg.InlineDataUrl);
-                        await rawStream.WriteAsync(bytes).ConfigureAwait(false);
-                    }
-
-                    // 继续用 writer 写闭合部分（writer 内部 buffer 已 flush，位置正确）
-                    await writer.WriteAsync("\"}}").ConfigureAwait(false);
-                }
-            }
-            await writer.WriteAsync(']').ConfigureAwait(false);
+            }).ToList();
+            await JsonSerializer.SerializeAsync(stream, schemas, JsonOptions, ct);
         }
-
-        await writer.WriteAsync('}').ConfigureAwait(false);
+        await WriteAsync(stream, ",\"messages\":[", ct);
+        for (int i = 0; i < request.Messages.Count; i++)
+        {
+            if (i != 0) await WriteAsync(stream, ",", ct);
+            var message = request.Messages[i];
+            await WriteAsync(stream, "{\"role\":", ct);
+            await JsonSerializer.SerializeAsync(stream, message.Role, JsonOptions, ct);
+            await WriteAsync(stream, ",\"content\":", ct);
+            if (message.Content is ChatMessageDescriptor descriptor)
+                await WriteContentAsync(stream, descriptor, ct);
+            else
+                await JsonSerializer.SerializeAsync(stream, message.Content, JsonOptions, ct);
+            if (message.ToolCallId is {} callId)
+            {
+                await WriteAsync(stream, ",\"tool_call_id\":", ct);
+                await JsonSerializer.SerializeAsync(stream, callId, JsonOptions, ct);
+            }
+            if (message.ReasoningContent is {} reasoning)
+            {
+                await WriteAsync(stream, ",\"reasoning_content\":", ct);
+                await JsonSerializer.SerializeAsync(stream, reasoning, JsonOptions, ct);
+            }
+            if (message.ToolCalls is {} calls)
+            {
+                await WriteAsync(stream, ",\"tool_calls\":", ct);
+                await JsonSerializer.SerializeAsync(stream, calls, JsonOptions, ct);
+            }
+            await WriteAsync(stream, "}", ct);
+        }
+        await WriteAsync(stream, "]}", ct);
     }
 
-    /// <summary>
-    /// 简单 JSON string 编码（带引号）。处理转义字符。
-    /// </summary>
-    private static string JsonEncode(string value)
+    protected override void Dispose(bool disposing)
     {
-        var sb = new StringBuilder(value.Length + 2);
-        sb.Append('"');
-        foreach (var c in value)
+        if (disposing) _request = null;
+        base.Dispose(disposing);
+    }
+
+    protected override bool TryComputeLength(out long length) { length = 0; return false; }
+
+    private static Task WriteAsync(Stream stream, string text, CancellationToken ct)
+        => stream.WriteAsync(Encoding.UTF8.GetBytes(text), ct).AsTask();
+
+    private static async Task WriteContentAsync(Stream stream, ChatMessageDescriptor message, CancellationToken ct)
+    {
+        if (message.Segments is [{ Kind: SegmentKind.Text } textSegment])
         {
-            switch (c)
+            await JsonSerializer.SerializeAsync(stream, textSegment.Text ?? "", JsonOptions, ct);
+            return;
+        }
+        await WriteAsync(stream, "[", ct);
+        for (int i = 0; i < message.Segments.Count; i++)
+        {
+            if (i != 0) await WriteAsync(stream, ",", ct);
+            var segment = message.Segments[i];
+            if (segment.Kind == SegmentKind.Text)
             {
-                case '"': sb.Append("\\\""); break;
-                case '\\': sb.Append("\\\\"); break;
-                case '\n': sb.Append("\\n"); break;
-                case '\r': sb.Append("\\r"); break;
-                case '\t': sb.Append("\\t"); break;
-                case '\b': sb.Append("\\b"); break;
-                case '\f': sb.Append("\\f"); break;
-                default:
-                    if (c < 0x20)
-                        sb.Append($"\\u{(int)c:X4}");
-                    else
-                        sb.Append(c);
-                    break;
+                await WriteAsync(stream, "{\"type\":\"text\",\"text\":", ct);
+                await JsonSerializer.SerializeAsync(stream, segment.Text ?? "", JsonOptions, ct);
+                await WriteAsync(stream, "}", ct);
+            }
+            else
+            {
+                await WriteAsync(stream, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"", ct);
+                if (segment.B64FilePath is {} path)
+                {
+                    // These files are generated internally and contain only a data-URL prefix and base64.
+                    await using var file = new FileStream(path, FileMode.Open, FileAccess.Read,
+                        FileShare.Read, 4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    await file.CopyToAsync(stream, 16384, ct);
+                }
+                else if (segment.InlineBytes is {} bytes)
+                {
+                    await WriteAsync(stream, $"data:{segment.Mime};base64,", ct);
+                    var buffer = ArrayPool<byte>.Shared.Rent(16384);
+                    try
+                    {
+                        const int chunk = 12 * 1024; // divisible by three; 16 KiB base64 output
+                        for (int offset = 0; offset < bytes.Length; offset += chunk)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            var count = Math.Min(chunk, bytes.Length - offset);
+                            System.Buffers.Text.Base64.EncodeToUtf8(bytes.AsSpan(offset, count), buffer, out _, out int written);
+                            await stream.WriteAsync(buffer.AsMemory(0, written), ct);
+                        }
+                    }
+                    finally { ArrayPool<byte>.Shared.Return(buffer); }
+                }
+                else throw new InvalidDataException("Image has no cached or inline data.");
+                await WriteAsync(stream, "\"}}", ct);
             }
         }
-        sb.Append('"');
-        return sb.ToString();
+        await WriteAsync(stream, "]", ct);
     }
 }

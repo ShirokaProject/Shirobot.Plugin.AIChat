@@ -7,6 +7,7 @@ using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
+using ShiroBot.AiChatPlugin.UserState;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Abstractions;
@@ -301,12 +302,16 @@ config.OwnerPrompt.Template = "主人是 789，QQ 123456，机器人使用 Shiro
 var identity = (string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt");
 Check(identity == "base prompt\n" + config.OwnerPrompt.Template, "Owner text must be appended verbatim, including braces and newlines.");
 var admin = false;
-((TestProxy)(object)context).Call = (method, _) => method.Name switch { "IsAdmin" => admin, "get_Message" => messageContext, _ => throw new NotSupportedException() };
+((TestProxy)(object)context).Call = (method, _) => method.Name switch { "IsAdmin" => admin, "get_Message" => messageContext, "get_InstanceId" => "test", _ => throw new NotSupportedException() };
 Check(!await (Task<bool>)Invoke(plugin, "CanClearAsync", direct) && !await (Task<bool>)Invoke(plugin, "CanClearAsync", message),
     "Owner prompt identity must not grant clear permissions in direct or group messages.");
-// Handler tests use uninitialized stores deliberately: denial must happen before any state mutation.
-await (Task)Invoke(plugin, "HandleFriendClearAsync", direct);
-await (Task)Invoke(plugin, "HandleGroupClearAsync", message);
+// Shared group clearing is guarded; private conversations are owned by their user.
+var guardRoot = Path.Combine(Path.GetTempPath(), "aichat-clear-" + Guid.NewGuid().ToString("N"));
+Set(plugin, "_userSettings", new UserSettingsStore(guardRoot));
+var originalMode = config.Default.DefaultChatMode;
+config.Default.DefaultChatMode = "shared";
+try { await (Task)Invoke(plugin, "HandleGroupClearAsync", message); }
+finally { config.Default.DefaultChatMode = originalMode; Directory.Delete(guardRoot, true); }
 admin = true;
 Check(await (Task<bool>)Invoke(plugin, "CanClearAsync", direct), "Host administrator must be allowed.");
 admin = false; config.Permissions.ClearAdminOnly = false;
@@ -314,6 +319,7 @@ Check(await (Task<bool>)Invoke(plugin, "CanClearAsync", direct), "Disabled restr
 config.Permissions.ClearAdminOnly = true; config.OwnerPrompt.Enabled = false;
 Console.WriteLine("PASS: route-only access config, admin clear guard before mutation, optional owner template and no prompt-based privilege grants");
 
+await MemoryStreamingChecks.RunAsync();
 await RichReplyChecks.RunAsync();
 await RecallChecks.RunAsync();
 await FetchTimerChecks.RunAsync();

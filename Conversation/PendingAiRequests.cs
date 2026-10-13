@@ -7,7 +7,17 @@ namespace ShiroBot.AiChatPlugin.Conversation;
 internal sealed class PendingAiRequests
 {
     private readonly ConcurrentDictionary<RequestKey, PendingAiRequest> _requests = new();
+    private readonly Lock _gate = new();
+    private bool _stopping;
     public int Count => _requests.Count;
+
+    public async Task StopAsync()
+    {
+        PendingAiRequest[] requests;
+        lock (_gate) { _stopping = true; requests = _requests.Values.ToArray(); }
+        await Task.WhenAll(requests.Select(r => r.CancelForUnloadAsync())).ConfigureAwait(false);
+        await Task.WhenAll(requests.Select(r => r.Completion)).ConfigureAwait(false);
+    }
 
     public PendingAiRequest Register(MessageEvent message)
     {
@@ -15,8 +25,12 @@ internal sealed class PendingAiRequests
             message.Channel.Id, message.MessageId);
         PendingAiRequest? request = null;
         request = new PendingAiRequest(() => _requests.TryRemove(new KeyValuePair<RequestKey, PendingAiRequest>(key, request!)));
-        if (_requests.TryAdd(key, request)) return request;
+        lock (_gate)
+        {
+            if (!_stopping && _requests.TryAdd(key, request)) return request;
+        }
         request.Dispose();
+        if (_stopping) throw new OperationCanceledException("Plugin is unloading.");
         throw new InvalidOperationException("同一消息已有待处理的 AI 请求。");
     }
 
@@ -39,7 +53,15 @@ internal sealed class PendingAiRequest : IDisposable
     private bool _replyStarted;
     private bool _disposed;
     private readonly Action _onDispose;
+    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task Completion => _completion.Task;
     public CancellationToken Token { get; }
+
+    public Task CancelForUnloadAsync()
+    {
+        lock (_gate)
+            return _disposed || _cancellation.IsCancellationRequested ? Task.CompletedTask : _cancellation.CancelAsync();
+    }
 
     public PendingAiRequest(Action onDispose)
     {
@@ -74,6 +96,7 @@ internal sealed class PendingAiRequest : IDisposable
             _disposed = true;
             _onDispose();
             _cancellation.Dispose();
+            _completion.TrySetResult();
         }
     }
 }

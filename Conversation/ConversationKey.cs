@@ -26,7 +26,7 @@ public readonly record struct ConversationKey(string InstanceId, ChatScene Scene
     public string ToFileSafeString()
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(InstanceId);
-        var identity = JsonSerializer.Serialize(new[] { InstanceId.ToUpperInvariant(), Scene.ToString(), PeerId, UserId });
+        var identity = PluginJson.Serialize(new[] { InstanceId.ToUpperInvariant(), Scene.ToString(), PeerId, UserId });
         return Scene + "_" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
     }
 }

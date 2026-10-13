@@ -6,7 +6,7 @@ namespace ShiroBot.AiChatPlugin.Resources;
 
 /// <summary>
 /// 资源缓存。生成 <c>{sha256}.b64</c> 存放完整的 data URL
-/// （data:mime;base64,...），后续读取零转换、零大对象分配。
+/// （data:mime;base64,...），发送请求时直接流式读取文件。
 /// </summary>
 internal sealed class ResourceCache
 {
@@ -85,50 +85,24 @@ internal sealed class ResourceCache
     }
 
     /// <summary>
-    /// 读取已缓存的 data URL。直接从 .b64 文件读取，零转换。
-    /// 返回 null 表示缓存不存在。
-    /// </summary>
-    public string? ReadDataUrl(string? cachePath)
-    {
-        if (string.IsNullOrEmpty(cachePath)) return null;
-
-        var fileName = Path.GetFileNameWithoutExtension(cachePath);
-        var b64Path = Path.Combine(_cacheDir, fileName + ".b64");
-
-        if (!File.Exists(b64Path)) return null;
-
-        try
-        {
-            return File.ReadAllText(b64Path);
-        }
-        catch (Exception ex)
-        {
-            BotLog.Warning($"[AiChat] 读取 .b64 缓存失败: {ex.Message}");
-            return null;
-        }
-    }
-
-    /// <summary>
     /// 分块写入 base64 data URL 到文件，避免在内存中产生完整的大字符串。
     /// </summary>
     private static async Task WriteBase64FileAsync(string path, byte[] bytes, string mime)
     {
-        await using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 8192, useAsync: true);
-        await using var writer = new StreamWriter(fs, System.Text.Encoding.ASCII);
-
-        // 写 data URL 前缀
-        await writer.WriteAsync($"data:{mime};base64,").ConfigureAwait(false);
-
-        // 分块编码写入（每块 48KB 原始 → 64KB base64，远低于 85KB LOH 阈值）
-        const int chunkSize = 48 * 1024;
-        var offset = 0;
-        while (offset < bytes.Length)
+        await using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 4096, useAsync: true);
+        await fs.WriteAsync(System.Text.Encoding.ASCII.GetBytes($"data:{mime};base64,"));
+        var buffer = ArrayPool<byte>.Shared.Rent(16384);
+        try
         {
-            var count = Math.Min(chunkSize, bytes.Length - offset);
-            var chunk = Convert.ToBase64String(bytes, offset, count);
-            await writer.WriteAsync(chunk).ConfigureAwait(false);
-            offset += count;
+            const int chunkSize = 12 * 1024;
+            for (var offset = 0; offset < bytes.Length; offset += chunkSize)
+            {
+                var count = Math.Min(chunkSize, bytes.Length - offset);
+                System.Buffers.Text.Base64.EncodeToUtf8(bytes.AsSpan(offset, count), buffer, out _, out int written);
+                await fs.WriteAsync(buffer.AsMemory(0, written)).ConfigureAwait(false);
+            }
         }
+        finally { ArrayPool<byte>.Shared.Return(buffer); }
     }
 
     public static string ComputeSha256(byte[] bytes)
