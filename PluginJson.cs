@@ -15,7 +15,14 @@ internal static class PluginJson
         return options;
     }
     public static string Serialize<T>(T value, JsonSerializerOptions? options = null)
-        => JsonSerializer.Serialize(ToJsonValue(value), options ?? Options);
+    {
+        // Preserve the declared DTO type. Serializing a generated DTO as object also
+        // probes its interfaces (including record IEquatable<T>) through the global
+        // reflection member-accessor cache, which can retain a collectible assembly.
+        if (PluginJsonContext.Default.GetTypeInfo(typeof(T)) is not null)
+            return JsonSerializer.Serialize(value, options ?? Options);
+        return JsonSerializer.Serialize(ToJsonValue(value), options ?? Options);
+    }
     internal static object? ToJsonValue(object? value)
     {
         if (value is null || value is string) return value;

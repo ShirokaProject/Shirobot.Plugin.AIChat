@@ -319,6 +319,7 @@ Check(await (Task<bool>)Invoke(plugin, "CanClearAsync", direct), "Disabled restr
 config.Permissions.ClearAdminOnly = true; config.OwnerPrompt.Enabled = false;
 Console.WriteLine("PASS: route-only access config, admin clear guard before mutation, optional owner template and no prompt-based privilege grants");
 
+CollectibleSerializationChecks.Run();
 await MemoryStreamingChecks.RunAsync();
 await RichReplyChecks.RunAsync();
 await RecallChecks.RunAsync();
