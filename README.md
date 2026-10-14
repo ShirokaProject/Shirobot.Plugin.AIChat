@@ -1,6 +1,6 @@
 # ShiroBot AIChat Plugin
 
-当前发布：`v1.3.3`。本版本使用 SDK `0.9.8`，需要宿主 `0.9.8` 的新 ABI；旧宿主不兼容。
+当前发布：`v1.3.4`。本版本使用 SDK `0.9.8`，需要宿主 `0.9.8` 的新 ABI；旧宿主不兼容。
 
 ShiroBot 的 OpenAI-compatible AI 聊天插件，支持多 provider、多模型、群聊共享上下文、图片/文件输入、上下文持久化和低内存图片发送。
 
