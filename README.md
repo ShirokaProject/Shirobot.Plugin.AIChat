@@ -18,7 +18,7 @@ ShiroBot 的 OpenAI-compatible AI 聊天插件，支持多 provider、多模型�
 
 ## 安装
 
-将 Release 发布生成的插件 DLL 放入宿主的插件目录。项目继续使用 `ShiroBot.SDK 0.9.8`。
+将 Release 发布生成的插件 DLL 放入宿主的插件目录。项目使用 `ShiroBot.SDK 1.0.1`。
 
 ```sh
 dotnet publish ShiroBot.AiChatPlugin.csproj -c Release
@@ -195,7 +195,7 @@ openai-gpt-4o-mini (GPT-4o Mini) [vision]
 
 `[behaviour].reply_with_mention` 默认为 `false`，Dashboard 中显示为“@发送者回复”。开启后群聊普通文本、折叠卡片和官方 Markdown 回复都会提及原消息发送者，可以与引用回复同时开启；私聊及私聊流式回复不添加 @。
 
-插件使用 NuGet `ShiroBot.SDK 0.9.8`（包含 QQ Model 合同），要求宿主至少为 `0.9.8`，并兼容 ShiroBot API `0.9.2`。
+插件使用 NuGet `ShiroBot.SDK 1.0.1`（包含 QQ Model 合同），按 SDK ABI 1.2 / QQ Model ABI 1.0 要求宿主至少为 `1.0.0`；`scripts/dev.sh` 会下载与 SDK 同版本的开发宿主。
 
 用户与会话 ID 以平台提供的字符串原样保存。升级会继续读取原有数字 ID 设置和数字 ID 会话文件；旧版曾将非数字 ID 哈希成整数，无法从哈希恢复原 ID，这些旧文件会保留在数据目录中，但新的请求会使用新的原生 ID 键。
 

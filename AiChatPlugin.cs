@@ -18,7 +18,6 @@ using ShiroBot.SDK.Plugin;
 
 [assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.3.4")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
-[assembly: ShiroBotApiCompatibility("0.9.2", "0.9.2")]
 
 namespace ShiroBot.AiChatPlugin;
 
