@@ -7,6 +7,7 @@ using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.AiChatPlugin.UserState;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.AiChatPlugin.Delivery;
+using ShiroBot.AiChatPlugin.Memory;
 using ShiroBot.AiChatPlugin.Timers;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
@@ -48,6 +49,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     private ChatToolRegistry _tools = new();
     private readonly PendingAiRequests _pendingRequests = new();
     private TimerScheduler _timerScheduler = null!;
+    private MemoryNotebookStore _memory = null!;
+    private Task? _memoryReview;
 
     private string PluginRoot => Path.GetDirectoryName(Context.Config.ConfigPath)
                                  ?? AppContext.BaseDirectory;
@@ -88,7 +91,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         DirectCommands.MapExact("#clear", HandleFriendClearAsync);
         DirectCommands.MapPrefix("#model", HandleFriendModelAsync);
         DirectCommands.MapExact("#refresh", HandleFriendRefreshAsync);
-        DirectCommands.MapExact("#timer", HandleTimerListAsync);
+        DirectCommands.MapPrefix("#timer", HandleTimerListAsync);
+        DirectCommands.MapPrefix("#memory", HandleMemoryAsync);
         DirectCommands.MapWhen(ShouldAutoReplyDirectMessage, HandleFriendAutoReplyAsync);
 
         // 群聊
@@ -99,11 +103,13 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         GroupCommands.MapExact("#clear", HandleGroupClearAsync);
         GroupCommands.MapPrefix("#model", HandleGroupModelAsync);
         GroupCommands.MapExact("#refresh", HandleGroupRefreshAsync);
-        GroupCommands.MapExact("#timer", HandleTimerListAsync);
+        GroupCommands.MapPrefix("#timer", HandleTimerListAsync);
+        GroupCommands.MapPrefix("#memory", HandleMemoryAsync);
         GroupCommands.MapWhen(message => !string.IsNullOrWhiteSpace(message.SelfId) && message.HasMention(message.SelfId), HandleGroupMentionAsync);
 
         Events.Map<MessageDeletedEvent>(HandleMessageDeletedAsync);
         _timerScheduler.Start();
+        _memoryReview = Task.Run(() => RunMemoryReviewLoopAsync(_backgroundStop.Token));
         BotLog.Info("[AiChat] 插件已加载。");
     }
 
@@ -114,6 +120,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         lock (_backgroundGate) recalls = _recallTasks.ToArray();
         await Task.WhenAll(recalls).ConfigureAwait(false);
         await _pendingRequests.StopAsync().ConfigureAwait(false);
+        if (_memoryReview is not null) await _memoryReview.ConfigureAwait(false);
         if (_timerScheduler is not null) await _timerScheduler.DisposeAsync().ConfigureAwait(false);
         _openAi?.Dispose();
         _fetcher?.Dispose();
@@ -171,14 +178,14 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         [history]
         # 单会话保留的最大轮次（user+assistant 各算一轮）
         max_turns = 20
-        # 单次请求的软上限 token，超出后按最早 turn 裁剪/压缩上下文
+        # 单次请求的估算 token 上限：超出时本次请求跳过最早的历史；历史超过 75% 时并入长期记忆
         max_tokens = 16000
         # 是否落盘到 JSONL
         persist = true
         # 后续请求中重新发送图片的最近用户轮次数；0 表示只保留文字摘要
         image_memory_turns = 1
-        # compact 压缩历史使用的 system prompt；留空使用内置默认值
-        compact_prompt = "请用简洁的中文总结以下对话的关键信息和结论，保留重要的事实、决定和上下文。"
+        # 合并长期记忆使用的 system prompt；留空使用内置默认值
+        compact_prompt = "你负责维护聊天机器人在这个会话中的长期记忆。把【已有长期记忆】和【新增对话】合并成更新后的完整记忆，只输出记忆本身，不要回复对话。\n按以下分类用简短条目记录，没有内容的分类省略：\n人物：每个人的称呼和 ID、身份、偏好、提到的个人信息\n事实与约定：已确认的事实、做出的决定、对机器人的要求或设定\n进行中：未完成的话题、待办、答应过的事\n近期话题：最近聊过的主要内容，每项一句话\n保留名字、数字、时间等具体细节，删除寒暄和已经过时的内容。总长度控制在 800 字以内。"
 
         [resources]
         # 单张图片最大字节
@@ -203,6 +210,16 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         use_streaming = false
         # AI 回复超过此字符数时使用 QQ 合并转发折叠；0 禁用
         fold_above_chars = 0
+        # 模型自选回复模式：[chat] 分条短消息并自行决定是否引用回复，[answer] 完整长内容；默认关闭（一问一答整条发送）
+        reply_modes = false
+        # 聊天模式单次最多发送的消息条数
+        chat_max_messages = 3
+        # 聊天模式消息间的基础间隔（毫秒），另按字数增加模拟打字时间
+        chat_message_delay_ms = 800
+        # 解答模式超过此字数时收进 QQ 合并转发；0 不折叠
+        answer_fold_above_chars = 400
+        # 合并转发中单条消息的最大字数
+        forward_node_max_chars = 600
         # 群聊回复时是否使用引用回复
         reply_with_quote = true
         # 群聊回复时 @ 原消息发送者；可与引用回复同时开启，私聊不添加 @
@@ -253,6 +270,18 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         # 到期时允许使用已启用的只读查询工具，不递归预约
         use_tools_on_delivery = true
         max_days_ahead = 30
+        # 允许 cron 重复提醒及工具查看/取消；关闭时工具与原来一样只接受一次性 at/text
+        allow_repeat = false
+        # 重复提醒（cron）相邻两次的最小间隔（分钟）
+        min_repeat_interval_minutes = 30
+
+        [tool_use.memory]
+        # 模型自主维护每个会话的记忆本（增改删条目）；默认关闭
+        enabled = false
+        # 每天本地 0 点用默认模型整理记忆本，删除过时/重复条目；需同时开启 enabled
+        daily_review = false
+        max_entries = 50
+        max_entry_chars = 200
 
         [network]
         # 模型和搜索请求共用的可选代理（安全网页抓取始终公网直连），例如 http://127.0.0.1:7890；留空直连
@@ -300,7 +329,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         // 旧默认配置升级后也由 Markdown 开关统一控制格式；保留用户自定义提示词。
         if (_config.Default.SharedPromptSuffix == DefaultSection.LegacySharedPromptSuffix)
             _config.Default.SharedPromptSuffix = DefaultSection.DefaultSharedPromptSuffix;
-        if (_config.History.CompactPrompt == HistorySection.LegacyCompactPrompt)
+        if (_config.History.CompactPrompt is HistorySection.LegacyCompactPrompt or HistorySection.PreviousCompactPrompt)
             _config.History.CompactPrompt = HistorySection.DefaultCompactPrompt;
 
         // 仅在首次加载时构造长期持有状态的服务，避免热重载冲掉内存里的会话/限流。
@@ -308,6 +337,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         {
             _conversations = new ConversationStore(pluginRoot, _config.History.Persist, _config.History.MaxTurns);
             _userSettings = new UserSettingsStore(pluginRoot);
+            _memory = new MemoryNotebookStore(pluginRoot);
             _timerScheduler = new TimerScheduler(pluginRoot,
                 () => _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled, SendTimerAsync);
 
@@ -424,6 +454,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
           #model         查看可用模型
           #model <name>  切换偏好模型(部分模型仅管理员)
           #timer         查看当前会话的待推送消息
+          #timer cancel <序号> 取消定时消息(本人或管理员)
+          #memory        查看当前会话的记忆本(#memory clear 清空)
           #refresh       重新拉取模型列表
           #aihelp        显示本帮助
         提示: 在消息里引用图片/文件/或合并转发, AI会一并读取这些资源。
@@ -526,14 +558,35 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
     private async Task HandleTimerListAsync(MessageEvent message)
     {
+        var arg = StripPrefix(message.GetPlainText(), "#timer");
         var jobs = await _timerScheduler.ListAsync(message).ConfigureAwait(false);
+        if (arg.StartsWith("cancel", StringComparison.OrdinalIgnoreCase) || arg.StartsWith("取消", StringComparison.Ordinal))
+        {
+            var target = arg[(arg.StartsWith("取消", StringComparison.Ordinal) ? 2 : 6)..].Trim();
+            var job = int.TryParse(target, out var index) && index >= 1 && index <= jobs.Count
+                ? jobs[index - 1]
+                : jobs.FirstOrDefault(j => j.Id == target);
+            string reply;
+            if (job is null) reply = "没有找到这个定时消息，用 #timer 查看序号。";
+            else if (job.UserId != message.Sender.Id && !Context.IsAdmin(message.Sender.Id)) reply = "只能取消自己创建的定时消息。";
+            else
+            {
+                await _timerScheduler.RemoveAsync(message, j => j.Id == job.Id).ConfigureAwait(false);
+                reply = $"已取消：{job.Text}";
+            }
+            await ReplyAsync(message, !message.IsDirect, reply).ConfigureAwait(false);
+            return;
+        }
         var paused = !_config.ToolUse.Enabled || !_config.ToolUse.TimerTool.Enabled;
         var text = jobs.Count == 0 ? "当前会话没有待推送消息。" :
             "待推送消息" + (paused ? "（工具已关闭，任务暂停）" : "") + "：\n" +
             string.Join("\n", jobs.Take(50).Select((job, index) =>
-                $"{index + 1}. {job.DueAt:yyyy-MM-dd HH:mm:ss zzz} → {job.UserName}\n{job.Text}" +
+                $"{index + 1}. {job.DueAt.ToLocalTime():yyyy-MM-dd HH:mm zzz} → {job.UserName}" +
+                (job.Cron is null ? "" : $"（重复 {job.Cron}" + (job.Until is { } until ? $"，至 {until.ToLocalTime():yyyy-MM-dd HH:mm}" : "") +
+                    (job.RemainingRuns is { } left ? $"，剩 {left} 次" : "") + "）") + $"\n{job.Text}" +
                 (job.Attempts >= 3 ? "\n发送失败，已停止自动重试。" : job.Attempts > 0 ? "\n发送失败，等待重试。" : ""))) +
-            (jobs.Count > 50 ? $"\n共 {jobs.Count} 条，显示前 50 条。" : "");
+            (jobs.Count > 50 ? $"\n共 {jobs.Count} 条，显示前 50 条。" : "") +
+            (jobs.Count > 0 ? "\n#timer cancel <序号> 取消" : "");
         await ReplyAsync(message, !message.IsDirect, text).ConfigureAwait(false);
     }
 
@@ -554,7 +607,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 {
                     var useTools = _config.ToolUse.Enabled && _config.ToolUse.TimerTool.UseToolsOnDelivery && _tools.HasReadOnlyTools;
                     var systemPrompt = ApplyOwnerPrompt(_config.Default.DefaultPrompt.TrimEnd() +
-                        "\n你正在发送用户预约的一次性提醒。根据提醒内容给出简短回复，不要创建新的预约，不要使用markdown。");
+                        (job.Cron is null ? "\n你正在发送用户预约的一次性提醒。" : "\n你正在发送用户预约的重复提醒中的一次，内容要贴合当天的情况，不要提到这是重复任务。") + "根据提醒内容给出简短回复，不要创建新的预约，不要使用markdown。");
                     if (useTools) systemPrompt += "\n" + _tools.ReadOnlySystemPrompt;
                     text = await ExecuteTextWithFallbackAsync(model, requestModel =>
                     {
@@ -710,7 +763,16 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
                 using var timer = _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled
                     ? new TimerTool(_timerScheduler, _config.ToolUse.TimerTool, message) : null;
-                await using var delivery = new OfficialReplyDelivery(Context, message, _config.Behaviour, pending.TryBeginReply, ct);
+                using var memoryTool = convo is not null && _config.ToolUse.Enabled && _config.ToolUse.Memory.Enabled
+                    ? new MemoryTool(_memory, _config.ToolUse.Memory, key) : null;
+                IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>()];
+                var contextualTools = contextual.Length > 0 ? contextual : null;
+                var replyModes = _config.Behaviour.ReplyModes;
+                await using var delivery = new OfficialReplyDelivery(Context, message, _config.Behaviour, pending.TryBeginReply, ct)
+                {
+                    // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
+                    PreviewFilter = replyModes ? ParsedReply.StreamPreview : null
+                };
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
                 var systemPrompt = isSharedMode && convo?.SharedPrompt is not null
                     ? convo.SharedPrompt
@@ -729,26 +791,44 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
                 systemPrompt = ApplyOwnerPrompt(systemPrompt);
                 if (timer is not null) systemPrompt += "\n" + timer.SystemPrompt;
+                if (memoryTool is not null) systemPrompt += "\n" + memoryTool.SystemPrompt;
+                if (replyModes) systemPrompt += "\n" + ParsedReply.SystemPrompt;
                 systemPrompt = OfficialReplyDelivery.ApplyPromptPolicy(systemPrompt, _config.Behaviour.UseMarkdown);
+                // 长期记忆放在末尾，前面稳定的部分仍可命中上游前缀缓存。
+                if (!string.IsNullOrWhiteSpace(convo?.Summary))
+                    systemPrompt += "\n\n[长期记忆：更早对话的整理摘要，可能不完整；与最近对话冲突时以最近对话为准]\n" + convo.Summary;
+                if (memoryTool is not null)
+                {
+                    try
+                    {
+                        var notes = await _memory.LoadAsync(key).ConfigureAwait(false);
+                        systemPrompt += "\n\n[记忆本]\n" + (notes.Count == 0 ? "（空）" : MemoryNotebookStore.Format(notes));
+                    }
+                    catch (Exception ex) { BotLog.Warning($"[AiChat] 本次请求不附带记忆本: {ex.Message}"); }
+                }
 
                 var userParts = isSharedMode && !message.IsDirect
                     ? AddSharedSpeakerPrefix(parts, message)
                     : parts;
                 var userTimestamp = message.Timestamp == default ? DateTimeOffset.UtcNow : message.Timestamp;
-                userParts = AppendUserContext(userParts, message, selfName);
+                // 历史只保存消息本身；会话上下文每轮都相同，只附在本次请求里，避免在历史中重复占用 token。
                 var userTurn = new ChatTurn("user", userParts, userTimestamp.ToUnixTimeMilliseconds());
+                var requestUserTurn = userTurn with { Parts = AppendUserContext(userParts, message, selfName) };
 
                 string assistantText;
                 try
                 {
                     var hasImageInCurrent = parts.Any(p => p is ImagePart);
                     var requestHistory = (convo?.Turns ?? []).ToList();
-                    if (hasImageInCurrent && !_tools.HasTools && timer is null)
+                    TrimHistoryToTokenBudget(systemPrompt, requestHistory, requestUserTurn);
+                    BotLog.Info($"[AiChat] 请求 {GetModelDisplayId(model)}: 历史 {requestHistory.Count}/{convo?.Turns.Count ?? 0} turns, " +
+                        $"长期记忆 {convo?.Summary?.Length ?? 0} 字, 估算 {EstimateRequestTokens(systemPrompt, requestHistory, requestUserTurn)} tokens");
+                    if (hasImageInCurrent && !_tools.HasTools && contextualTools is null)
                     {
                         assistantText = await ExecuteWithRetryAsync(() =>
                             ExecuteReplyAttemptAsync(delivery, onContent =>
                                 _openAi.ChatStreamingBodyAsync(_config.Default, model,
-                                    BuildMessageDescriptors(systemPrompt, requestHistory, userTurn), ct: ct, onContent: onContent), ct),
+                                    BuildMessageDescriptors(systemPrompt, requestHistory, requestUserTurn), ct: ct, onContent: onContent), ct),
                             () => TrimRequestHistoryForRetry(requestHistory), ct).ConfigureAwait(false);
                     }
                     else
@@ -758,11 +838,11 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                             {
                                 timer?.ResetAttempt();
                                 // 每次尝试都重建消息，避免重试/回退带入上次的 tool_calls。
-                                var messages = BuildOpenAiMessages(systemPrompt, requestHistory, userTurn,
+                                var messages = BuildOpenAiMessages(systemPrompt, requestHistory, requestUserTurn,
                                     requestModel.SupportsVision);
-                                if (_tools.HasTools || timer is not null)
+                                if (_tools.HasTools || contextualTools is not null)
                                     return _tools.ChatAsync(_openAi, requestModel, messages, _config.ToolUse.MaxRounds, onContent, ct,
-                                        timer is null ? null : [timer], maxOutputTokens: _config.Default.MaxOutputTokens);
+                                        contextualTools, maxOutputTokens: _config.Default.MaxOutputTokens);
                                 var request = new OpenAiChatRequest
                                 {
                                     Model = requestModel.Name, Messages = messages, Stream = false,
@@ -806,8 +886,29 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                         return;
                     }
                 }
-                var delivered = await delivery.CompleteAsync(assistantText).ConfigureAwait(false);
-                if (!delivered) await ReplyAssistantAsync(message, isGroup, assistantText).ConfigureAwait(false);
+                if (replyModes)
+                {
+                    var reply = ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages);
+                    BotLog.Info($"[AiChat] 回复 mode={(reply.Mode == ReplyMode.Chat ? reply.Quote ? "chat+reply" : "chat" : "answer")} " +
+                        $"条数={reply.Messages.Count} 字数={reply.Text.Length}:\n{ForLog(reply.Text)}");
+                    // 历史只保存去掉标记后的正文，关闭该功能后模型不会继续模仿标记。
+                    assistantText = reply.Text;
+                    if (reply.Mode == ReplyMode.Chat && !delivery.HasStreamed)
+                    {
+                        await delivery.AbandonStreamAsync().ConfigureAwait(false);
+                        await SendChatMessagesAsync(message, isGroup, delivery, reply).ConfigureAwait(false);
+                    }
+                    else if (!await delivery.CompleteAsync(reply.Text).ConfigureAwait(false))
+                    {
+                        await ReplyFoldableAsync(message, isGroup, reply.Text, _config.Behaviour.AnswerFoldAboveChars).ConfigureAwait(false);
+                    }
+                }
+                else
+                {
+                    BotLog.Info($"[AiChat] 回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
+                    var delivered = await delivery.CompleteAsync(assistantText).ConfigureAwait(false);
+                    if (!delivered) await ReplyAssistantAsync(message, isGroup, assistantText).ConfigureAwait(false);
+                }
 
                 // single 模式不保存历史
                 if (convo is not null)
@@ -1136,29 +1237,186 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         await reply($"已切换到模型: {GetModelDisplayId(target)}").ConfigureAwait(false);
     }
 
+    // -------- #memory --------
+
+    private async Task HandleMemoryAsync(MessageEvent message)
+    {
+        var isGroup = !message.IsDirect;
+        var arg = StripPrefix(message.GetPlainText(), "#memory");
+        var mode = _userSettings.GetOrCreate(ScopedUser(SenderId(message))).ChatMode ?? _config.Default.DefaultChatMode;
+        var key = ResolveConversationKey(isGroup ? ChatScene.Group : ChatScene.Friend, PeerId(message), SenderId(message));
+        if (mode == "single")
+        {
+            await ReplyAsync(message, isGroup, "single 模式不使用记忆本。").ConfigureAwait(false);
+            return;
+        }
+        if (arg is "clear" or "清空")
+        {
+            if (isGroup && mode == "shared" && !await CanClearAsync(message).ConfigureAwait(false)) return;
+            await _memory.ClearAsync(key).ConfigureAwait(false);
+            await ReplyAsync(message, isGroup, "已清空当前会话的记忆本。").ConfigureAwait(false);
+            return;
+        }
+        List<MemoryEntry> notes;
+        try { notes = await _memory.LoadAsync(key).ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            await ReplyAsync(message, isGroup, ex.Message).ConfigureAwait(false);
+            return;
+        }
+        var paused = !_config.ToolUse.Enabled || !_config.ToolUse.Memory.Enabled ? "（记忆本工具未开启）" : "";
+        await ReplyAsync(message, isGroup, notes.Count == 0
+            ? "当前会话的记忆本是空的。" + paused
+            : $"记忆本{paused}（{notes.Count} 条）：\n{MemoryNotebookStore.Format(notes)}").ConfigureAwait(false);
+    }
+
+    /// <summary>每分钟检查一次日期；跨过本地 0 点后整理所有记忆本。首次运行只记录日期，不立即整理。</summary>
+    private async Task RunMemoryReviewLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var memory = _config.ToolUse.Memory;
+                    var today = DateOnly.FromDateTime(DateTime.Now).ToString("yyyy-MM-dd");
+                    var stamp = _memory.ReviewStampPath;
+                    var last = File.Exists(stamp) ? File.ReadAllText(stamp).Trim() : null;
+                    if (_config.ToolUse.Enabled && memory is { Enabled: true, DailyReview: true } && last != today)
+                    {
+                        if (last is not null) await ReviewMemoryNotebooksAsync(ct).ConfigureAwait(false);
+                        Directory.CreateDirectory(Path.GetDirectoryName(stamp)!);
+                        await File.WriteAllTextAsync(stamp, today, ct).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    BotLog.Warning($"[AiChat] 记忆本整理失败: {ex.Message}");
+                }
+                await Task.Delay(TimeSpan.FromMinutes(1), ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+    }
+
+    internal async Task ReviewMemoryNotebooksAsync(CancellationToken ct)
+    {
+        var model = ResolveModel(_config.Default.Model) ?? throw new InvalidOperationException("默认模型未注册");
+        var maxChars = Math.Clamp(_config.ToolUse.Memory.MaxEntryChars, 20, 1000);
+        foreach (var path in _memory.Notebooks())
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var entries = await _memory.ReadFileAsync(path).ConfigureAwait(false);
+                if (entries.Count == 0) continue;
+                await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
+                string response;
+                try
+                {
+                    response = await _openAi.ChatAsync(_config.Default, model, new OpenAiChatRequest
+                    {
+                        Model = model.Name, Stream = false, MaxCompletionTokens = 4096,
+                        Messages =
+                        [
+                            new OpenAiMessage { Role = "system", Content =
+                                $"你在整理聊天机器人的记忆本。今天是 {DateTime.Now:yyyy-MM-dd}。删除已经过时（如已过去的日程）、重复、互相矛盾中较旧的、或没有长期价值的条目；把内容相近的条目合并成一条；其余条目保持原文。不要编造新信息，每条不超过 {maxChars} 字。" +
+                                "只输出 JSON，格式为 {\"keep\":[{\"id\":\"保留或合并后沿用的原条目 id\",\"text\":\"条目内容\"}]}。" },
+                            new OpenAiMessage { Role = "user", Content = MemoryNotebookStore.Format(entries) }
+                        ]
+                    }, ct).ConfigureAwait(false);
+                }
+                finally { _globalConcurrency.Release(); }
+
+                var kept = ParseMemoryReview(response, entries, maxChars);
+                if (kept is null)
+                {
+                    BotLog.Warning($"[AiChat] 记忆本整理返回无法解析，保持原样 {Path.GetFileName(path)}:\n{ForLog(response)}");
+                    continue;
+                }
+                if (kept.SequenceEqual(entries)) continue;
+                if (!await _memory.ReplaceIfUnchangedAsync(path, entries, kept).ConfigureAwait(false))
+                {
+                    BotLog.Info($"[AiChat] 记忆本在整理期间被修改，跳过 {Path.GetFileName(path)}");
+                    continue;
+                }
+                var removed = entries.Select(e => e.Id).Except(kept.Select(e => e.Id));
+                BotLog.Info($"[AiChat] 记忆本整理完成 {Path.GetFileName(path)}: {entries.Count} -> {kept.Count} 条, 删除 [{string.Join(", ", removed)}]\n{MemoryNotebookStore.Format(kept)}");
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                BotLog.Warning($"[AiChat] 整理记忆本 {Path.GetFileName(path)} 失败: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>只接受原有 id；格式错误返回 null，保持记忆本不变。</summary>
+    internal static List<MemoryEntry>? ParseMemoryReview(string response, IReadOnlyList<MemoryEntry> original, int maxChars)
+    {
+        var start = response.IndexOf('{');
+        var end = response.LastIndexOf('}');
+        if (start < 0 || end <= start) return null;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(response[start..(end + 1)]);
+            if (!doc.RootElement.TryGetProperty("keep", out var keep) || keep.ValueKind != System.Text.Json.JsonValueKind.Array) return null;
+            var result = new List<MemoryEntry>();
+            foreach (var item in keep.EnumerateArray())
+            {
+                if (item.ValueKind != System.Text.Json.JsonValueKind.Object) return null;
+                var id = item.TryGetProperty("id", out var idValue) ? idValue.GetString()?.TrimStart('#') : null;
+                var text = item.TryGetProperty("text", out var textValue) ? textValue.GetString()?.Trim() : null;
+                var source = original.FirstOrDefault(e => e.Id == id);
+                if (source is null || string.IsNullOrEmpty(text) || result.Any(e => e.Id == id)) continue;
+                if (text.Length > maxChars) text = text[..maxChars];
+                result.Add(text == source.Text ? source : source with { Text = text, UpdatedAt = DateTimeOffset.UtcNow });
+            }
+            return result;
+        }
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
     // -------- 工具方法 --------
 
     /// <summary>
-    /// Context compact：当会话轮次达到 maxTurns 的 80% 时，把前半部分对话压缩为一条摘要 turn，
-    /// 保留最近的对话不动。这样既不丢失重要上下文，又控制了 token 消耗。
+    /// Context compact：轮数达到 maxTurns 的 80% 或历史估算 token 超过上限的 75% 时，
+    /// 把较早的对话合并进会话的长期记忆，只保留最近的对话原文。
+    /// 长期记忆每次在旧记忆基础上增量更新，不会对摘要反复再摘要。
     /// </summary>
     private async Task TryCompactConversationAsync(ConversationState convo, ModelEntry model)
     {
         var maxItems = _config.History.MaxTurns * 2; // user+assistant 配对
-        var threshold = (int)(maxItems * 0.8);
-
-        if (convo.Turns.Count < threshold)
+        var tokenBudget = Math.Max(1000, _config.History.MaxTokens);
+        var historyTokens = convo.Turns.Sum(EstimateTurnTokens);
+        if (convo.Turns.Count < (int)(maxItems * 0.8) && historyTokens <= tokenBudget * 3 / 4)
             return;
 
-        // 把前半部分压缩，保留后半部分原样
-        var halfCount = convo.Turns.Count / 2;
-        // 确保 halfCount 是偶数（user+assistant 配对）
-        if (halfCount % 2 != 0) halfCount--;
-        if (halfCount < 2) return;
+        // 从最新往前保留不超过一半轮数、一半 token 预算的原文，至少保留最近一对。
+        var keep = 0;
+        var keptTokens = 0;
+        while (keep + 2 <= convo.Turns.Count)
+        {
+            var pairTokens = EstimateTurnTokens(convo.Turns[^(keep + 1)]) + EstimateTurnTokens(convo.Turns[^(keep + 2)]);
+            if (keep >= 2 && (keep + 2 > maxItems / 2 || keptTokens + pairTokens > tokenBudget / 2)) break;
+            keep += 2;
+            keptTokens += pairTokens;
+        }
+        var compactCount = convo.Turns.Count - keep;
+        if (compactCount % 2 != 0) compactCount--;
+        if (compactCount < 2) return;
 
-        var turnsToCompact = convo.Turns.GetRange(0, halfCount);
+        var transcript = new StringBuilder();
+        foreach (var turn in convo.Turns.Take(compactCount))
+            transcript.Append(turn.Role == "user" ? "用户: " : "机器人: ").AppendLine(TurnToTranscript(turn));
 
-        // 构造摘要请求
+        var input = new StringBuilder();
+        input.AppendLine("【已有长期记忆】").AppendLine(string.IsNullOrWhiteSpace(convo.Summary) ? "（暂无）" : convo.Summary)
+            .AppendLine().AppendLine("【新增对话】").Append(transcript)
+            .AppendLine().Append("请输出合并后的完整长期记忆。");
         var summaryMessages = new List<OpenAiMessage>
         {
             new()
@@ -1167,19 +1425,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 Content = string.IsNullOrWhiteSpace(_config.History.CompactPrompt)
                     ? HistorySection.DefaultCompactPrompt
                     : _config.History.CompactPrompt
-            }
+            },
+            new() { Role = "user", Content = input.ToString() }
         };
-
-        foreach (var turn in turnsToCompact)
-        {
-            summaryMessages.Add(TurnToMessage(turn, includeImages: false));
-        }
-
-        summaryMessages.Add(new OpenAiMessage
-        {
-            Role = "user",
-            Content = "请总结以上对话。"
-        });
 
         try
         {
@@ -1188,29 +1436,80 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 Model = model.Name,
                 Messages = summaryMessages,
                 Stream = false,
-                MaxCompletionTokens = _config.Default.MaxOutputTokens
+                MaxCompletionTokens = Math.Min(_config.Default.MaxOutputTokens, 2048)
             };
 
-            var summary = await _openAi.ChatAsync(_config.Default, model, summaryRequest).ConfigureAwait(false);
+            var summary = (await _openAi.ChatAsync(_config.Default, model, summaryRequest).ConfigureAwait(false)).Trim();
+            if (summary.Length == 0) throw new InvalidOperationException("摘要为空");
 
-            // 用摘要 turn 替换前半部分
-            convo.Turns.RemoveRange(0, halfCount);
-            convo.Turns.Insert(0, new ChatTurn(
-                "assistant",
-                [new TextPart($"[对话摘要] {summary}")],
-                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
-
-            // 持久化压缩后的状态
+            convo.Turns.RemoveRange(0, compactCount);
+            convo.Summary = summary;
             await _conversations.RewriteAsync(convo).ConfigureAwait(false);
 
-            BotLog.Info($"[AiChat] Context compact 完成: {halfCount} turns -> 1 摘要, 剩余 {convo.Turns.Count} turns");
+            BotLog.Info($"[AiChat] Context compact 完成: {compactCount} turns 并入长期记忆, 剩余 {convo.Turns.Count} turns, 记忆 {summary.Length} 字:\n{ForLog(summary)}");
         }
         catch (Exception ex)
         {
-            // compact 失败不影响正常对话，降级为旧截断行为
-            BotLog.Warning($"[AiChat] Context compact 失败，回退到截断: {ex.Message}");
+            // compact 失败不影响正常对话，超出轮数上限后由存储层截断最早的历史。
+            BotLog.Warning($"[AiChat] Context compact 失败，保留原历史: {ex.Message}");
         }
     }
+
+    /// <summary>从最早的历史开始成对丢弃，直到本次请求的估算 token 不超过 history.max_tokens。只影响本次请求。</summary>
+    private void TrimHistoryToTokenBudget(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn)
+    {
+        var budget = Math.Max(1000, _config.History.MaxTokens);
+        var total = EstimateRequestTokens(systemPrompt, history, currentUserTurn);
+        var removed = 0;
+        while (total > budget && history.Count > 0)
+        {
+            var count = history.Count >= 2 ? 2 : 1;
+            total -= history.Take(count).Sum(EstimateTurnTokens);
+            history.RemoveRange(0, count);
+            removed += count;
+        }
+        if (removed > 0)
+            BotLog.Info($"[AiChat] 上下文超过 {budget} tokens，本次请求跳过最早 {removed} turns。");
+    }
+
+    private static int EstimateRequestTokens(string systemPrompt, IEnumerable<ChatTurn> history, ChatTurn currentUserTurn) =>
+        EstimateTokens(systemPrompt) + history.Sum(EstimateTurnTokens) + EstimateTurnTokens(currentUserTurn);
+
+    private static int EstimateTurnTokens(ChatTurn turn) => 4 + turn.Parts.Sum(part => part switch
+    {
+        TextPart text => EstimateTokens(text.Text),
+        FileTextPart file => EstimateTokens(file.Excerpt) + 20,
+        ImagePart => 800,
+        _ => 20
+    });
+
+    /// <summary>粗略估算：CJK 字符约 1 token，其他字符约 4 个 1 token。</summary>
+    private static int EstimateTokens(string text)
+    {
+        var cjk = 0;
+        var other = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (rune.Value >= 0x2E80) cjk++;
+            else other++;
+        }
+        return cjk + (other + 3) / 4;
+    }
+
+    private static string TurnToTranscript(ChatTurn turn) => string.Join(" ", turn.Parts.Select(part => part switch
+    {
+        TextPart text => text.Text,
+        ImagePart => "[图片]",
+        FileTextPart file => $"[文件 {file.Name}: {Truncate(file.Excerpt, 300)}]",
+        FileMetaPart file => $"[文件 {file.Name}]",
+        _ => ""
+    }));
+
+    private static string Truncate(string text, int maxChars) =>
+        text.Length <= maxChars ? text : text[..maxChars] + "…";
+
+    /// <summary>调试日志中的模型文本，过长时截断。</summary>
+    private static string ForLog(string text) => Truncate(text, 2000);
 
     private static string SenderId(MessageEvent message) => message.Sender.Id;
 
@@ -1527,7 +1826,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
         for (var i = 0; i < history.Count; i++)
         {
-            msgs.Add(TurnToMessage(history[i], includeImages: supportsVision && ShouldIncludeHistoryImages(history, i)));
+            msgs.Add(TurnToMessage(ShrinkOldFiles(history, i), includeImages: supportsVision && ShouldIncludeHistoryImages(history, i)));
         }
         msgs.Add(TurnToMessage(currentUserTurn, includeImages: supportsVision));
         return msgs;
@@ -1549,11 +1848,31 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
         for (var i = 0; i < history.Count; i++)
         {
-            descriptors.Add(TurnToDescriptor(history[i], includeImages: ShouldIncludeHistoryImages(history, i)));
+            descriptors.Add(TurnToDescriptor(ShrinkOldFiles(history, i), includeImages: ShouldIncludeHistoryImages(history, i)));
         }
         descriptors.Add(TurnToDescriptor(currentUserTurn, includeImages: true));
         return descriptors;
     }
+
+    /// <summary>最近 2 个用户轮次之前的文件只保留开头摘录，避免同一份文件在每轮请求里重复发送。</summary>
+    private static ChatTurn ShrinkOldFiles(IReadOnlyList<ChatTurn> history, int index)
+    {
+        var turn = history[index];
+        if (turn.Role != "user" || !turn.Parts.Any(p => p is FileTextPart { Excerpt.Length: > OldFileExcerptChars })) return turn;
+        var newerUserTurns = 0;
+        for (var i = history.Count - 1; i > index; i--)
+            if (history[i].Role == "user") newerUserTurns++;
+        // 当前消息不在 history 中，因此这里只需再保留一轮完整文件。
+        if (newerUserTurns < 1) return turn;
+        return turn with
+        {
+            Parts = turn.Parts.Select(p => p is FileTextPart { Excerpt.Length: > OldFileExcerptChars } file
+                ? file with { Excerpt = file.Excerpt[..OldFileExcerptChars] + "\n…（较早的文件，后文已省略）", Truncated = true }
+                : p).ToList()
+        };
+    }
+
+    private const int OldFileExcerptChars = 500;
 
     private bool ShouldIncludeHistoryImages(IReadOnlyList<ChatTurn> history, int index)
     {
@@ -1685,15 +2004,52 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     private static string FormatUserTimestamp(long timestamp) =>
         $"[消息时间: {DateTimeOffset.FromUnixTimeMilliseconds(timestamp).LocalDateTime:yyyy-MM-dd HH:mm:ss zzz}]";
 
-    private async Task ReplyAssistantAsync(MessageEvent message, bool isGroup, string text)
+    private Task ReplyAssistantAsync(MessageEvent message, bool isGroup, string text) =>
+        ReplyFoldableAsync(message, isGroup, text, _config.Behaviour.FoldAboveChars);
+
+    /// <summary>
+    /// 聊天模式逐条发送。只有模型选择 [chat+reply] 时第一条按引用/@ 配置回复，其余作为普通消息发出。
+    /// 回复已经开始，因此间隔不受撤回取消影响。
+    /// </summary>
+    private async Task SendChatMessagesAsync(MessageEvent message, bool isGroup, OfficialReplyDelivery delivery, ParsedReply reply)
     {
-        var threshold = _config.Behaviour.FoldAboveChars;
+        for (var i = 0; i < reply.Messages.Count; i++)
+        {
+            var text = reply.Messages[i];
+            if (i > 0) await Task.Delay(ChatMessageDelay(text)).ConfigureAwait(false);
+            var asReply = i == 0 && reply.Quote;
+            try
+            {
+                if (await delivery.CompleteAsync(text, mention: asReply).ConfigureAwait(false)) continue;
+                if (asReply) await ReplyAsync(message, isGroup, text).ConfigureAwait(false);
+                else await Context.Message.SendMessageAsync(message.Channel, [new TextSegment(text)]).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (i > 0)
+            {
+                // 首条已送达，后续单条失败不影响保存这轮历史。
+                BotLog.Warning($"[AiChat] 分条发送第 {i + 1} 条失败: {ex.Message}");
+            }
+        }
+    }
+
+    private TimeSpan ChatMessageDelay(string next)
+    {
+        var baseMs = Math.Clamp(_config.Behaviour.ChatMessageDelayMs, 0, 10_000);
+        if (baseMs == 0) return TimeSpan.Zero;
+        var typingMs = Math.Min(next.EnumerateRunes().Count() * 60, 3000);
+        return TimeSpan.FromMilliseconds(baseMs + typingMs);
+    }
+
+    private async Task ReplyFoldableAsync(MessageEvent message, bool isGroup, string text, int threshold)
+    {
         if (threshold > 0 && text.EnumerateRunes().Count() > threshold &&
             string.Equals(message.Platform, "qq", StringComparison.OrdinalIgnoreCase) &&
             !string.IsNullOrWhiteSpace(message.SelfId))
         {
             var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
-            var forward = new QOutgoingForward([new QForwardedMessage(message.SelfId, selfName, [new QOutgoingText(text)])])
+            var nodes = ParsedReply.SplitForForward(text, _config.Behaviour.ForwardNodeMaxChars)
+                .Select(node => new QForwardedMessage(message.SelfId, selfName, [new QOutgoingText(node)])).ToList();
+            var forward = new QOutgoingForward(nodes)
             {
                 Title = $"{selfName} 的回复",
                 Preview = [CreateReplyPreview(text)],

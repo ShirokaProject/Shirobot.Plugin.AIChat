@@ -210,11 +210,60 @@ using (var client = Client(handler))
     Set(plugin, "_conversations", new ConversationStore(Path.GetTempPath(), false, 4));
     var state = new ConversationState(new ConversationKey("test-instance", ChatScene.Friend, "1", "1"));
     for (var i = 0; i < 8; i++) state.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart($"turn {i}")], i));
+    state.Summary = "old memory";
     await (Task)Invoke(plugin, "TryCompactConversationAsync", state, primary);
-    Check(handler.Requests[0].GetProperty("messages")[0].GetProperty("content").GetString() == "custom compact prompt", "Compact must send configured system prompt.");
-    Check(state.Turns.Count == 5 && state.Turns[0].Parts.OfType<TextPart>().Single().Text.Contains("custom summary"), "Compact must replace old turns with summary.");
+    var compactMessages = handler.Requests[0].GetProperty("messages");
+    Check(compactMessages[0].GetProperty("content").GetString() == "custom compact prompt", "Compact must send configured system prompt.");
+    var compactInput = compactMessages[1].GetProperty("content").GetString()!;
+    Check(compactMessages.GetArrayLength() == 2 && compactInput.Contains("old memory") && compactInput.Contains("用户: turn 0") &&
+        compactInput.Contains("机器人: turn 3") && !compactInput.Contains("turn 4"), "Compact must merge the previous memory with only the evicted transcript.");
+    Check(state.Summary == "custom summary" && state.Turns.Count == 4 && state.Turns[0].Parts.OfType<TextPart>().Single().Text == "turn 4",
+        "Compact must store the merged memory separately and keep the newest turns verbatim.");
+
+    // 只有 2 轮但 token 超过预算的 75% 时也要压缩，且至少保留最近一对。
+    config.History.MaxTokens = 1000;
+    var big = new ConversationState(new ConversationKey("test-instance", ChatScene.Friend, "1", "2"));
+    for (var i = 0; i < 4; i++) big.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart(new string('字', 300))], i));
+    await (Task)Invoke(plugin, "TryCompactConversationAsync", big, primary);
+    Check(big.Turns.Count == 2 && big.Summary == "custom summary", "Token pressure must compact even below the turn threshold.");
+
+    var history = Enumerable.Range(0, 6).Select(i => new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart(new string('字', 300))], i)).ToList();
+    Invoke(plugin, "TrimHistoryToTokenBudget", "system", history, new ChatTurn("user", [new TextPart("hi")], 9));
+    Check(history.Count == 2 && history[0].Role == "user", "Request history must drop the oldest pairs until it fits history.max_tokens.");
+    config.History.MaxTokens = 16000;
 }
-Console.WriteLine("PASS: compact custom prompt and history replacement");
+{
+    var root = Path.Combine(Path.GetTempPath(), "aichat-memory-" + Guid.NewGuid().ToString("N"));
+    var store = new ConversationStore(root, true, 20);
+    var key = new ConversationKey("test-instance", ChatScene.Friend, "1", "1");
+    var state = await store.AcquireAsync(key);
+    state.Summary = "人物：小明";
+    state.Turns.Add(new ChatTurn("user", [new TextPart("hi")], 1));
+    state.Turns.Add(new ChatTurn("assistant", [new TextPart("hello")], 2));
+    await store.RewriteAsync(state);
+    await store.AppendTurnsAsync(state, new ChatTurn("user", [new TextPart("again")], 3), new ChatTurn("assistant", [new TextPart("ok")], 4));
+    store.Release(key);
+    state = await store.AcquireAsync(key);
+    Check(state.Summary == "人物：小明" && state.Turns.Count == 4 && state.Turns.All(t => t.Role != "summary"),
+        "Long-term memory must survive reload separately from turns.");
+    store.Clear(key);
+    store.Release(key);
+    state = await store.AcquireAsync(key);
+    Check(state.Summary is null && state.Turns.Count == 0, "Clearing a conversation must also clear its long-term memory.");
+    store.Release(key);
+
+    var legacyKey = new ConversationKey("test-instance", ChatScene.Friend, "1", "3");
+    var legacy = await store.AcquireAsync(legacyKey);
+    legacy.Turns.Add(new ChatTurn("assistant", [new TextPart("[对话摘要] 旧摘要")], 1));
+    legacy.Turns.Add(new ChatTurn("user", [new TextPart("hi")], 2));
+    await store.RewriteAsync(legacy);
+    store.Release(legacyKey);
+    legacy = await store.AcquireAsync(legacyKey);
+    Check(legacy.Summary == "旧摘要" && legacy.Turns.Single().Role == "user", "Legacy summary turns must migrate into long-term memory.");
+    store.Release(legacyKey);
+    Directory.Delete(root, true);
+}
+Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, request token budget, persistence, clear and legacy migration");
 
 var messageContext = DispatchProxy.Create<IMessageContext, TestProxy>();
 var context = DispatchProxy.Create<IBotContext, TestProxy>();
@@ -322,6 +371,9 @@ Console.WriteLine("PASS: route-only access config, admin clear guard before muta
 CollectibleSerializationChecks.Run();
 await MemoryStreamingChecks.RunAsync();
 await RichReplyChecks.RunAsync();
+await ReplyModeChecks.RunAsync();
+await MemoryNotebookChecks.RunAsync();
+await TimerRepeatChecks.RunAsync();
 await RecallChecks.RunAsync();
 await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();

@@ -67,8 +67,17 @@ public sealed class DefaultSection
 
 public sealed class HistorySection
 {
-    public const string DefaultCompactPrompt = "请用简洁的中文总结以下对话的关键信息和结论，保留重要的事实、决定和上下文。";
-    public const string LegacyCompactPrompt = DefaultCompactPrompt + "不要使用Markdown格式。";
+    public const string DefaultCompactPrompt =
+        "你负责维护聊天机器人在这个会话中的长期记忆。把【已有长期记忆】和【新增对话】合并成更新后的完整记忆，只输出记忆本身，不要回复对话。\n" +
+        "按以下分类用简短条目记录，没有内容的分类省略：\n" +
+        "人物：每个人的称呼和 ID、身份、偏好、提到的个人信息\n" +
+        "事实与约定：已确认的事实、做出的决定、对机器人的要求或设定\n" +
+        "进行中：未完成的话题、待办、答应过的事\n" +
+        "近期话题：最近聊过的主要内容，每项一句话\n" +
+        "保留名字、数字、时间等具体细节，删除寒暄和已经过时的内容。总长度控制在 800 字以内。";
+    /// <summary>旧版本的默认值，加载时升级为新的结构化记忆提示词。</summary>
+    public const string PreviousCompactPrompt = "请用简洁的中文总结以下对话的关键信息和结论，保留重要的事实、决定和上下文。";
+    public const string LegacyCompactPrompt = PreviousCompactPrompt + "不要使用Markdown格式。";
 
     /// <summary>压缩历史时的 system prompt；留空使用默认提示词。</summary>
     [ConfigField("compact 摘要请求的 system prompt；留空使用内置提示词。", Label = "上下文压缩提示词", Type = "text")]
@@ -82,7 +91,7 @@ public sealed class HistorySection
     /// <summary>
     /// 单次请求的软上限 token，超出则按最早 turn 裁剪。
     /// </summary>
-    [ConfigField("超出上限时裁剪最早的历史消息。", Label = "上下文 Token 软上限", Min = 1)]
+    [ConfigField("单次请求的估算 token 上限：超过时本次请求跳过最早的历史；历史超过其 75% 时自动并入长期记忆。", Label = "上下文 Token 软上限", Min = 1000)]
     public int MaxTokens { get; set; } = 16000;
 
     /// <summary>
@@ -155,6 +164,22 @@ public sealed class BehaviourSection
     /// <summary>AI 回复超过此字符数时使用 QQ 合并转发折叠；小于等于 0 禁用。</summary>
     [ConfigField("QQ 回复超过此字符数时使用合并转发折叠；0 禁用。", Label = "长回复折叠字数", Min = 0)]
     public int FoldAboveChars { get; set; }
+
+    [ConfigField("让模型每次自选回复模式：聊天模式像真人一样分几条短消息发送，并自行决定是否引用回复；解答模式输出完整长内容，超长时收进聊天记录。关闭后整条发送并使用“长回复折叠字数”。需要模型稳定输出首行标记，小模型建议保持关闭。", Label = "模型自选回复模式")]
+    public bool ReplyModes { get; set; }
+
+    [ConfigField("聊天模式单次最多发送的消息条数，多出的内容并入最后一条。", Label = "聊天模式最多条数", Min = 1, Max = 10)]
+    public int ChatMaxMessages { get; set; } = 3;
+
+    [ConfigField("聊天模式两条消息之间的基础间隔，实际还会按下一条的字数增加模拟打字时间（最多再加 3 秒）；0 表示不等待。", Label = "聊天模式发送间隔（毫秒）", Min = 0, Max = 10000)]
+    public int ChatMessageDelayMs { get; set; } = 800;
+
+    [ConfigField("解答模式超过此字数时收进 QQ 合并转发聊天记录；0 表示不折叠。", Label = "解答模式折叠字数", Min = 0)]
+    public int AnswerFoldAboveChars { get; set; } = 400;
+
+    [ConfigField("合并转发聊天记录中单条消息的最大字数，超出时按段落和句子拆成多条。", Label = "聊天记录单条字数", Min = 50)]
+    public int ForwardNodeMaxChars { get; set; } = 600;
+
     /// <summary>群聊回复时是否使用引用回复。</summary>
     [ConfigField("在群聊中引用用户原消息回复，折叠消息除外。", Label = "群聊引用回复")]
     public bool ReplyWithQuote { get; set; } = true;
@@ -195,6 +220,8 @@ public sealed class ToolUseSection
     public HttpFetchSection HttpFetch { get; set; } = new();
     [ConfigField("预约消息，到点使用默认模型生成回复并 @ 用户。", Label = "定时消息工具")]
     public TimerToolSection TimerTool { get; set; } = new();
+    [ConfigField("让模型自主维护每个会话的长期记忆本，可选每日自动整理。", Label = "记忆本工具")]
+    public MemoryToolSection Memory { get; set; } = new();
 }
 
 public sealed class TavilySection
@@ -250,10 +277,25 @@ public sealed class TimerToolSection
     public int MaxPendingPerUser { get; set; } = 20;
     [ConfigField("到点生成提醒时允许使用已启用的 Tavily 和 HTTP 页面读取工具，受全局轮数及各工具次数限制；不允许创建新的定时任务。", Label = "定时推送时允许使用查询工具")]
     public bool UseToolsOnDelivery { get; set; } = true;
-    [ConfigField("允许预约的最远天数。模型需提供带时区偏移的 ISO 8601 时间。", Label = "最远预约天数", Min = 1, Max = 365)]
+    [ConfigField("一次性提醒及重复提醒首次触发允许的最远天数。模型需提供带时区偏移的 ISO 8601 时间。", Label = "最远预约天数", Min = 1, Max = 365)]
     public int MaxDaysAhead { get; set; } = 30;
+    [ConfigField("允许模型用 cron 表达式创建重复提醒，并通过工具查看、取消自己的提醒。关闭时工具只接受一次性的 at 和 text，适合工具调用能力较弱的小模型；已有重复任务照常推送，#timer cancel 不受影响。", Label = "允许重复提醒")]
+    public bool AllowRepeat { get; set; }
+    [ConfigField("重复提醒（cron）相邻两次之间的最小间隔，防止刷屏。", Label = "重复提醒最小间隔（分钟）", Min = 5, Max = 1440)]
+    public int MinRepeatIntervalMinutes { get; set; } = 30;
 }
 
+public sealed class MemoryToolSection
+{
+    [ConfigField("允许模型通过 memory_note 工具新增、修改、删除当前会话记忆本的条目，记忆本内容会附在对话提示词中。shared 模式一个群一本，multi 模式每人一本，single 模式不可用。", Label = "启用记忆本工具")]
+    public bool Enabled { get; set; }
+    [ConfigField("每天本地时间 0 点用默认模型整理一次所有记忆本：删除过时、重复或无用的条目，合并相近内容。需同时启用记忆本工具。", Label = "每日整理记忆本")]
+    public bool DailyReview { get; set; }
+    [ConfigField("单个记忆本最多保存的条目数。", Label = "记忆本条目上限", Min = 1, Max = 200)]
+    public int MaxEntries { get; set; } = 50;
+    [ConfigField("单条记忆的最大字数。", Label = "单条记忆字数上限", Min = 20, Max = 1000)]
+    public int MaxEntryChars { get; set; } = 200;
+}
 
 public sealed class OwnerPromptSection
 {

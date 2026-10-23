@@ -7,7 +7,19 @@ namespace ShiroBot.AiChatPlugin.Timers;
 
 internal sealed record TimerJob(string Id, string? InstanceId, string Platform, ChannelType ChannelType,
     string ChannelId, string UserId, string UserName, string SourceMessageId, DateTimeOffset DueAt,
-    string Text, int Attempts = 0, DateTimeOffset? RetryAt = null, string? LastError = null);
+    string Text, int Attempts = 0, DateTimeOffset? RetryAt = null, string? LastError = null,
+    string? Cron = null, DateTimeOffset? Until = null, int? RemainingRuns = null)
+{
+    /// <summary>重复任务本次之后的下一次时间；一次性任务、超过截止时间或次数用完时返回 null。</summary>
+    public TimerJob? NextOccurrence(DateTimeOffset after)
+    {
+        if (CronSchedule.TryParse(Cron) is not { } cron) return null;
+        if (RemainingRuns is <= 1) return null;
+        var next = cron.Next(after > DueAt ? after : DueAt);
+        if (next is null || next > Until) return null;
+        return this with { DueAt = next.Value, Attempts = 0, RetryAt = null, RemainingRuns = RemainingRuns - 1 };
+    }
+}
 
 /// <summary>单个后台循环领取到期任务；修改队列时先持久化，发送成功后删除。</summary>
 internal sealed class TimerScheduler : IAsyncDisposable
@@ -53,6 +65,22 @@ internal sealed class TimerScheduler : IAsyncDisposable
         }
         finally { _gate.Release(); }
     }
+    /// <summary>删除当前会话中满足条件的任务，返回被删除的任务。</summary>
+    public async Task<IReadOnlyList<TimerJob>> RemoveAsync(MessageEvent message, Func<TimerJob, bool> match, CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var removed = _jobs.Where(j => SameChannel(j, message) && match(j)).ToList();
+            if (removed.Count == 0) return removed;
+            var updated = _jobs.Except(removed).ToList();
+            await SaveAsync(updated, ct).ConfigureAwait(false);
+            _jobs = updated;
+            foreach (var job in removed) BotLog.Info($"[AiChat] ToolUse timer_tool 任务已取消 id={job.Id}");
+            return removed;
+        }
+        finally { _gate.Release(); }
+    }
     public async Task<IReadOnlyList<TimerJob>> ListAsync(MessageEvent message)
     {
         await _gate.WaitAsync().ConfigureAwait(false);
@@ -92,7 +120,13 @@ internal sealed class TimerScheduler : IAsyncDisposable
             ct.ThrowIfCancellationRequested();
             if (!_enabled()) return;
             string? error = null;
-            try
+            // 重复任务在停机或暂停期间错过的时间点不补发，直接排到下一次。
+            var missed = job.Cron is not null && job.Attempts == 0 && now - job.DueAt > TimeSpan.FromMinutes(10);
+            if (missed)
+            {
+                BotLog.Info($"[AiChat] ToolUse timer_tool 重复任务错过 {job.DueAt:O}，跳到下一次 id={job.Id}");
+            }
+            else try
             {
                 BotLog.Info($"[AiChat] ToolUse timer_tool 到期推送开始 id={job.Id} attempt={job.Attempts + 1}");
                 await _send(job, ct).ConfigureAwait(false);
@@ -106,8 +140,14 @@ internal sealed class TimerScheduler : IAsyncDisposable
             await _gate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                // 期间任务可能已被取消，此时不再放回队列。
+                if (!_jobs.Any(j => j.Id == job.Id)) continue;
                 var updated = _jobs.Where(j => j.Id != job.Id).ToList();
-                if (error is not null)
+                if (error is not null && job.Attempts + 1 < 3)
+                    updated.Add(job with { Attempts = job.Attempts + 1, RetryAt = now.AddMinutes(1), LastError = error });
+                else if (job.NextOccurrence(now) is { } next)
+                    updated.Add(next with { LastError = error ?? job.LastError });
+                else if (error is not null)
                     updated.Add(job with { Attempts = job.Attempts + 1, RetryAt = now.AddMinutes(1), LastError = error });
                 await SaveAsync(updated, ct).ConfigureAwait(false);
                 _jobs = updated;

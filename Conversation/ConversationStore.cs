@@ -11,6 +11,10 @@ namespace ShiroBot.AiChatPlugin.Conversation;
 /// </summary>
 internal sealed class ConversationStore
 {
+    /// <summary>会话文件中保存长期记忆的特殊行，始终位于第一行。</summary>
+    internal const string SummaryRole = "summary";
+    private const string LegacySummaryPrefix = "[对话摘要] ";
+
     private readonly ConcurrentDictionary<ConversationKey, SemaphoreSlim> _locks = new();
     private readonly string _conversationsDir;
     private readonly bool _persist;
@@ -150,6 +154,11 @@ internal sealed class ConversationStore
                              useAsync: true))
             await using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
             {
+                if (!string.IsNullOrWhiteSpace(state.Summary))
+                {
+                    var summary = new ChatTurn(SummaryRole, [new TextPart(state.Summary)], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    await writer.WriteLineAsync(PluginJson.Serialize(summary, _jsonOptions)).ConfigureAwait(false);
+                }
                 foreach (var turn in state.Turns)
                 {
                     await writer.WriteLineAsync(PluginJson.Serialize(turn, _jsonOptions)).ConfigureAwait(false);
@@ -220,12 +229,24 @@ internal sealed class ConversationStore
                 try
                 {
                     var turn = PluginJson.Deserialize<ChatTurn>(line, _jsonOptions);
-                    if (turn is not null) state.Turns.Add(turn);
+                    if (turn is null) continue;
+                    if (turn.Role == SummaryRole)
+                        state.Summary = string.Concat(turn.Parts.OfType<TextPart>().Select(p => p.Text));
+                    else
+                        state.Turns.Add(turn);
                 }
                 catch (JsonException ex)
                 {
                     BotLog.Warning($"[AiChat] 跳过损坏的会话行: {ex.Message}");
                 }
+            }
+
+            // 旧版本把摘要存成第一条 assistant 消息，读取时转为长期记忆。
+            if (state.Summary is null && state.Turns.Count > 0 && state.Turns[0] is { Role: "assistant" } first &&
+                first.Parts is [TextPart { Text: var legacy }] && legacy.StartsWith(LegacySummaryPrefix, StringComparison.Ordinal))
+            {
+                state.Summary = legacy[LegacySummaryPrefix.Length..];
+                state.Turns.RemoveAt(0);
             }
 
             // 加载后立即 trim

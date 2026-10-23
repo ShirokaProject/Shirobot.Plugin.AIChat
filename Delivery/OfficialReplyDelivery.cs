@@ -21,6 +21,10 @@ internal sealed class OfficialReplyDelivery : IAsyncDisposable
     private bool _plainTextOnly;
 
     public bool IsStreaming => _stream is not null;
+    /// <summary>流式回复是否已经向用户推送过内容。</summary>
+    public bool HasStreamed => _stream is not null && _lastText is not null;
+    /// <summary>把累计生成文本转换为可推送的预览；返回 null 时暂不推送。</summary>
+    public Func<string, string?>? PreviewFilter { get; init; }
     public bool MarkdownAvailable => !_plainTextOnly && _markdownApi is not null;
 
     public OfficialReplyDelivery(IBotContext context, MessageEvent message, BehaviourSection behaviour,
@@ -72,6 +76,7 @@ internal sealed class OfficialReplyDelivery : IAsyncDisposable
 
     public async Task AppendAsync(string cumulativeText)
     {
+        if (PreviewFilter is not null) cumulativeText = PreviewFilter(cumulativeText) ?? "";
         if (_stream is null || string.IsNullOrWhiteSpace(cumulativeText) || cumulativeText == _lastText) return;
         // 合并快速到达的 token，避免每个 token 都占用一个官方流式帧。
         if (_lastText is not null && DateTimeOffset.UtcNow - _lastUpdate < TimeSpan.FromMilliseconds(600)) return;
@@ -93,6 +98,14 @@ internal sealed class OfficialReplyDelivery : IAsyncDisposable
     public async Task DisableStreamingAsync()
     {
         _plainTextOnly = true;
+        await CloseStreamAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>放弃尚未推送内容的流式回复，保留 Markdown 等其他官方发送能力。</summary>
+    public Task AbandonStreamAsync() => HasStreamed ? Task.CompletedTask : CloseStreamAsync();
+
+    private async Task CloseStreamAsync()
+    {
         var stream = _stream;
         _stream = null;
         if (stream is null) return;
@@ -107,7 +120,7 @@ internal sealed class OfficialReplyDelivery : IAsyncDisposable
     }
 
     /// <summary>返回 true 表示已通过官方接口发送完毕，否则由调用方发送普通文本。</summary>
-    public async Task<bool> CompleteAsync(string text)
+    public async Task<bool> CompleteAsync(string text, bool mention = true)
     {
         if (_stream is not null)
         {
@@ -129,7 +142,7 @@ internal sealed class OfficialReplyDelivery : IAsyncDisposable
         {
             try
             {
-                var markdown = new QCustomMarkdown(_markdownPrefix + text);
+                var markdown = new QCustomMarkdown((mention ? _markdownPrefix : "") + text);
                 if (!_markdownApi!.CanSendMarkdown(_target!, markdown)) return false;
                 var id = await _markdownApi.SendMarkdownAsync(_target!, markdown, reply: _reply).ConfigureAwait(false);
                 return !string.IsNullOrWhiteSpace(id);

@@ -27,7 +27,8 @@ internal static class PluginJson
     {
         if (value is null || value is string) return value;
         var type = value.GetType();
-        if (type.Name.Contains("AnonymousType", StringComparison.Ordinal))
+        // 匿名类型数组的类型名也含 AnonymousType，交给下面的集合分支。
+        if (!type.IsArray && type.Name.Contains("AnonymousType", StringComparison.Ordinal))
             return type.GetProperties().ToDictionary(p => p.Name, p => ToJsonValue(p.GetValue(value)));
         if (value is System.Collections.IDictionary dictionary)
         {

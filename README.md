@@ -83,7 +83,7 @@ default_chat_mode = "shared"
 max_turns = 20
 max_tokens = 16000
 persist = true
-compact_prompt = "请用简洁的中文总结以下对话的关键信息和结论，保留重要的事实、决定和上下文。"
+compact_prompt = "" # 留空使用内置的结构化长期记忆提示词
 
 [resources]
 max_image_bytes = 8388608
@@ -97,7 +97,12 @@ auto_reply_direct_messages = false
 cancel_on_recall = false
 use_markdown = false
 use_streaming = false
-fold_above_chars = 1000 # 回复超过 1000 字符时折叠；0 禁用
+fold_above_chars = 1000 # 回复超过 1000 字符时折叠；0 禁用（reply_modes 关闭时使用）
+reply_modes = false # 模型自选聊天/解答模式，默认关闭
+chat_max_messages = 3
+chat_message_delay_ms = 800
+answer_fold_above_chars = 400
+forward_node_max_chars = 600
 reply_with_quote = true
 reply_with_mention = false
 warn_on_no_vision = true
@@ -175,8 +180,16 @@ openai-gpt-4o-mini (GPT-4o Mini) [vision]
 ### 长回复、失败回退与 compact
 
 - `[behaviour].fold_above_chars`：AI 正文超过阈值时，在 QQ 群聊和私聊中以合并转发显示完整内容。卡片预览正文前 120 个 Unicode 字符，底部显示“点击查看全部”。按 Unicode 字符计数，等于阈值不折叠，默认 `0` 禁用。折叠消息不附加引用；其他平台或合并转发发送失败时按普通文本回复。
+- `[behaviour].reply_modes`：默认关闭（一问一答整条发送）；需要模型能稳定输出首行标记，小模型建议保持关闭。开启后模型每次回复时在首行选择模式，插件解析后去掉标记再发送和保存历史：
+  - `[chat]` 聊天模式：每行作为一条独立消息依次发送（最多 `chat_max_messages` 条），间隔为 `chat_message_delay_ms` 加按字数估算的打字时间（最多再加 3 秒），均不引用原消息；适合吹水、接话。
+  - `[chat+reply]`：同聊天模式，但第一条按 `reply_with_quote` / `reply_with_mention` 引用或 @ 原消息，后续条目普通发送。
+  - `[answer]` 解答模式：完整长内容。超过 `answer_fold_above_chars` 时在 QQ 中收进合并转发，聊天记录内按段落和句末标点拆成不超过 `forward_node_max_chars` 字的多条。
+  - 模型未输出标记时按解答模式整条发送。开启流式发送时只有解答模式会流式推送，聊天模式在生成完成后分条发送。关闭后恢复整条发送并使用 `fold_above_chars`。
 - `[default].fallback_model`：使用已注册模型名或 `provider-model`。文本请求先完成原有超时、网络错误和空响应重试，仍失败（包括上游 HTTP 错误）时使用备用模型；备用模型也按相同规则重试，不再继续回退。不修改用户或共享会话的模型选择。当前请求含图片时不使用此回退。
-- `[history].compact_prompt`：历史轮数达到现有压缩阈值时，作为摘要请求的 system prompt。支持 TOML 多行字符串；留空使用内置提示词，不受用户 `#prompt` 影响。
+- `[history].compact_prompt`：合并长期记忆时使用的 system prompt。支持 TOML 多行字符串；留空使用内置的结构化提示词（人物、事实与约定、进行中、近期话题），不受用户 `#prompt` 影响。旧版默认值会自动升级。
+- 长期记忆：历史达到 `max_turns` 的 80%，或估算 token 超过 `max_tokens` 的 75% 时，较早的对话会和已有长期记忆合并成一份新的记忆（增量更新，不会对摘要反复再摘要），只保留最近的对话原文。长期记忆附在 system prompt 末尾，随会话历史保存，`#clear` 时一并清空；旧版存成 `[对话摘要]` 消息的摘要会自动迁移。
+- `[history].max_tokens`：单次请求的估算 token 上限，超过时本次请求跳过最早的历史。会话上下文标记只附在当前消息，不再写入历史；较早轮次中的文件只保留开头 500 字。
+- 调试日志：每次请求记录模型、实际发送的历史轮数、长期记忆长度和估算 token；每次回复记录模式、条数和正文（超过 2000 字截断）；长期记忆合并后记录新的记忆内容。
 
 ### Markdown 与流式回复
 
@@ -288,6 +301,12 @@ max_days_ahead = 30
 定时消息：开启 `[tool_use.timer_tool].enabled` 和全局工具开关后，模型可以使用 `timer_tool(at, text)` 创建一次性预约。时间必须是带时区偏移的 ISO 8601 时间，且在未来和预约范围内。模型请求未完成、失败或因撤回取消时，不保存该次尝试的预约；最终回复完成生成后提交到 `data/timers.json`，重启后恢复。默认每个用户在同一会话最多保留 20 条任务。
 
 到期后选中原适配器实例，使用默认模型根据预约内容生成简短回复，并在原群聊中 @ 请求者，不受普通回复 @ 开关影响；私聊直接推送。模型生成失败时推送原预约文本。发送失败每分钟重试，最多 3 次，失败任务保留供查看；关闭工具暂停已有任务，重新开启后处理到期任务。宿主需持续运行，平台需支持主动消息发送；重启恢复会补发过期的待推送任务。发送与磁盘更新之间发生异常退出时可能重复推送。
+
+### 记忆本（默认关闭）
+
+`[tool_use.memory].enabled = true` 后，模型可通过 `memory_note` 工具新增、修改、删除当前会话记忆本的条目（shared 模式一个群一本，multi 模式每人一本，single 模式不可用），记忆本全部条目附在对话提示词中。条目数和单条字数受 `max_entries`、`max_entry_chars` 限制。`daily_review = true` 时，每天本地 0 点用默认模型整理所有记忆本，删除过时、重复或无用的条目并合并相近内容；只接受原有条目 id，输出无法解析或整理期间记忆本被修改时保持不变。`#memory` 查看记忆本，`#memory clear` 清空（权限同 `#clear`）；`#clear` 不清空记忆本。
+
+重复提醒（`[tool_use.timer_tool].allow_repeat`，默认关闭；关闭时工具定义与原来一样只接受一次性 `at` / `text`）：开启后 `timer_tool` 支持 `repeat` 填 5 段 cron 表达式（分 时 日 月 周，宿主本地时区），例如每天 8 点 `0 8 * * *`、工作日 `30 9 * * 1-5`、每月 1 号和 15 号 `0 9 1,15 * *`、每年 3 月 8 日 `0 9 8 3 *`；可选 `until` 截止时间和 `count` 次数。相邻两次间隔不得小于 `min_repeat_interval_minutes`（默认 30）。每次推送后排到下一次；停机或暂停期间错过超过 10 分钟的时间点不补发，直接跳到下一次；连续 3 次发送失败也会跳到下一次。用户可让 AI 取消自己的提醒（工具 `list` / `cancel`，回复成功后才生效），或用 `#timer cancel <序号>` 取消（本人或管理员）。
 
 群聊 `#timer` 查看当前群的待推送消息、预约时间和失败状态；私聊也可查看自己的会话任务。沿用插件使用权限，列表按适配器实例和会话隔离。
 
