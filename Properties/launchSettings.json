@@ -1,5 +1,10 @@
 {
   "profiles": {
+    "ShiroBot": {
+      "commandName": "Executable",
+      "executablePath": "$(MSBuildProjectDirectory)/.shirobot-dev/host/$(NETCoreSdkRuntimeIdentifier)/$(ShiroBotDevelopmentHostExecutable)",
+      "workingDirectory": "$(MSBuildProjectDirectory)/.shirobot-dev/host/$(NETCoreSdkRuntimeIdentifier)"
+    },
     "AIChat DebugAdapter": {
       "commandName": "Executable",
       "executablePath": "$(MSBuildProjectDirectory)/.debug-runtime/ShiroBot",

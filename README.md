@@ -18,25 +18,49 @@ ShiroBot 的 OpenAI-compatible AI 聊天插件，支持多 provider、多模型�
 
 ## 安装
 
-将插件放入 ShiroBot 工作区，目录结构建议如下：
+将 Release 发布生成的插件 DLL 放入宿主的插件目录。项目继续使用 `ShiroBot.SDK 0.9.8`。
 
-```text
-ShiroBot/
-  ShiroBot.SDK/
-  ShiroBot.Model/
-  ShiroBot.AiChatPlugin/
+```sh
+dotnet publish ShiroBot.AiChatPlugin.csproj -c Release
 ```
 
-Debug 构建时插件会复制到宿主输出目录：
+输出位于 `bin/Release/net10.0/publish/`。Release 保持单 DLL 打包；Debug 保留独立依赖和 portable PDB，供断点调试。
 
-```powershell
-dotnet build .\ShiroBot.AiChatPlugin\ShiroBot.AiChatPlugin.csproj -c Debug
+## 本地开发与 Rider 调试
+
+macOS/Linux：
+
+```sh
+sh scripts/dev.sh --prepare  # 构建插件并准备宿主，不启动
+sh scripts/dev.sh            # 构建、准备并启动宿主
 ```
 
-Release 发布：
+Windows：
 
 ```powershell
-dotnet publish .\ShiroBot.AiChatPlugin\ShiroBot.AiChatPlugin.csproj -c Release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 --prepare
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1
+```
+
+脚本基于[上游 plugin 模板](https://github.com/ShirokaProject/ShiroBot/tree/91fbc0e87d51a72ef884054306278cee65ada088/Templates/ShiroBot.Templates/templates/plugin)，读取本项目 `.csproj` 中固定的 SDK 版本，下载对应平台、同版本的 framework-dependent 宿主（需要 .NET 10、网络；Unix 还需要 curl/unzip）。宿主、适配器、配置和数据保存在 Git 忽略的 `.shirobot-dev/host/<RID>/`，插件复制到其 `plugins/AiChatPlugin/`。更换 SDK 版本时更新宿主并保留本地配置与数据；每次准备会清理上次复制但本次构建已不再产出的文件。
+
+在 Rider 中选择 **ShiroBot** 启动配置和 **Debug** 构建配置，保留启动前构建步骤，然后 Run 或 Debug。Debug 构建会自动准备宿主；IDE 首次提示宿主不存在时，先执行一次上述 `--prepare`。此配置直接启动宿主，支持插件断点；Hot Reload 的可用范围取决于 IDE 和代码变更类型。
+
+新开发环境的 Dashboard 地址为 `http://127.0.0.1:7002/dashboard/`，登录 token 查看宿主 `config.toml` 的 `[api].token`。已有配置不覆盖。脚本不会自动安装或连接适配器，需要在宿主中配置后才能收发消息。停止宿主后重新运行脚本更新插件。
+
+只构建而不下载/准备开发宿主：
+
+```sh
+dotnet build ShiroBot.AiChatPlugin.csproj -c Debug -p:ShiroBotDevelopmentHostEnabled=false
+```
+
+原有源码宿主和 DebugAdapter 测试流程保留：`sh dev/prepare-debug.sh` 仍通过 `SHIROBOT_DEBUG_HOST_SOURCE` / `SHIROBOT_DEBUG_ADAPTER_SOURCE` 指定源码目录，输出到 `.debug-runtime/`，再选择 **AIChat DebugAdapter** 启动配置。该脚本使用 `UseLegacyDebugHost=true`，避免同时准备新的开发宿主。现有 `dev/verify_debug_adapter.py` 继续服务于这一测试环境。
+
+发布前保持 `.csproj` 的 `<Version>`、`AiChatPlugin.cs` 中的 `BotPlugin.Version` 和程序集 `ShiroBotPackage` 版本一致，再创建同版本 `v` tag。现有发布工作流会在上传 DLL 前检查发布产物中的这些版本与 tag；本地也可执行：
+
+```sh
+dotnet run --project scripts/version-check/VersionCheck.csproj -c Release -- \
+  bin/Release/net10.0/publish/ShiroBot.AiChatPlugin.dll 1.3.4 1.3.4
 ```
 
 ## 配置

@@ -1,0 +1,14 @@
+<Project>
+  <!-- Only the plugin prepares a host; verification and helper projects inherit this file too. -->
+  <Target Name="PrepareShiroBotDevelopmentHost" AfterTargets="Build"
+          Condition="'$(MSBuildProjectName)' == 'ShiroBot.AiChatPlugin' and '$(Configuration)' == 'Debug' and '$(DesignTimeBuild)' != 'true' and '$(ShiroBotDevelopmentHostEnabled)' != 'false' and '$(UseLegacyDebugHost)' != 'true'">
+    <Exec Condition="'$(OS)' != 'Windows_NT'" WorkingDirectory="$(MSBuildProjectDirectory)"
+          Command="/bin/sh &quot;$(MSBuildProjectDirectory)/scripts/dev.sh&quot; --prepare --no-build" />
+    <Exec Condition="'$(OS)' == 'Windows_NT'" WorkingDirectory="$(MSBuildProjectDirectory)"
+          Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/scripts/dev.ps1&quot; --prepare --no-build" />
+  </Target>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'ShiroBot.AiChatPlugin'">
+    <ShiroBotDevelopmentHostExecutable Condition="'$(OS)' == 'Windows_NT'">ShiroBot.exe</ShiroBotDevelopmentHostExecutable>
+    <ShiroBotDevelopmentHostExecutable Condition="'$(OS)' != 'Windows_NT'">ShiroBot</ShiroBotDevelopmentHostExecutable>
+  </PropertyGroup>
+</Project>

@@ -9,19 +9,21 @@
         <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
         <HostPluginDir>$(MSBuildProjectDirectory)/.debug-runtime/plugins/AiChatPlugin/</HostPluginDir>
         <Configurations>Debug;DebugPlugin;DebugAdapter;DebugAll;Release</Configurations>
-        <ShiroBotPluginPackagingEnabled>true</ShiroBotPluginPackagingEnabled>
+        <ShiroBotPluginPackagingEnabled Condition="'$(Configuration)' == 'Release'">true</ShiroBotPluginPackagingEnabled>
+        <ShiroBotPluginPackagingEnabled Condition="'$(Configuration)' != 'Release'">false</ShiroBotPluginPackagingEnabled>
+        <DebugType>portable</DebugType>
         <ShiroBotPluginSharedAssemblies>ShiroBot.Model.QQ;ShiroBot.Model.Discord;ShiroBot.Model.Telegram</ShiroBotPluginSharedAssemblies>
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Remove="Tests/**/*.cs;dev/**/*.cs" />
+        <Compile Remove="Tests/**/*.cs;dev/**/*.cs;scripts/**/*.cs" />
         <InternalsVisibleTo Include="ShiroBot.AiChatPlugin.Verification" />
         <PackageReference Include="ShiroBot.SDK" Version="0.9.8" />
     </ItemGroup>
 
     <Target Name="CopyPluginToHost"
             AfterTargets="Build"
-            Condition="'$(Configuration)'=='Debug'">
+            Condition="'$(Configuration)' == 'Debug' and '$(UseLegacyDebugHost)' == 'true'">
         <MakeDir Directories="$(HostPluginDir)" />
 
         <ItemGroup>

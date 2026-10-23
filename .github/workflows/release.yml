@@ -34,6 +34,15 @@ jobs:
       - name: Publish
         run: dotnet publish "$PROJECT_DIR" --configuration Release
 
+      - name: Check packaged plugin version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        run: |
+          version="$(dotnet msbuild ShiroBot.AiChatPlugin.csproj -nologo -getProperty:Version -p:Configuration=Release)"
+          dotnet run --project scripts/version-check/VersionCheck.csproj -c Release -- \
+            "$PUBLISH_DIR/ShiroBot.AiChatPlugin.dll" "$version" "${RELEASE_TAG#v}"
+
       - name: Collect Plugin DLL
         shell: bash
         run: |

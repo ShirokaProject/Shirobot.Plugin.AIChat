@@ -7,4 +7,4 @@ dotnet publish "$host_source/Core/ShiroBot.csproj" -c Debug -o "$repo_root/.debu
 dotnet build "$adapter_source/ShiroBot.Adapter.Debug.csproj" -c Release -p:ShiroBotSourceRoot="$host_source"
 mkdir -p "$repo_root/.debug-runtime/adapters/debug"
 cp "$adapter_source/bin/Release/net10.0/ShiroBot.Adapter.Debug.dll" "$repo_root/.debug-runtime/adapters/debug/"
-dotnet build "$repo_root/ShiroBot.AiChatPlugin.csproj" -c Debug
+dotnet build "$repo_root/ShiroBot.AiChatPlugin.csproj" -c Debug -p:UseLegacyDebugHost=true
