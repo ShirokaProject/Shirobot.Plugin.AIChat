@@ -48,10 +48,11 @@ internal static class TimerRepeatChecks
         var sent = new List<TimerJob>();
         try
         {
-            await using var scheduler = new TimerScheduler(root, () => true, (job, _) => { sent.Add(job); return Task.CompletedTask; });
+            await using var scheduler = new TimerScheduler(root, () => true, (jobs, _) => { sent.AddRange(jobs); return Task.CompletedTask; });
             using (var tool = new TimerTool(scheduler, config, message))
             {
-                Check((await tool.ExecuteAsync("{\"repeat\":\"*/5 * * * *\",\"text\":\"喝水\"}")).Contains("at least"), "Too frequent repeats must be rejected.");
+                Check((await tool.ExecuteAsync("{\"repeat\":\"*/5 * * * *\",\"text\":\"喝水\"}")).Contains("times per day"), "Too many runs per day must be rejected.");
+                Check((await tool.ExecuteAsync("{\"repeat\":\"0,10 8 * * *\",\"text\":\"喝水\"}")).Contains("at least"), "Too short repeat intervals must be rejected.");
                 Check((await tool.ExecuteAsync("{\"repeat\":\"0 8 * *\",\"text\":\"喝水\"}")).Contains("cron"), "Invalid cron must be rejected.");
                 Check((await tool.ExecuteAsync("{\"text\":\"喝水\"}")).Contains("at is required"), "One-time reminders still need at.");
                 var created = JsonDocument.Parse(await tool.ExecuteAsync("{\"repeat\":\"0 8 * * *\",\"count\":2,\"text\":\"吃早饭\"}")).RootElement;

@@ -14,6 +14,7 @@ namespace ShiroBot.AiChatPlugin;
 [JsonSerializable(typeof(ConversationMetadata))]
 [JsonSerializable(typeof(Dictionary<string, UserSettings>))]
 [JsonSerializable(typeof(List<TimerJob>))]
+[JsonSerializable(typeof(List<TimerDeliveryCount>))]
 [JsonSerializable(typeof(List<MemoryEntry>))]
 [JsonSerializable(typeof(OpenAiChatRequest))]
 [JsonSerializable(typeof(OpenAiChatResponse))]

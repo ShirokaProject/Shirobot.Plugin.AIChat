@@ -16,7 +16,7 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.3.4")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.0")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -27,7 +27,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.3.4",
+    Version = "1.4.0",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -183,6 +183,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         persist = true
         # 后续请求中重新发送图片的最近用户轮次数；0 表示只保留文字摘要
         image_memory_turns = 1
+        # 合并长期记忆使用的模型；留空使用当前对话的模型
+        compact_model = ""
         # 合并长期记忆使用的 system prompt；留空使用内置默认值
         compact_prompt = "你负责维护聊天机器人在这个会话中的长期记忆。把【已有长期记忆】和【新增对话】合并成更新后的完整记忆，只输出记忆本身，不要回复对话。\n按以下分类用简短条目记录，没有内容的分类省略：\n人物：每个人的称呼和 ID、身份、偏好、提到的个人信息\n事实与约定：已确认的事实、做出的决定、对机器人的要求或设定\n进行中：未完成的话题、待办、答应过的事\n近期话题：最近聊过的主要内容，每项一句话\n保留名字、数字、时间等具体细节，删除寒暄和已经过时的内容。总长度控制在 800 字以内。"
 
@@ -272,7 +274,21 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         # 允许 cron 重复提醒及工具查看/取消；关闭时工具与原来一样只接受一次性 at/text
         allow_repeat = false
         # 重复提醒（cron）相邻两次的最小间隔（分钟）
-        min_repeat_interval_minutes = 30
+        min_repeat_interval_minutes = 60
+        # 单个重复提醒每天最多触发次数
+        max_runs_per_day = 4
+        # 每用户最多重复提醒数
+        max_recurring_per_user = 3
+        # 重复提醒最长持续天数，到期自动结束
+        max_recurring_days = 90
+        # 每个会话（群/私聊）合计最多待推送任务数
+        max_pending_per_conversation = 30
+        # 每个会话每天最多推送条数（同一分钟合并的推送算一条）
+        max_deliveries_per_day = 30
+        # 允许为当前消息里 @ 到的其他群成员设置提醒
+        allow_mention_others = false
+        # 一次性提醒停机/暂停超过这么久（分钟）才轮到推送时不再补发，标记为已错过
+        missed_grace_minutes = 60
 
         [tool_use.memory]
         # 模型自主维护每个会话的记忆本（增改删条目）；默认关闭
@@ -338,7 +354,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             _userSettings = new UserSettingsStore(pluginRoot);
             _memory = new MemoryNotebookStore(pluginRoot);
             _timerScheduler = new TimerScheduler(pluginRoot,
-                () => _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled, SendTimerAsync);
+                () => _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled, SendTimerAsync,
+                () => _config.ToolUse.TimerTool.MaxDeliveriesPerDay,
+                () => TimeSpan.FromMinutes(Math.Clamp(_config.ToolUse.TimerTool.MissedGraceMinutes, 1, 10080)));
 
             var maxConcurrency = Math.Max(1, _config.Default.MaxConcurrency);
             _globalConcurrency = new SemaphoreSlim(maxConcurrency, maxConcurrency);
@@ -453,7 +471,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
           #model         查看可用模型
           #model <name>  切换偏好模型(部分模型仅管理员)
           #timer         查看当前会话的待推送消息
-          #timer cancel <序号> 取消定时消息(本人或管理员)
+          #timer cancel <序号> 取消定时消息(创建者/被提醒者/管理员)
+          #timer clear [@成员] 管理员清空本会话(或某成员)的定时消息
           #memory        查看当前会话的记忆本(#memory clear 清空)
           #refresh       重新拉取模型列表
           #aihelp        显示本帮助
@@ -567,7 +586,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 : jobs.FirstOrDefault(j => j.Id == target);
             string reply;
             if (job is null) reply = "没有找到这个定时消息，用 #timer 查看序号。";
-            else if (job.UserId != message.Sender.Id && !Context.IsAdmin(message.Sender.Id)) reply = "只能取消自己创建的定时消息。";
+            else if (!job.IsOwnedBy(message.Sender.Id) && !Context.IsAdmin(message.Sender.Id)) reply = "只能取消自己创建或提醒自己的定时消息。";
             else
             {
                 await _timerScheduler.RemoveAsync(message, j => j.Id == job.Id).ConfigureAwait(false);
@@ -576,43 +595,68 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             await ReplyAsync(message, !message.IsDirect, reply).ConfigureAwait(false);
             return;
         }
+        if (arg.StartsWith("clear", StringComparison.OrdinalIgnoreCase) || arg.StartsWith("清空", StringComparison.Ordinal))
+        {
+            if (!Context.IsAdmin(message.Sender.Id))
+            {
+                await ReplyAsync(message, !message.IsDirect, "仅机器人所有者或管理员可以清空定时消息。").ConfigureAwait(false);
+                return;
+            }
+            // 带 @ 时只清空这些成员创建或被提醒的任务，否则清空整个会话。
+            var users = message.Segments.OfType<MentionSegment>().Where(m => m.UserId != message.SelfId).Select(m => m.UserId).ToHashSet();
+            var removed = await _timerScheduler.RemoveAsync(message, j => users.Count == 0 || users.Any(j.IsOwnedBy)).ConfigureAwait(false);
+            await ReplyAsync(message, !message.IsDirect, $"已清空 {removed.Count} 条定时消息。").ConfigureAwait(false);
+            return;
+        }
         var paused = !_config.ToolUse.Enabled || !_config.ToolUse.TimerTool.Enabled;
         var text = jobs.Count == 0 ? "当前会话没有待推送消息。" :
             "待推送消息" + (paused ? "（工具已关闭，任务暂停）" : "") + "：\n" +
             string.Join("\n", jobs.Take(50).Select((job, index) =>
-                $"{index + 1}. {job.DueAt.ToLocalTime():yyyy-MM-dd HH:mm zzz} → {job.UserName}" +
+                $"{index + 1}. {job.DueAt.ToLocalTime():yyyy-MM-dd HH:mm zzz} → " +
+                (job.Targets is { Count: > 0 } ? $"{string.Join("、", job.Targets.Select(t => t.Name))}（{job.UserName} 预约）" : job.UserName) +
                 (job.Cron is null ? "" : $"（重复 {job.Cron}" + (job.Until is { } until ? $"，至 {until.ToLocalTime():yyyy-MM-dd HH:mm}" : "") +
                     (job.RemainingRuns is { } left ? $"，剩 {left} 次" : "") + "）") + $"\n{job.Text}" +
-                (job.Attempts >= 3 ? "\n发送失败，已停止自动重试。" : job.Attempts > 0 ? "\n发送失败，等待重试。" : ""))) +
+                (job.Stopped ? $"\n{job.LastError ?? "发送失败"}，已停止。" : job.Attempts > 0 ? "\n发送失败，等待重试。" :
+                    job.LastError is not null && job.Cron is not null ? $"\n上次：{job.LastError}" : ""))) +
             (jobs.Count > 50 ? $"\n共 {jobs.Count} 条，显示前 50 条。" : "") +
-            (jobs.Count > 0 ? "\n#timer cancel <序号> 取消" : "");
+            (jobs.Count > 0 ? "\n#timer cancel <序号> 取消；管理员 #timer clear [@成员] 清空" : "");
         await ReplyAsync(message, !message.IsDirect, text).ConfigureAwait(false);
     }
 
-    private async Task SendTimerAsync(TimerJob job, CancellationToken ct)
+    /// <summary>推送同一会话同一分钟到期的一批提醒：只调用一次模型，合并为一条消息并 @ 所有提醒对象。</summary>
+    private async Task SendTimerAsync(IReadOnlyList<TimerJob> jobs, CancellationToken ct)
     {
+        var job = jobs[0];
         using var scope = job.InstanceId is null ? null : Context.UseInstance(job.InstanceId);
         if (Context.Platform != job.Platform || job.InstanceId is not null && Context.InstanceId != job.InstanceId)
             throw new InvalidOperationException("定时任务的来源适配器当前不可用。");
+        static string Describe(TimerJob j) =>
+            j.Targets is { Count: > 0 } targets ? $"提醒 {string.Join("、", targets.Select(t => t.Name))}（{j.UserName} 预约）" : $"提醒 {j.UserName}";
+        var fallback = jobs.Count == 1 ? job.Text : string.Join("\n", jobs.Select(j => $"{Describe(j)}：{j.Text}"));
+        var request = jobs.Count == 1
+            ? $"现在是 {DateTimeOffset.Now:O}。预约时间是 {job.DueAt:O}。" + (job.Targets is { Count: > 0 } ? Describe(job) + "。" : "") + $"请回复以下提醒内容：\n{job.Text}"
+            : $"现在是 {DateTimeOffset.Now:O}。以下 {jobs.Count} 条提醒同时到期，请合并成一条简短的消息，分别说明各自的提醒内容：\n" +
+              string.Join("\n", jobs.Select((j, i) => $"{i + 1}. {Describe(j)}：{j.Text}"));
         await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
         string text;
         try
         {
             var model = ResolveModel(_config.Default.Model);
-            if (model is null) text = job.Text;
+            if (model is null) text = fallback;
             else
             {
                 try
                 {
                     var useTools = _config.ToolUse.Enabled && _config.ToolUse.TimerTool.UseToolsOnDelivery && _tools.HasReadOnlyTools;
                     var systemPrompt = ApplyOwnerPrompt(_config.Default.DefaultPrompt.TrimEnd() +
-                        (job.Cron is null ? "\n你正在发送用户预约的一次性提醒。" : "\n你正在发送用户预约的重复提醒中的一次，内容要贴合当天的情况，不要提到这是重复任务。") + "根据提醒内容给出简短回复，不要创建新的预约，不要使用markdown。");
+                        (jobs.All(j => j.Cron is null) ? "\n你正在发送用户预约的定时提醒。" : "\n你正在发送用户预约的定时提醒，其中有重复提醒，内容要贴合当天的情况，不要提到这是重复任务。") +
+                        "根据提醒内容给出简短回复，不要创建新的预约，不要使用markdown。被提醒的人会在消息开头被 @，正文不需要再写 @。");
                     if (useTools) systemPrompt += "\n" + _tools.ReadOnlySystemPrompt;
                     text = await ExecuteTextWithFallbackAsync(model, requestModel =>
                     {
                         var messages = new List<OpenAiMessage> {
                             new() { Role = "system", Content = systemPrompt },
-                            new() { Role = "user", Content = $"现在是 {DateTimeOffset.Now:O}。预约时间是 {job.DueAt:O}。请回复以下提醒内容：\n{job.Text}" }
+                            new() { Role = "user", Content = request }
                         };
                         return useTools
                             ? _tools.ChatAsync(_openAi, requestModel, messages, _config.ToolUse.MaxRounds, ct: ct, readOnlyOnly: true, maxOutputTokens: _config.Default.MaxOutputTokens)
@@ -623,17 +667,23 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
                     BotLog.Warning($"[AiChat] 定时消息生成失败，直接推送预约文本: {ex.Message}");
-                    text = job.Text;
+                    text = fallback;
                 }
             }
         }
         finally { _globalConcurrency.Release(); }
         ct.ThrowIfCancellationRequested();
+        BotLog.Info($"[AiChat] 定时推送 {jobs.Count} 条合并为 1 条消息:\n{ForLog(text)}");
         var channel = job.ChannelType == ChannelType.Group ? Channel.Group(job.ChannelId) : Channel.Direct(job.ChannelId);
-        var segments = job.ChannelType == ChannelType.Group
-            ? new MessageSegment[] { new MentionSegment(job.UserId) { DisplayName = job.UserName }, new TextSegment(" " + text) }
-            : [new TextSegment(text)];
-        var sent = await Context.Message.SendMessageAsync(channel, (IReadOnlyList<MessageSegment>)segments).ConfigureAwait(false);
+        var segments = new List<MessageSegment>();
+        if (job.ChannelType == ChannelType.Group)
+        {
+            foreach (var target in jobs.SelectMany(j => j.Recipients).DistinctBy(t => t.UserId))
+                segments.Add(new MentionSegment(target.UserId) { DisplayName = target.Name });
+            segments.Add(new TextSegment(" " + text));
+        }
+        else segments.Add(new TextSegment(text));
+        var sent = await Context.Message.SendMessageAsync(channel, segments).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(sent.MessageId)) throw new InvalidOperationException("推送未返回消息 ID。");
     }
 
@@ -757,6 +807,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             }
 
             await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            // 全局名额只在调用模型时占用；分条发送的等待只占本会话的锁，不拖慢其他群。
+            var holdsGlobal = true;
             try
             {
                 var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
@@ -885,6 +937,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                         return;
                     }
                 }
+                _globalConcurrency.Release();
+                holdsGlobal = false;
                 if (replyModes)
                 {
                     var reply = ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages);
@@ -919,13 +973,18 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     await _conversations.AppendTurnsAsync(convo, userTurn, assistantTurn).ConfigureAwait(false);
 
                     // Context compact：当轮次接近上限时自动压缩前半部分为摘要
-                    await TryCompactConversationAsync(convo, model).ConfigureAwait(false);
+                    if (NeedsCompaction(convo))
+                    {
+                        await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
+                        holdsGlobal = true;
+                        await TryCompactConversationAsync(convo, model).ConfigureAwait(false);
+                    }
                 }
 
             }
             finally
             {
-                _globalConcurrency.Release();
+                if (holdsGlobal) _globalConcurrency.Release();
             }
         }
         finally
@@ -1386,13 +1445,15 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     /// 把较早的对话合并进会话的长期记忆，只保留最近的对话原文。
     /// 长期记忆每次在旧记忆基础上增量更新，不会对摘要反复再摘要。
     /// </summary>
+    private bool NeedsCompaction(ConversationState convo) =>
+        convo.Turns.Count >= (int)(_config.History.MaxTurns * 2 * 0.8) ||
+        convo.Turns.Sum(EstimateTurnTokens) > Math.Max(1000, _config.History.MaxTokens) * 3 / 4;
+
     private async Task TryCompactConversationAsync(ConversationState convo, ModelEntry model)
     {
+        if (!NeedsCompaction(convo)) return;
         var maxItems = _config.History.MaxTurns * 2; // user+assistant 配对
         var tokenBudget = Math.Max(1000, _config.History.MaxTokens);
-        var historyTokens = convo.Turns.Sum(EstimateTurnTokens);
-        if (convo.Turns.Count < (int)(maxItems * 0.8) && historyTokens <= tokenBudget * 3 / 4)
-            return;
 
         // 从最新往前保留不超过一半轮数、一半 token 预算的原文，至少保留最近一对。
         var keep = 0;
@@ -1428,6 +1489,11 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             new() { Role = "user", Content = input.ToString() }
         };
 
+        if (!string.IsNullOrWhiteSpace(_config.History.CompactModel))
+        {
+            if (ResolveModel(_config.History.CompactModel) is { } compactModel) model = compactModel;
+            else BotLog.Warning($"[AiChat] 压缩模型 {_config.History.CompactModel} 未注册，改用当前对话模型 {model.Name}。");
+        }
         try
         {
             var summaryRequest = new OpenAiChatRequest
@@ -2073,9 +2139,21 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             {
                 BotLog.Warning($"[AiChat] 折叠回复发送失败，改用普通文本: {ex.Message}");
             }
+            // 合并转发失败多半是长消息被拒，普通文本也分成几段发，只有第一段引用原消息。
+            var chunks = ParsedReply.SplitForForward(text, FallbackChunkChars);
+            await ReplyAsync(message, isGroup, chunks[0]).ConfigureAwait(false);
+            foreach (var chunk in chunks.Skip(1))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false);
+                await Context.Message.SendMessageAsync(message.Channel, [new TextSegment(chunk)]).ConfigureAwait(false);
+            }
+            return;
         }
         await ReplyAsync(message, isGroup, text).ConfigureAwait(false);
     }
+
+    /// <summary>合并转发失败时每段普通文本的最大字数。</summary>
+    internal const int FallbackChunkChars = 1500;
 
     private static string CreateReplyPreview(string text)
     {

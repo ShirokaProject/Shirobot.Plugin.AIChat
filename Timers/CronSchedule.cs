@@ -74,6 +74,9 @@ internal sealed class CronSchedule
         return min;
     }
 
+    /// <summary>一天内最多触发的次数（只看时、分字段，与日期无关）。</summary>
+    public int RunsPerDay => _hours.Count(h => h) * _minutes.Count(m => m);
+
     private bool MatchesDay(DateTime day)
     {
         if (!_months[day.Month]) return false;

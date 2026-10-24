@@ -82,6 +82,8 @@ public sealed class HistorySection
     /// <summary>压缩历史时的 system prompt；留空使用默认提示词。</summary>
     [ConfigField("compact 摘要请求的 system prompt；留空使用内置提示词。", Label = "上下文压缩提示词", Type = "text")]
     public string CompactPrompt { get; set; } = DefaultCompactPrompt;
+    [ConfigField("合并长期记忆使用的模型名称，可填更便宜的模型；留空使用当前对话的模型。", Label = "上下文压缩模型")]
+    public string CompactModel { get; set; } = "";
     /// <summary>
     /// 单会话保留的最大轮次（user+assistant 各算一轮）。
     /// </summary>
@@ -282,7 +284,21 @@ public sealed class TimerToolSection
     [ConfigField("允许模型用 cron 表达式创建重复提醒，并通过工具查看、取消自己的提醒。关闭时工具只接受一次性的 at 和 text，适合工具调用能力较弱的小模型；已有重复任务照常推送，#timer cancel 不受影响。", Label = "允许重复提醒")]
     public bool AllowRepeat { get; set; }
     [ConfigField("重复提醒（cron）相邻两次之间的最小间隔，防止刷屏。", Label = "重复提醒最小间隔（分钟）", Min = 5, Max = 1440)]
-    public int MinRepeatIntervalMinutes { get; set; } = 30;
+    public int MinRepeatIntervalMinutes { get; set; } = 60;
+    [ConfigField("单个重复提醒在一天内最多触发的次数，超过的 cron 规则会被拒绝。", Label = "重复提醒每日最多次数", Min = 1, Max = 48)]
+    public int MaxRunsPerDay { get; set; } = 4;
+    [ConfigField("同一用户在同一会话中最多保留的重复提醒数，计入每用户任务上限。", Label = "每用户重复提醒上限", Min = 0, Max = 100)]
+    public int MaxRecurringPerUser { get; set; } = 3;
+    [ConfigField("重复提醒没有截止时间或截止时间更晚时，从首次触发起最多持续的天数，到期自动结束。", Label = "重复提醒最长天数", Min = 1, Max = 3650)]
+    public int MaxRecurringDays { get; set; } = 90;
+    [ConfigField("同一会话（一个群或一个私聊）中所有用户合计最多保留的待推送任务数。", Label = "每会话任务上限", Min = 1, Max = 1000)]
+    public int MaxPendingPerConversation { get; set; } = 30;
+    [ConfigField("同一会话每天（本地日期）最多推送的定时消息条数，同一分钟合并的推送算一条；超出后一次性提醒标记为已跳过，重复提醒顺延到下一次。计数保存在磁盘，重启后不清零。", Label = "每会话每日推送上限", Min = 1, Max = 1000)]
+    public int MaxDeliveriesPerDay { get; set; } = 30;
+    [ConfigField("允许模型在群聊中为当前消息里 @ 到的其他成员设置提醒，到点 @ 这些成员。关闭时只能提醒请求者本人，工具定义与原来一致。", Label = "允许提醒其他成员")]
+    public bool AllowMentionOthers { get; set; }
+    [ConfigField("一次性提醒因停机或暂停超过这么久才轮到推送时不再补发，标记为已错过并保留在 #timer 列表中；重复提醒错过 10 分钟即跳到下一次。", Label = "一次性提醒补发时限（分钟）", Min = 1, Max = 10080)]
+    public int MissedGraceMinutes { get; set; } = 60;
 }
 
 public sealed class MemoryToolSection

@@ -374,6 +374,8 @@ await RichReplyChecks.RunAsync();
 await ReplyModeChecks.RunAsync();
 await MemoryNotebookChecks.RunAsync();
 await TimerRepeatChecks.RunAsync();
+await TimerLimitChecks.RunAsync();
+await TimerUpdateChecks.RunAsync();
 await RecallChecks.RunAsync();
 await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();

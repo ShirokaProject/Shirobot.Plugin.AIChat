@@ -101,7 +101,7 @@ internal static class FetchTimerChecks
         var arguments = JsonSerializer.Serialize(new { at = due.ToString("O"), text = "喝水" });
         try
         {
-            await using (var scheduler = new TimerScheduler(root, () => enabled, (job, _) => { sent.Add(job); return Task.CompletedTask; }))
+            await using (var scheduler = new TimerScheduler(root, () => enabled, (jobs, _) => { sent.AddRange(jobs); return Task.CompletedTask; }))
             {
                 using var tool = new TimerTool(scheduler, config, message);
                 Check((await tool.ExecuteAsync("{\"at\":\"2026-10-01T10:00:00\",\"text\":\"a\"}")).Contains("timezone"), "Timezone-less dates must not schedule.");
@@ -119,7 +119,7 @@ internal static class FetchTimerChecks
                 Check(sent.Count == 0, "Disabled timer tool must pause dispatch.");
             }
             enabled = true;
-            await using (var restored = new TimerScheduler(root, () => enabled, (job, _) => { sent.Add(job); return Task.CompletedTask; }))
+            await using (var restored = new TimerScheduler(root, () => enabled, (jobs, _) => { sent.AddRange(jobs); return Task.CompletedTask; }))
             {
                 Check((await restored.ListAsync(message)).Count == 1, "Pending timers must survive restart.");
                 await restored.DispatchDueAsync(due.AddSeconds(-1), default);
@@ -170,10 +170,10 @@ internal static class FetchTimerChecks
         using var client = new OpenAiClient(10, "");
         var clients = (Dictionary<string, HttpClient>)typeof(OpenAiClient).GetField("_clients", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(client)!;
         clients["https://example.invalid/v1"] = new HttpClient(handler); Set("_openAi", client);
-        await (Task)typeof(AiChatPlugin).GetMethod("SendTimerAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(plugin, [job, CancellationToken.None])!;
+        await (Task)typeof(AiChatPlugin).GetMethod("SendTimerAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(plugin, [new[] { job }, CancellationToken.None])!;
         Check(selected && segments!.OfType<MentionSegment>().Single().UserId == "user" && segments!.OfType<TextSegment>().Single().Text.Contains("该喝水了"), "Timer must mention requester even when normal reply mention is off.");
         handler.Respond = _ => throw new HttpRequestException("unavailable");
-        await (Task)typeof(AiChatPlugin).GetMethod("SendTimerAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(plugin, [job, CancellationToken.None])!;
+        await (Task)typeof(AiChatPlugin).GetMethod("SendTimerAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(plugin, [new[] { job }, CancellationToken.None])!;
         Check(segments!.OfType<TextSegment>().Single().Text.Contains("喝水"), "Model failure must still deliver requested reminder text.");
         config.Default.DefaultPrompt = "custom prompt must not enter isolated summary";
         handler.Respond = body => {
@@ -202,7 +202,7 @@ internal static class FetchTimerChecks
                 tool_calls = new[] { new { id = "query" + results, type = "function", function = new { name = results == 0 ? "tavily_search" : "http_fetch", arguments = "{}" } } } } } } }) :
                 "{\"choices\":[{\"message\":{\"content\":\"搜索后抓取的定时结果\"}}]}";
         };
-        await (Task)typeof(AiChatPlugin).GetMethod("SendTimerAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(plugin, [job, CancellationToken.None])!;
+        await (Task)typeof(AiChatPlugin).GetMethod("SendTimerAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(plugin, [new[] { job }, CancellationToken.None])!;
         Check(search.Calls == 1 && fetch.Calls == 1 && segments!.OfType<TextSegment>().Single().Text.Contains("搜索后抓取的定时结果"),
             "Timer delivery must support search -> fetch -> final mention reply through bounded readonly tools.");
     }
