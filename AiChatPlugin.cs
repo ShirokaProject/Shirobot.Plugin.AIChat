@@ -54,11 +54,16 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     {
         /// <summary>上次判断之后的新消息，判断时全部交给模型，不只看最后一条。</summary>
         public readonly List<MessageEvent> Batch = [];
-        /// <summary>这段连续消息里最近一条提到机器人的消息。</summary>
-        public MessageEvent? Mentioned;
+        /// <summary>批次里提到机器人的消息。</summary>
+        public readonly HashSet<MessageEvent> Mentions = [];
         public DateTimeOffset Due = due;
-        public MessageEvent Latest => Batch[^1];
+        /// <summary>正在交给模型判断的那批消息；判断期间其中有消息被撤回时取消这次判断。</summary>
+        public MessageEvent[]? Judging;
+        public CancellationTokenSource? JudgingAbort;
+        /// <summary>判断期间被撤回的消息 ID。</summary>
+        public readonly HashSet<string> RecalledWhileJudging = [];
     }
+    private readonly record struct ProactiveOutcome(TimeSpan? RetryAfter, bool ReplyStarted);
     private const int MaxProactiveBatch = 30;
     /// <summary>冷却等待超过这个时间就不再补判，避免回复很久以前的消息。</summary>
     private static readonly TimeSpan MaxProactiveDeferral = TimeSpan.FromMinutes(2);
@@ -720,7 +725,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         var name = message.Member?.DisplayName ?? message.Sender.Name ?? message.Sender.Id;
         var keep = Math.Max(_config.History.GroupContextMessages, config.ContextMessages);
         var at = message.Timestamp == default ? DateTimeOffset.UtcNow : message.Timestamp;
-        _proactive.Record(groupKey, name, DescribeMessage(message), keep, at);
+        _proactive.Record(groupKey, name, DescribeMessage(message), keep, at, message.MessageId);
         if (!ProactiveTrigger.IsAllowedGroup(config, message.Channel.Id)) return;
         string[] botNames = config.IncludeBotName ? [await ResolveSelfNameAsync(message).ConfigureAwait(false)] : [];
         ScheduleProactive(groupKey, message, ProactiveTrigger.IsMentioned(message.GetPlainText(), config, botNames));
@@ -765,8 +770,48 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     private static void AddToBatch(PendingProactive pending, MessageEvent message, bool mentioned)
     {
         pending.Batch.Add(message);
-        if (pending.Batch.Count > MaxProactiveBatch) pending.Batch.RemoveAt(0);
-        if (mentioned) pending.Mentioned = message;
+        if (mentioned) pending.Mentions.Add(message);
+        TrimBatch(pending);
+    }
+
+    private static void TrimBatch(PendingProactive pending)
+    {
+        while (pending.Batch.Count > MaxProactiveBatch)
+        {
+            pending.Mentions.Remove(pending.Batch[0]);
+            pending.Batch.RemoveAt(0);
+        }
+    }
+
+    /// <summary>没有判断成的消息放回批次前面，和之后的新消息一起判断。</summary>
+    private static void Requeue(PendingProactive pending, IEnumerable<MessageEvent> batch, IEnumerable<MessageEvent> mentions)
+    {
+        pending.Batch.InsertRange(0, batch);
+        foreach (var m in mentions) if (pending.Batch.Contains(m)) pending.Mentions.Add(m);
+        TrimBatch(pending);
+    }
+
+    private static bool SameMessage(MessageEvent message, MessageDeletedEvent deleted) =>
+        message.MessageId == deleted.MessageId && message.InstanceId == deleted.InstanceId && message.Channel.Id == deleted.Channel.Id;
+
+    /// <summary>
+    /// 群消息被撤回：从最近消息记录和待判断的批次里去掉；正在判断的批次包含它时，在发出回复前取消这次判断，
+    /// 剩下的消息重新等安静窗口再判断。主动回复不是对方主动发起的请求，不受“撤回取消”开关影响。
+    /// </summary>
+    private void ForgetRecalledGroupMessage(MessageDeletedEvent deleted)
+    {
+        var groupKey = $"{deleted.InstanceId}:{deleted.Channel.Id}";
+        _proactive.Forget(groupKey, deleted.MessageId);
+        lock (_backgroundGate)
+        {
+            if (!_pendingProactive.TryGetValue(groupKey, out var pending)) return;
+            var removed = pending.Batch.RemoveAll(m => SameMessage(m, deleted));
+            pending.Mentions.RemoveWhere(m => SameMessage(m, deleted));
+            var judging = pending.Judging?.Any(m => SameMessage(m, deleted)) == true;
+            if (judging && pending.RecalledWhileJudging.Add(deleted.MessageId)) pending.JudgingAbort?.Cancel();
+            if (removed > 0 || judging)
+                BotLog.Info($"[AiChat] 群 {deleted.Channel.Id} 有消息撤回，主动回复不再使用这条消息。");
+        }
     }
 
     private async Task RunProactiveWindowAsync(string groupKey, CancellationToken token)
@@ -776,19 +821,29 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             while (true)
             {
                 MessageEvent[] batch;
-                MessageEvent? mentioned;
+                MessageEvent[] mentions;
                 TimeSpan wait;
+                using var abort = new CancellationTokenSource();
                 lock (_backgroundGate)
                 {
                     var pending = _pendingProactive[groupKey];
+                    // 批次里的消息全被撤回了，没什么可判断的。
+                    if (pending.Batch.Count == 0)
+                    {
+                        _pendingProactive.Remove(groupKey);
+                        return;
+                    }
                     batch = pending.Batch.ToArray();
-                    mentioned = pending.Mentioned;
+                    mentions = pending.Mentions.ToArray();
                     wait = pending.Due - DateTimeOffset.UtcNow;
                     // 开始判断后再进来的消息另起一批。
                     if (wait <= TimeSpan.Zero)
                     {
                         pending.Batch.Clear();
-                        pending.Mentioned = null;
+                        pending.Mentions.Clear();
+                        pending.Judging = batch;
+                        pending.JudgingAbort = abort;
+                        pending.RecalledWhileJudging.Clear();
                     }
                 }
                 if (wait > TimeSpan.Zero)
@@ -797,21 +852,44 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     continue;
                 }
 
-                TimeSpan? retry = null;
-                if (ProactiveTrigger.IsAllowedGroup(_config.Proactive, batch[^1].Channel.Id))
-                    retry = await TryProactiveReplyAsync(batch, mentioned).ConfigureAwait(false);
+                // 有人提到机器人时以最近那条为准。
+                var mentioned = batch.LastOrDefault(mentions.Contains);
+                ProactiveOutcome outcome = default;
+                try
+                {
+                    if (ProactiveTrigger.IsAllowedGroup(_config.Proactive, batch[^1].Channel.Id))
+                        outcome = await TryProactiveReplyAsync(batch, mentioned, abort.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    lock (_backgroundGate)
+                    {
+                        var pending = _pendingProactive[groupKey];
+                        pending.Judging = null;
+                        pending.JudgingAbort = null;
+                    }
+                }
 
                 lock (_backgroundGate)
                 {
                     var pending = _pendingProactive[groupKey];
+                    var recalled = pending.RecalledWhileJudging.ToHashSet();
+                    pending.RecalledWhileJudging.Clear();
+                    var remaining = batch.Where(m => !recalled.Contains(m.MessageId)).ToArray();
+                    if (recalled.Count > 0 && !outcome.ReplyStarted)
+                    {
+                        // 判断期间有消息被撤回、回复还没发出：去掉撤回的消息，剩下的重新等安静窗口再判断。
+                        Requeue(pending, remaining, mentions);
+                        var again = DateTimeOffset.UtcNow + QuietWindow(_config.Proactive);
+                        if (pending.Due < again) pending.Due = again;
+                        continue;
+                    }
                     var latest = batch[^1];
                     var age = DateTimeOffset.UtcNow - (latest.Timestamp == default ? DateTimeOffset.UtcNow : latest.Timestamp);
-                    if (retry is { } r && age + r <= MaxProactiveDeferral)
+                    if (outcome.RetryAfter is { } r && age + r <= MaxProactiveDeferral)
                     {
                         // 没有判断成：这批消息放回去，到时和之后的新消息一起判断。
-                        pending.Batch.InsertRange(0, batch);
-                        if (pending.Batch.Count > MaxProactiveBatch) pending.Batch.RemoveRange(0, pending.Batch.Count - MaxProactiveBatch);
-                        pending.Mentioned ??= mentioned;
+                        Requeue(pending, remaining, mentions);
                         var retryAt = DateTimeOffset.UtcNow + r + TimeSpan.FromMilliseconds(500);
                         if (pending.Due < retryAt) pending.Due = retryAt;
                         continue;
@@ -829,7 +907,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     }
 
     /// <summary>判断一次是否主动回复；只因冷却或并发已满而没有判断时返回还需等待的时间。</summary>
-    private async Task<TimeSpan?> TryProactiveReplyAsync(IReadOnlyList<MessageEvent> batch, MessageEvent? mentionedBy)
+    private async Task<ProactiveOutcome> TryProactiveReplyAsync(IReadOnlyList<MessageEvent> batch, MessageEvent? mentionedBy, CancellationToken abort)
     {
         var config = _config.Proactive;
         // 有人提到机器人时以那条为准，否则以最后一条为准；但这批新消息都会交给模型，任何一条都可以回应。
@@ -837,26 +915,28 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         var mentioned = mentionedBy is not null;
         var groupKey = ProactiveKey(message);
         // 正在处理的请求已占满并发时先不插话，优先保证被 @ 的回复，稍后再看。
-        if (_globalConcurrency.CurrentCount == 0) return TimeSpan.FromSeconds(5);
+        if (_globalConcurrency.CurrentCount == 0) return new(TimeSpan.FromSeconds(5), false);
         var decision = _proactive.Evaluate(groupKey, mentioned, config, DateTimeOffset.UtcNow);
-        if (decision.Prompt is not { } prompt) return decision.RetryAfter;
+        if (decision.Prompt is not { } prompt) return new(decision.RetryAfter, false);
+        var request = (ProactiveRequest?)null;
         try
         {
             var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
             var transcript = await GetRecentGroupMessagesAsync(batch[0], config.ContextMessages, selfName, recordedAfter: batch.Count, _backgroundStop.Token).ConfigureAwait(false);
             var fresh = string.Join('\n', batch.Select(m => ProactiveTrigger.FormatLine(m.Timestamp,
                 m.Member?.DisplayName ?? m.Sender.Name ?? m.Sender.Id, DescribeMessage(m))));
-            BotLog.Info($"[AiChat] 群 {message.Channel.Id} 主动回复判断: {(mentioned ? "被提到" : "主动插话")}，新消息 {batch.Count} 条，附带之前 {CountLines(transcript)} 条群消息");
+            BotLog.Info($"[AiChat] 群 {message.Channel.Id} 交给模型判断是否主动回复: {(mentioned ? "命中称呼" : "主动插话")}，新消息 {batch.Count} 条，附带之前 {CountLines(transcript)} 条群消息");
             var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
-            await ProcessAiAsync(message, key, prefixToStrip: null, isGroup: true, invokedByMention: false,
-                new ProactiveRequest(groupKey, ProactiveTrigger.BuildContext(transcript, fresh, prompt))).ConfigureAwait(false);
+            request = new ProactiveRequest(groupKey, ProactiveTrigger.BuildContext(transcript, fresh, prompt), abort);
+            if (abort.IsCancellationRequested) return default;
+            await ProcessAiAsync(message, key, prefixToStrip: null, isGroup: true, invokedByMention: false, request).ConfigureAwait(false);
         }
         finally
         {
             // 冷却从这次判断结束算起。
             _proactive.MarkReplied(groupKey, DateTimeOffset.UtcNow);
         }
-        return null;
+        return new(null, request?.ReplyStarted == true);
     }
 
     private async Task<string> SummarizeFetchedPageAsync(string untrustedPage, CancellationToken ct)
@@ -986,17 +1066,26 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         if (string.IsNullOrWhiteSpace(sent.MessageId)) throw new InvalidOperationException("推送未返回消息 ID。");
     }
 
-    private Task HandleMessageDeletedAsync(MessageDeletedEvent message) =>
-        _config.Behaviour.CancelOnRecall ? _pendingRequests.CancelBeforeReplyAsync(message) : Task.CompletedTask;
+    private Task HandleMessageDeletedAsync(MessageDeletedEvent message)
+    {
+        if (message.Channel.Type == ChannelType.Group) ForgetRecalledGroupMessage(message);
+        return _config.Behaviour.CancelOnRecall ? _pendingRequests.CancelBeforeReplyAsync(message) : Task.CompletedTask;
+    }
 
     private async Task ProcessAiAsync(MessageEvent message, ConversationKey key,
         string? prefixToStrip, bool isGroup, bool invokedByMention, ProactiveRequest? proactive = null)
     {
         using var pending = _pendingRequests.Register(message);
+        // 主动回复依据的消息被撤回时，在回复发出前取消。
+        using var abort = proactive?.Abort.Register(() => _ = pending.CancelBeforeReplyAsync());
         try { await ProcessAiCoreAsync(message, key, prefixToStrip, isGroup, invokedByMention, pending, proactive).ConfigureAwait(false); }
         catch (Exception) when (pending.Token.IsCancellationRequested)
         {
             BotLog.Info("[AiChat] 请求已取消，停止处理。");
+        }
+        finally
+        {
+            if (proactive is not null) proactive.ReplyStarted = pending.ReplyStarted;
         }
     }
 

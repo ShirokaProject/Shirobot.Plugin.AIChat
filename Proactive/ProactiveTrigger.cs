@@ -51,11 +51,13 @@ internal sealed class ProactiveTrigger
     }
 
     internal const string KeywordPrompt =
-        "[交互方式: 没有人 @ 你，但新消息里这条提到了你。上面是群里之前的聊天记录和你上次看过之后的新消息，新消息里其他人说的也可以一起回应。" +
-        "如果是在跟你说话或在聊你，就自然地接话；" +
-        "如果只是碰巧提到、并不需要你回应，只输出 " + SkipTag + "，不要输出别的内容。]";
+        "[交互方式: 没有人 @ 你，但新消息里这条出现了你的名字或称呼。上面是群里之前的聊天记录和你上次看过之后的新消息。" +
+        "先判断这条消息是不是在对你说话：直接叫你（如“XX 在不在”“XX 你觉得呢”）、向你提问、让你做事或明显在等你回应，才开口，" +
+        "开口时像群友一样简短随意，新消息里其他人说的也可以顺带回应。" +
+        "如果只是在一段话里顺带提到你、在跟别人聊起你、引用或转述你说过的话、或者名字只是碰巧出现，都不算在对你说话，只输出 " + SkipTag + "，不要输出别的内容。" +
+        "拿不准时保持沉默。]";
 
-    private sealed record Line(DateTimeOffset At, string Name, string Text);
+    private sealed record Line(DateTimeOffset At, string Name, string Text, string? MessageId = null);
 
     private sealed class GroupState
     {
@@ -72,13 +74,13 @@ internal sealed class ProactiveTrigger
         config.Enabled && config.Groups.Any(g => g.Trim() == groupId);
 
     /// <summary>记录一条群消息；返回本条之前的最近消息记录（不含本条）。</summary>
-    public string Record(string groupKey, string name, string text, int keep, DateTimeOffset at)
+    public string Record(string groupKey, string name, string text, int keep, DateTimeOffset at, string? messageId = null)
     {
         lock (_groups)
         {
             var state = GetState(groupKey);
             var transcript = Format(state.Recent);
-            state.Recent.Add(new Line(at, name, Shorten(text, 300)));
+            state.Recent.Add(new Line(at, name, Shorten(text, 300), messageId));
             state.MessagesSince++;
             var max = Math.Clamp(keep, 1, 100);
             if (state.Recent.Count > max) state.Recent.RemoveRange(0, state.Recent.Count - max);
@@ -137,6 +139,20 @@ internal sealed class ProactiveTrigger
         }
     }
 
+    /// <summary>消息被撤回：从最近消息记录里去掉。</summary>
+    public void Forget(string groupKey, string messageId)
+    {
+        lock (_groups)
+        {
+            if (!_groups.TryGetValue(groupKey, out var state)) return;
+            var index = state.Recent.FindIndex(l => l.MessageId == messageId);
+            if (index < 0) return;
+            // 撤回的消息如果是上次发言之后的，也不再计入插话所需的消息数。
+            if ((state.LastSpoke is not { } last || state.Recent[index].At > last) && state.MessagesSince > 0) state.MessagesSince--;
+            state.Recent.RemoveAt(index);
+        }
+    }
+
     /// <summary>
     /// 机器人在本群回复结束（被 @ 的回复、主动发言或选择沉默）：冷却从这时开始算。
     /// 不清零消息计数，回复期间进来的消息仍然算数。
@@ -191,4 +207,9 @@ internal sealed class ProactiveTrigger
 internal readonly record struct ProactiveDecision(string? Prompt, TimeSpan? RetryAfter);
 
 /// <summary>一次主动回复请求：所在群和附加在本次请求中的群聊上下文与提示。</summary>
-internal sealed record ProactiveRequest(string GroupKey, string Context);
+/// <param name="Abort">依据的消息被撤回时触发，回复发出前取消这次请求。</param>
+internal sealed record ProactiveRequest(string GroupKey, string Context, CancellationToken Abort = default)
+{
+    /// <summary>回复是否已经开始发送（发出后撤回也无法收回）。</summary>
+    public bool ReplyStarted { get; set; }
+}

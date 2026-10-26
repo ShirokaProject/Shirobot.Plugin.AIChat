@@ -57,6 +57,12 @@ internal sealed class PendingAiRequest : IDisposable
     public Task Completion => _completion.Task;
     public CancellationToken Token { get; }
 
+    /// <summary>回复已经开始发送。</summary>
+    public bool ReplyStarted
+    {
+        get { lock (_gate) return _replyStarted; }
+    }
+
     public Task CancelForUnloadAsync()
     {
         lock (_gate)

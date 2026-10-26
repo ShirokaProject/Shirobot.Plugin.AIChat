@@ -97,7 +97,8 @@ internal static class ProactiveChecks
         // 一段时间内多人发言时，全部新消息都交给模型，不只最后一条。
         var both = ProactiveTrigger.BuildContext("A: 之前", "我: 问个问题\nB: 无关的话", ProactiveTrigger.MediumPrompt);
         Check(both.Contains("[你上次看过之后的新消息]\n我: 问个问题\nB: 无关的话") && both.IndexOf("A: 之前") < both.IndexOf("我: 问个问题")
-            && ProactiveTrigger.MediumPrompt.Contains("不一定是最后一条") && ProactiveTrigger.KeywordPrompt.Contains("其他人说的也可以"),
+            && ProactiveTrigger.MediumPrompt.Contains("不一定是最后一条") && ProactiveTrigger.KeywordPrompt.Contains("其他人说的也可以")
+            && ProactiveTrigger.KeywordPrompt.Contains("顺带提到你") && ProactiveTrigger.KeywordPrompt.Contains("拿不准时保持沉默"),
             "Every new message since the last look must be offered to the model.");
 
         var plugin = new AiChatPlugin();
@@ -178,5 +179,32 @@ internal static class ProactiveChecks
         trigger.Record("i:g1", "alice", "现在呢", 10, t0.AddMinutes(5));
         Check(await Fetch(5, 1) == $"{Time(0)} bob: 内存里的", "Unsupported history must fall back to recorded messages, skipping the current one.");
         Console.WriteLine("PASS: group context uses message history with ordering, bot marking and memory fallback");
+
+        // 撤回：从内存记录、待判断批次中去掉；正在判断的批次包含它时取消这次判断。
+        trigger.Record("i:g1", "carol", "要撤回的", 10, t0.AddMinutes(6), "r1");
+        trigger.Forget("i:g1", "r1");
+        Check(!trigger.Recent("i:g1", 10).Contains("要撤回的"), "Recalled messages must leave the recorded context.");
+        var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+        var schedule = typeof(AiChatPlugin).GetMethod("ScheduleProactive", flags)!;
+        var deleted = typeof(AiChatPlugin).GetMethod("HandleMessageDeletedAsync", flags)!;
+        var pendingMap = (System.Collections.IDictionary)typeof(AiChatPlugin).GetField("_pendingProactive", flags)!.GetValue(plugin)!;
+        MessageDeletedEvent Recall(MessageEvent m) => new() { Platform = m.Platform, InstanceId = m.InstanceId, MessageId = m.MessageId, Channel = m.Channel };
+        var mine = Msg("p1", "alice", 7, new TextSegment("露露你看"));
+        var other = Msg("p2", "bob", 7, new TextSegment("无关的话"));
+        schedule.Invoke(plugin, ["i:g1", mine, true]);
+        schedule.Invoke(plugin, ["i:g1", other, false]);
+        var state = pendingMap["i:g1"]!;
+        T Field<T>(string name) => (T)state.GetType().GetField(name)!.GetValue(state)!;
+        await (Task)deleted.Invoke(plugin, [Recall(mine)])!;
+        Check(Field<List<MessageEvent>>("Batch").SequenceEqual([other]) && Field<HashSet<MessageEvent>>("Mentions").Count == 0,
+            "A recalled message must leave the pending batch along with its mention.");
+        using var abort = new CancellationTokenSource();
+        state.GetType().GetField("Judging")!.SetValue(state, new[] { other });
+        state.GetType().GetField("JudgingAbort")!.SetValue(state, abort);
+        await (Task)deleted.Invoke(plugin, [Recall(other)])!;
+        Check(abort.IsCancellationRequested && Field<HashSet<string>>("RecalledWhileJudging").Contains("p2") && Field<List<MessageEvent>>("Batch").Count == 0,
+            "Recalling a message that is being judged must cancel the judgment.");
+        state.GetType().GetField("Judging")!.SetValue(state, null);
+        Console.WriteLine("PASS: recalled messages are dropped from proactive context, batches and running judgments");
     }
 }
