@@ -30,7 +30,17 @@ internal static class ReplyModeChecks
         var tooled = ParsedReply.Parse("[chat]\n我查一下\n\n[answer]\n结果如下", 4);
         Check(tooled.Mode == ReplyMode.Answer && tooled.Text == "我查一下\n\n结果如下", "The last tag wins and every tag line is removed.");
         Check(ParsedReply.Parse("[chat]", 4).Text == "[chat]", "A tag-only reply must not become empty.");
-        Console.WriteLine("PASS: reply mode tags, quote choice, message cap, fallback and tool prefixes");
+        // 强制聊天模式：没有标记或写了 [answer] 也分条发送，不引用；[chat+reply] 仍可引用。
+        var forced = ParsedReply.Parse("没有标记\n\n第二行", 4, forceChat: true);
+        Check(forced.Mode == ReplyMode.Chat && !forced.Quote && forced.Messages.SequenceEqual(["没有标记", "第二行"]), "Forced chat must split untagged replies without quoting.");
+        var forcedAnswer = ParsedReply.Parse("[answer]\n一\n二\n三\n四", 3, forceChat: true);
+        Check(forcedAnswer.Mode == ReplyMode.Chat && !forcedAnswer.Quote && forcedAnswer.Messages.Count == 3 && forcedAnswer.Messages[0] == "一",
+            "Forced chat must also split answer-tagged replies and respect the cap.");
+        Check(ParsedReply.Parse("[chat+reply]\n在", 4, forceChat: true).Quote, "Forced chat must keep the model's quote choice.");
+        Check(new BehaviourSection { ReplyMode = "聊天" }.ReplyStyle() == "chat" && new BehaviourSection { ReplyMode = " AUTO " }.ReplyStyle() == "auto"
+            && new BehaviourSection { ReplyMode = "bogus" }.ReplyStyle() == "answer" && new BehaviourSection().ReplyStyle() == "answer",
+            "Reply mode values must normalise, defaulting to answer.");
+        Console.WriteLine("PASS: reply mode tags, quote choice, message cap, fallback, forced chat and tool prefixes");
 
         Check(ParsedReply.StreamPreview("[cha") is null && ParsedReply.StreamPreview("[chat]\n你好") is null,
             "Chat mode and incomplete tags must not stream.");

@@ -18,6 +18,13 @@ internal sealed record ParsedReply(ReplyMode Mode, bool Quote, string Text, IRea
         "[answer] 解答模式：用户要求解释、教程、对比、分析、写代码，或问题本身需要完整说明时使用，可以写成完整的长内容，长内容会自动收进聊天记录。\n" +
         "根据当前这条消息选择模式，不要因为之前回复过长内容就继续写长；拿不准时用 [chat]。";
 
+    /// <summary>强制聊天模式：总是分条短消息，只让模型决定是否引用。</summary>
+    public const string ChatOnlyPrompt =
+        "回复格式：第一行只写 [chat] 或 [chat+reply]，正文从第二行开始。\n" +
+        "像真人在群里发消息一样回复，每一行会作为一条独立消息依次发出，每行一句短话；不要分点、不要标题、不要长段落，即使问题比较复杂也只说重点。\n" +
+        "条数要克制：默认只发 1 条；确实有自然的补充或追问时才发 2 条；只有情绪很强烈（特别激动、委屈、炸毛、大笑）时才发 3 条。同一个意思不要拆成几条重复说。\n" +
+        "[chat+reply] 会让第一条引用回复对方的原消息，只在需要明确回应对方某句话时使用（如回答对方的问题、群里指定回应某人）；纯吹水、附和、接梗用 [chat]。";
+
     private static readonly (string Tag, ReplyMode Mode, bool Quote)[] Tags =
     [
         ("[chat+reply]", ReplyMode.Chat, true),
@@ -26,7 +33,8 @@ internal sealed record ParsedReply(ReplyMode Mode, bool Quote, string Text, IRea
         ("[answer]", ReplyMode.Answer, true)
     ];
 
-    public static ParsedReply Parse(string raw, int maxMessages)
+    /// <param name="forceChat">强制聊天模式：没有标记或写了 [answer] 也按聊天模式分条，且不引用。</param>
+    public static ParsedReply Parse(string raw, int maxMessages, bool forceChat = false)
     {
         ReplyMode? mode = null;
         var quote = true;
@@ -46,7 +54,8 @@ internal sealed record ParsedReply(ReplyMode Mode, bool Quote, string Text, IRea
 
         var text = string.Join('\n', body).Trim();
         if (text.Length == 0) text = raw.Trim();
-        if (mode != ReplyMode.Chat) return new(ReplyMode.Answer, true, text, [text]);
+        if (forceChat && mode != ReplyMode.Chat) quote = false;
+        else if (mode != ReplyMode.Chat) return new(ReplyMode.Answer, true, text, [text]);
 
         var messages = body.Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
         maxMessages = Math.Max(1, maxMessages);

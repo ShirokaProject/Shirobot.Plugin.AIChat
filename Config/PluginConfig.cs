@@ -21,6 +21,8 @@ public sealed class PluginConfig
     public ResourcesSection Resources { get; set; } = new();
     [ConfigField("长回复折叠、引用回复和使用提示。", Label = "回复行为")]
     public BehaviourSection Behaviour { get; set; } = new();
+    [ConfigField("群聊中没有被 @ 时由模型自行决定是否插话，默认关闭。", Label = "群聊主动回复")]
+    public ProactiveSection Proactive { get; set; } = new();
     [ConfigField("管理员清空会话和模型切换限制；用户使用范围由宿主路由控制。", Label = "操作权限")]
     public PermissionsSection Permissions { get; set; } = new();
     [ConfigField("全局工具开关及各工具的独立配置。", Label = "工具调用")]
@@ -105,6 +107,9 @@ public sealed class HistorySection
     /// <summary>在后续请求中重新发送图片的最近用户轮次数。0 表示只保留文字摘要。</summary>
     [ConfigField("后续请求重新发送图片的最近用户轮数；0 仅保留文字摘要。", Label = "图片记忆轮数", Min = 0)]
     public int ImageMemoryTurns { get; set; } = 1;
+
+    [ConfigField("群聊中被 @ 或用 #ai 时，附上群里最近多少条消息，帮助理解大家在聊什么；只附在本次请求里，不写入历史。优先通过适配器的历史消息接口获取，不支持时使用插件运行期间记录的普通消息。0 表示不附带。", Label = "群聊上下文消息数", Min = 0, Max = 100)]
+    public int GroupContextMessages { get; set; }
 }
 
 public sealed class ResourcesSection
@@ -167,8 +172,16 @@ public sealed class BehaviourSection
     [ConfigField("QQ 回复超过此字符数时使用合并转发折叠；0 禁用。", Label = "长回复折叠字数", Min = 0)]
     public int FoldAboveChars { get; set; }
 
-    [ConfigField("让模型每次自选回复模式：聊天模式像真人一样分几条短消息发送，并自行决定是否引用回复；解答模式输出完整长内容，超长时收进聊天记录。关闭后整条发送并使用“长回复折叠字数”。需要模型稳定输出首行标记，小模型建议保持关闭。", Label = "模型自选回复模式")]
-    public bool ReplyModes { get; set; }
+    [ConfigField("answer 回答：一问一答整条发送，超长时按“长回复折叠字数”折叠（默认，原来的行为）；chat 聊天：总是像真人一样分几条短消息发送，模型自行决定是否引用回复；auto 自动：模型每次在聊天和解答之间自选，解答时输出完整长内容，超长时收进聊天记录。chat 和 auto 需要模型稳定输出首行标记，小模型建议用 answer。", Label = "回复模式", Options = new[] { "answer", "chat", "auto" })]
+    public string ReplyMode { get; set; } = "answer";
+
+    /// <summary>规范化的回复模式：answer、chat 或 auto，无法识别时按 answer。</summary>
+    public string ReplyStyle() => ReplyMode?.Trim().ToLowerInvariant() switch
+    {
+        "chat" or "聊天" => "chat",
+        "auto" or "自动" => "auto",
+        _ => "answer"
+    };
 
     [ConfigField("聊天模式单次最多发送的消息条数，多出的内容并入最后一条。", Label = "聊天模式最多条数", Min = 1, Max = 10)]
     public int ChatMaxMessages { get; set; } = 3;
@@ -198,6 +211,36 @@ public sealed class BehaviourSection
     public bool HintOnEmptyInput { get; set; } = true;
 }
 
+public sealed class ProactiveSection
+{
+    [ConfigField("开启后，白名单群里没有 @ 机器人的普通消息在冷却和频率限制允许时交给模型，由模型判断是否插话，不合适就保持沉默。每次判断都会调用一次模型。", Label = "启用群聊主动回复")]
+    public bool Enabled { get; set; }
+    [ConfigField("允许主动回复的群号；留空表示不在任何群主动回复。", Label = "主动回复群白名单")]
+    public string[] Groups { get; set; } = [];
+    [ConfigField("消息里提到这些词（不需要 @）时视为在叫机器人，使用较短的冷却并让模型优先考虑回应，例如机器人的昵称、外号。", Label = "称呼关键词")]
+    public string[] Keywords { get; set; } = [];
+    [ConfigField("把机器人当前的群昵称/名称也当作称呼关键词。", Label = "名称算作称呼")]
+    public bool IncludeBotName { get; set; } = true;
+    [ConfigField("被提到时距机器人上次在本群回复结束（含被 @ 的回复和模型选择沉默）至少间隔的秒数；冷却期间的消息会在冷却结束后补判。", Label = "被提到时的冷却（秒）", Min = 0, Max = 86400)]
+    public int KeywordCooldownSeconds { get; set; } = 60;
+    [ConfigField("没有提到机器人的普通消息也交给模型判断是否插话；关闭时只在被提到时判断。", Label = "允许主动插话")]
+    public bool Interject { get; set; } = true;
+    [ConfigField("主动插话距机器人上次在本群回复结束（含被 @ 的回复和模型选择沉默）至少间隔的秒数；冷却期间进来的消息会在冷却结束后用最新一条补判，等待超过 2 分钟的不补判。", Label = "主动插话冷却（秒）", Min = 0, Max = 86400)]
+    public int CooldownSeconds { get; set; } = 10;
+    [ConfigField("主动插话前，自上次判断以来群里至少要有这么多条其他消息，避免冷清时自说自话。", Label = "主动插话最少间隔消息数", Min = 0, Max = 1000)]
+    public int MinMessagesBetween { get; set; } = 1;
+    [ConfigField("交给模型参考的群聊最近消息条数，优先通过适配器的历史消息接口获取。", Label = "参考最近消息数", Min = 1, Max = 100)]
+    public int ContextMessages { get; set; } = 20;
+    [ConfigField("群里来消息后先等一个随机的安静窗口（最短秒数），期间有新消息就重新计时，安静下来后只用最新一条判断一次，避免连续发消息时每条都请求模型。", Label = "安静窗口最短（秒）", Min = 0, Max = 120)]
+    public int QuietMinSeconds { get; set; } = 3;
+    [ConfigField("安静窗口的最长秒数，每次在最短和最长之间随机取值。", Label = "安静窗口最长（秒）", Min = 0, Max = 120)]
+    public int QuietMaxSeconds { get; set; } = 10;
+    [ConfigField("没被提到时模型插话的积极程度：low 只在有人找它或明显能帮上忙时开口；medium 被问到、有人求助、能补充有价值信息或有很好笑的点时开口；high 除非完全无关都接话。", Label = "活跃度", Options = new[] { "low", "medium", "high" })]
+    public string Eagerness { get; set; } = "medium";
+    [ConfigField("自定义没被提到时的插话提示词，填写后代替活跃度对应的内置提示词；没有写 [skip] 时会自动补上“不想说话时只输出 [skip]”。留空使用内置提示词。", Label = "自定义插话提示词", Type = "text")]
+    public string Prompt { get; set; } = "";
+}
+
 public sealed class PermissionsSection
 {
     [ConfigField("仅限制 shared 模式的群聊共享会话：开启后仅机器人所有者或管理员可清空；关闭后群成员均可清空。single/multi 个人会话和私聊会话始终由用户本人清空。", Label = "shared 会话仅管理员可清空")]
@@ -224,6 +267,46 @@ public sealed class ToolUseSection
     public TimerToolSection TimerTool { get; set; } = new();
     [ConfigField("让模型自主维护每个会话的长期记忆本，可选每日自动整理。", Label = "记忆本工具")]
     public MemoryToolSection Memory { get; set; } = new();
+    [ConfigField("⚠️ 让模型调用本机或远程的 MCP 服务，有安全风险，默认关闭。", Label = "MCP 工具")]
+    public McpSection Mcp { get; set; } = new();
+}
+
+public sealed class McpSection
+{
+    [ConfigField("⚠️ 风险提示：MCP 工具运行在机器人所在的电脑上或你配置的远程服务上，可能读写文件、执行命令、访问网络或你的账号。群成员可以通过聊天诱导模型调用它们（提示词注入）。只接入你完全信任的 MCP 服务，尽量只开放只读工具，并保持“所有人可用”关闭。", Label = "启用 MCP 工具")]
+    public bool Enabled { get; set; }
+    [ConfigField("⚠️ 关闭时只有机器人所有者或管理员发起的对话才会向模型提供 MCP 工具；开启后任何能和机器人对话的人都能让模型调用，风险很高。主动插话和定时推送始终不提供 MCP 工具。", Label = "所有人可用")]
+    public bool AllowEveryone { get; set; }
+    [ConfigField("每次 AI 回复中单个 MCP 工具最多调用的次数，仍受全局工具轮数限制。", Label = "单工具调用次数上限", Min = 1, Max = 20)]
+    public int MaxCallsPerTurn { get; set; } = 3;
+    [ConfigField("连接、列出工具和单次调用的超时时间。", Label = "超时（秒）", Min = 5, Max = 600)]
+    public int TimeoutSeconds { get; set; } = 60;
+    [ConfigField("单次工具结果交给模型的最大字符数，超出部分截断。", Label = "结果最大字符数", Min = 500, Max = 100000)]
+    public int MaxResultChars { get; set; } = 8000;
+    [ConfigField("MCP 服务列表。stdio 服务填写 command/args，HTTP 服务填写 url。", Label = "MCP 服务")]
+    public List<McpServerEntry> Servers { get; set; } = [];
+}
+
+public sealed class McpServerEntry
+{
+    [ConfigField("服务名称，只能用字母、数字、下划线或短横线，会出现在工具名 mcp_<名称>_<工具> 中。", Label = "名称")]
+    public string Name { get; set; } = "";
+    [ConfigField("关闭后不连接这个服务。", Label = "启用")]
+    public bool Enabled { get; set; } = true;
+    [ConfigField("stdio 服务启动的命令，建议写绝对路径（从 IDE 或服务启动时 PATH 可能不包含 node/npx）。Windows 上 npx 需写成 command = \"cmd\"，args 以 \"/c\", \"npx\" 开头。", Label = "命令")]
+    public string Command { get; set; } = "";
+    [ConfigField("命令参数。", Label = "参数")]
+    public string[] Args { get; set; } = [];
+    [ConfigField("额外的环境变量，每项写成 KEY=VALUE。", Label = "环境变量")]
+    public string[] Env { get; set; } = [];
+    [ConfigField("进程的工作目录；留空使用宿主的工作目录。", Label = "工作目录")]
+    public string WorkingDirectory { get; set; } = "";
+    [ConfigField("Streamable HTTP 服务地址；填写后忽略命令。", Label = "URL")]
+    public string Url { get; set; } = "";
+    [ConfigField("HTTP 请求头，每项写成 \"Name: value\"，例如 \"Authorization: Bearer xxx\"。", Label = "请求头")]
+    public string[] Headers { get; set; } = [];
+    [ConfigField("只向模型提供这些工具（MCP 原始工具名）；留空提供全部。建议只放只读工具。", Label = "允许的工具")]
+    public string[] AllowedTools { get; set; } = [];
 }
 
 public sealed class TavilySection

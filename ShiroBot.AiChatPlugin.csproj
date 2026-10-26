@@ -6,7 +6,6 @@
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
         <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
-        <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
         <HostPluginDir>$(MSBuildProjectDirectory)/.debug-runtime/plugins/AiChatPlugin/</HostPluginDir>
         <Configurations>Debug;DebugPlugin;DebugAdapter;DebugAll;Release</Configurations>
         <ShiroBotPluginPackagingEnabled Condition="'$(Configuration)' == 'Release'">true</ShiroBotPluginPackagingEnabled>

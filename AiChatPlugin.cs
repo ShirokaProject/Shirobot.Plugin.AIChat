@@ -7,7 +7,9 @@ using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.AiChatPlugin.UserState;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.AiChatPlugin.Delivery;
+using ShiroBot.AiChatPlugin.Mcp;
 using ShiroBot.AiChatPlugin.Memory;
+using ShiroBot.AiChatPlugin.Proactive;
 using ShiroBot.AiChatPlugin.Timers;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
@@ -45,7 +47,25 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     private ResourceFetcher _fetcher = null!;
     private ResourceCache _cache = null!;
     private SemaphoreSlim _globalConcurrency = null!;
+    private readonly ProactiveTrigger _proactive = new();
+    /// <summary>每个群等待判断的消息；同一个群同时只有一个等待任务。</summary>
+    private readonly Dictionary<string, PendingProactive> _pendingProactive = new();
+    private sealed class PendingProactive(DateTimeOffset due)
+    {
+        /// <summary>上次判断之后的新消息，判断时全部交给模型，不只看最后一条。</summary>
+        public readonly List<MessageEvent> Batch = [];
+        /// <summary>这段连续消息里最近一条提到机器人的消息。</summary>
+        public MessageEvent? Mentioned;
+        public DateTimeOffset Due = due;
+        public MessageEvent Latest => Batch[^1];
+    }
+    private const int MaxProactiveBatch = 30;
+    /// <summary>冷却等待超过这个时间就不再补判，避免回复很久以前的消息。</summary>
+    private static readonly TimeSpan MaxProactiveDeferral = TimeSpan.FromMinutes(2);
     private ChatToolRegistry _tools = new();
+    private McpHub? _mcp;
+    /// <summary>当前 MCP 配置的快照，配置没变时热重载不重启 MCP 进程。</summary>
+    private string? _mcpConfigKey;
     private readonly PendingAiRequests _pendingRequests = new();
     private TimerScheduler _timerScheduler = null!;
     private MemoryNotebookStore _memory = null!;
@@ -92,6 +112,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         DirectCommands.MapExact("#refresh", HandleFriendRefreshAsync);
         DirectCommands.MapPrefix("#timer", HandleTimerListAsync);
         DirectCommands.MapPrefix("#memory", HandleMemoryAsync);
+        DirectCommands.MapExact("#mcp", HandleMcpAsync);
         DirectCommands.MapWhen(ShouldAutoReplyDirectMessage, HandleFriendAutoReplyAsync);
 
         // 群聊
@@ -104,7 +125,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         GroupCommands.MapExact("#refresh", HandleGroupRefreshAsync);
         GroupCommands.MapPrefix("#timer", HandleTimerListAsync);
         GroupCommands.MapPrefix("#memory", HandleMemoryAsync);
+        GroupCommands.MapExact("#mcp", HandleMcpAsync);
         GroupCommands.MapWhen(message => !string.IsNullOrWhiteSpace(message.SelfId) && message.HasMention(message.SelfId), HandleGroupMentionAsync);
+        GroupCommands.MapWhen(ShouldRecordGroupMessage, HandleGroupChatterAsync);
 
         Events.Map<MessageDeletedEvent>(HandleMessageDeletedAsync);
         _timerScheduler.Start();
@@ -115,15 +138,17 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     protected override async Task OnUnloadAsync()
     {
         await _backgroundStop.CancelAsync().ConfigureAwait(false);
+        // 先取消进行中的 AI 请求：主动回复的补判任务可能正在等待模型。
+        await _pendingRequests.StopAsync().ConfigureAwait(false);
         Task[] recalls;
         lock (_backgroundGate) recalls = _recallTasks.ToArray();
         await Task.WhenAll(recalls).ConfigureAwait(false);
-        await _pendingRequests.StopAsync().ConfigureAwait(false);
         if (_memoryReview is not null) await _memoryReview.ConfigureAwait(false);
         if (_timerScheduler is not null) await _timerScheduler.DisposeAsync().ConfigureAwait(false);
         _openAi?.Dispose();
         _fetcher?.Dispose();
         _tools.Dispose();
+        if (_mcp is not null) await _mcp.DisposeAsync().ConfigureAwait(false);
         _globalConcurrency?.Dispose();
         _backgroundStop.Dispose();
         BotLog.Info("[AiChat] 插件已卸载。");
@@ -183,6 +208,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         persist = true
         # 后续请求中重新发送图片的最近用户轮次数；0 表示只保留文字摘要
         image_memory_turns = 1
+        # 群聊被 @ 或 #ai 时附带最近多少条群消息（优先用适配器历史消息接口；仅本次请求，不写入历史）；0 表示不附带
+        group_context_messages = 0
         # 合并长期记忆使用的模型；留空使用当前对话的模型
         compact_model = ""
         # 合并长期记忆使用的 system prompt；留空使用内置默认值
@@ -211,8 +238,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         use_streaming = false
         # AI 回复超过此字符数时使用 QQ 合并转发折叠；0 禁用
         fold_above_chars = 0
-        # 模型自选回复模式：[chat] 分条短消息并自行决定是否引用回复，[answer] 完整长内容；默认关闭（一问一答整条发送）
-        reply_modes = false
+        # 回复模式：answer 一问一答整条发送（默认）；chat 总是分条短消息，模型自行决定是否引用回复；
+        # auto 模型每次在聊天和解答（完整长内容）之间自选
+        reply_mode = "answer"
         # 聊天模式单次最多发送的消息条数
         chat_max_messages = 3
         # 聊天模式消息间的基础间隔（毫秒），另按字数增加模拟打字时间
@@ -290,6 +318,33 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         # 一次性提醒停机/暂停超过这么久（分钟）才轮到推送时不再补发，标记为已错过
         missed_grace_minutes = 60
 
+        [tool_use.mcp]
+        # ⚠️ 风险提示：MCP 工具运行在机器人所在电脑或远程服务上，可能读写文件、执行命令、访问网络或账号；
+        # 群成员可能通过聊天诱导模型调用（提示词注入）。只接入完全信任的服务，尽量只开放只读工具。默认关闭。
+        enabled = false
+        # 关闭时只有所有者/管理员发起的对话才提供 MCP 工具；开启后所有人都能让模型调用，风险很高
+        allow_everyone = false
+        # 每次回复中单个 MCP 工具最多调用次数
+        max_calls_per_turn = 3
+        # 连接、列出工具和单次调用的超时（秒）
+        timeout_seconds = 60
+        # 单次工具结果交给模型的最大字符数
+        max_result_chars = 8000
+        # 服务示例（去掉行首 # 使用）：
+        # stdio：command 建议写绝对路径；Windows 上 npx 写成 command = "cmd"，args = ["/c", "npx", ...]
+        # [[tool_use.mcp.servers]]
+        # name = "fs"
+        # command = "/opt/homebrew/bin/npx"
+        # args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/Documents"]
+        # env = []                     # 每项 "KEY=VALUE"
+        # allowed_tools = ["read_text_file", "list_directory"]   # 留空提供全部，建议只放只读工具
+        #
+        # Streamable HTTP：
+        # [[tool_use.mcp.servers]]
+        # name = "remote"
+        # url = "http://127.0.0.1:8000/mcp"
+        # headers = ["Authorization: Bearer xxx"]
+
         [tool_use.memory]
         # 模型自主维护每个会话的记忆本（增改删条目）；默认关闭
         enabled = false
@@ -297,6 +352,34 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         daily_review = false
         max_entries = 50
         max_entry_chars = 200
+
+        [proactive]
+        # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
+        # 每次判断都会调用一次模型（包括最终选择沉默的）
+        enabled = false
+        # 允许主动回复的群号，留空表示不在任何群主动回复，例如 ["123456"]
+        groups = []
+        # 称呼关键词：消息提到这些词（不需要 @）时视为在叫机器人
+        keywords = []
+        # 机器人当前的群昵称/名称也算称呼
+        include_bot_name = true
+        # 被提到时距机器人上次回复结束的冷却（秒）
+        keyword_cooldown_seconds = 60
+        # 没被提到时也让模型判断要不要插话；false 表示只在被提到时判断
+        interject = true
+        # 主动插话距机器人上次回复结束的最小间隔（秒）；冷却期间的消息会在冷却结束后补判（最多等 2 分钟）
+        cooldown_seconds = 10
+        # 主动插话前，自上次判断以来群里至少要有的其他消息数
+        min_messages_between = 1
+        # 交给模型参考的群聊最近消息条数（优先用适配器历史消息接口）
+        context_messages = 20
+        # 安静窗口：来消息后随机等 quiet_min_seconds~quiet_max_seconds 秒，期间有新消息就重新计时，安静下来只判断最新一条
+        quiet_min_seconds = 3
+        quiet_max_seconds = 10
+        # 没被提到时插话的积极程度：low（只在有人找它时）/ medium（被问到、求助、有价值或很好笑时）/ high（除非完全无关都接）
+        eagerness = "medium"
+        # 自定义插话提示词，填写后代替活跃度的内置提示词；没写 [skip] 会自动补上沉默说明；留空使用内置
+        prompt = ""
 
         [network]
         # 模型和搜索请求共用的可选代理（安全网页抓取始终公网直连），例如 http://127.0.0.1:7890；留空直连
@@ -378,6 +461,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             _config.Resources.CacheMaxAgeDays);
         _tools.Dispose();
         _tools = ChatToolRegistry.Create(_config, SummarizeFetchedPageAsync);
+        UpdateMcpHub();
         _ = _cache.CleanupAsync();
 
         if (initial)
@@ -468,12 +552,14 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
           #prompt        查看当前 prompt
           #prompt -      重置为默认
           #clear         清空当前会话上下文
-          #model         查看可用模型
+          #model         查看当前模型
+          #model list    查看可用模型
           #model <name>  切换偏好模型(部分模型仅管理员)
           #timer         查看当前会话的待推送消息
           #timer cancel <序号> 取消定时消息(创建者/被提醒者/管理员)
           #timer clear [@成员] 管理员清空本会话(或某成员)的定时消息
           #memory        查看当前会话的记忆本(#memory clear 清空)
+          #mcp           查看 MCP 服务状态(管理员)
           #refresh       重新拉取模型列表
           #aihelp        显示本帮助
         提示: 在消息里引用图片/文件/或合并转发, AI会一并读取这些资源。
@@ -558,6 +644,219 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
         // 移除触发本次路由的自身 @，避免模型把机器人名称误认成第三方。
         await ProcessAiAsync(message, key, prefixToStrip: null, isGroup: true, invokedByMention: true).ConfigureAwait(false);
+    }
+
+    /// <summary>没有 @ 机器人的普通群消息：开启群聊上下文或主动回复时记录下来。</summary>
+    private bool ShouldRecordGroupMessage(MessageEvent message)
+    {
+        if (_config.History.GroupContextMessages <= 0 && !ProactiveTrigger.IsAllowedGroup(_config.Proactive, message.Channel.Id)) return false;
+        if (message.Sender.Id == message.SelfId) return false;
+        var text = message.GetPlainText().TrimStart();
+        return !text.StartsWith('#') && !text.StartsWith('/');
+    }
+
+    /// <summary>
+    /// 当前消息之前的群聊记录：优先用适配器的历史消息接口（包含 @ 机器人的消息和机器人自己的发言，重启后也能拿到），
+    /// 不支持或失败时用内存中记录的普通消息。
+    /// </summary>
+    /// <param name="recordedAfter">内存记录中排在这条消息之后（含自身）的条数，兜底时跳过。</param>
+    private async Task<string> GetRecentGroupMessagesAsync(MessageEvent message, int count, string selfName, int recordedAfter, CancellationToken ct)
+    {
+        if (count <= 0) return "";
+        try
+        {
+            var history = await Context.Message.GetHistoryMessagesAsync(message.Channel, message.MessageId, count + 1, ct).ConfigureAwait(false);
+            // 不同适配器对 beforeMessageId 是否包含自身、返回顺序不一致，统一过滤并按时间排序。
+            var lines = history
+                .Where(m => m.MessageId != message.MessageId && (message.Timestamp == default || m.Timestamp <= message.Timestamp))
+                .DistinctBy(m => m.MessageId)
+                .OrderBy(m => m.Timestamp)
+                .TakeLast(count)
+                .Select(m => ProactiveTrigger.FormatLine(m.Timestamp,
+                    m.Sender.Id == message.SelfId ? $"{selfName}（你）" : m.Member?.DisplayName ?? m.Sender.Name ?? m.Sender.Id,
+                    DescribeMessage(m)));
+            return string.Join('\n', lines);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            if (ex is not NotSupportedException) BotLog.Warning($"[AiChat] 获取群历史消息失败，改用内存记录: {ex.Message}");
+            return _proactive.Recent(ProactiveKey(message), count, recordedAfter);
+        }
+    }
+
+    /// <summary>把消息段转成一行文字，图片等资源只保留类型。</summary>
+    private static string DescribeMessage(MessageEvent message)
+    {
+        var sb = new StringBuilder();
+        foreach (var segment in message.Segments)
+        {
+            sb.Append(segment switch
+            {
+                TextSegment text => text.Text,
+                MentionSegment mention => "@" + (mention.DisplayName ?? mention.UserId) + " ",
+                MentionAllSegment => "@全体成员 ",
+                ImageSegment => "[图片]",
+                EmojiSegment => "[表情]",
+                AudioSegment => "[语音]",
+                VideoSegment => "[视频]",
+                FileSegment => "[文件]",
+                QuoteSegment => "",
+                _ => "[消息]"
+            });
+        }
+        var described = sb.ToString().Trim();
+        return described.Length == 0 ? "[消息]" : described;
+    }
+
+    private static int CountLines(string transcript) => transcript.Length == 0 ? 0 : transcript.Count(c => c == '\n') + 1;
+
+    private static string ProactiveKey(MessageEvent message) => $"{message.InstanceId}:{message.Channel.Id}";
+
+    /// <summary>先记进最近消息；白名单群里在频率限制允许时交给模型判断是否插话。</summary>
+    private async Task HandleGroupChatterAsync(MessageEvent message)
+    {
+        var config = _config.Proactive;
+        var groupKey = ProactiveKey(message);
+        var name = message.Member?.DisplayName ?? message.Sender.Name ?? message.Sender.Id;
+        var keep = Math.Max(_config.History.GroupContextMessages, config.ContextMessages);
+        var at = message.Timestamp == default ? DateTimeOffset.UtcNow : message.Timestamp;
+        _proactive.Record(groupKey, name, DescribeMessage(message), keep, at);
+        if (!ProactiveTrigger.IsAllowedGroup(config, message.Channel.Id)) return;
+        string[] botNames = config.IncludeBotName ? [await ResolveSelfNameAsync(message).ConfigureAwait(false)] : [];
+        ScheduleProactive(groupKey, message, ProactiveTrigger.IsMentioned(message.GetPlainText(), config, botNames));
+    }
+
+    private static TimeSpan QuietWindow(ProactiveSection config)
+    {
+        var min = Math.Clamp(config.QuietMinSeconds, 0, 120) * 1000;
+        var max = Math.Max(min, Math.Clamp(config.QuietMaxSeconds, 0, 120) * 1000);
+        return TimeSpan.FromMilliseconds(Random.Shared.Next(min, max + 1));
+    }
+
+    /// <summary>
+    /// 安静窗口：每来一条消息就把这个群的判断时间推迟一个随机窗口，群里安静下来后只用最新一条判断一次。
+    /// 冷却未到时也在这里等，到时再判断最新的消息。
+    /// </summary>
+    private void ScheduleProactive(string groupKey, MessageEvent message, bool mentioned)
+    {
+        var due = DateTimeOffset.UtcNow + QuietWindow(_config.Proactive);
+        lock (_backgroundGate)
+        {
+            if (_backgroundStop.IsCancellationRequested) return;
+            if (_pendingProactive.TryGetValue(groupKey, out var pending))
+            {
+                AddToBatch(pending, message, mentioned);
+                pending.Due = due;
+                return;
+            }
+            pending = new PendingProactive(due);
+            AddToBatch(pending, message, mentioned);
+            _pendingProactive[groupKey] = pending;
+            var token = _backgroundStop.Token;
+            var task = Task.Run(() => RunProactiveWindowAsync(groupKey, token));
+            _recallTasks.Add(task);
+            _ = task.ContinueWith(completed =>
+            {
+                lock (_backgroundGate) _recallTasks.Remove(completed);
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+    }
+
+    private static void AddToBatch(PendingProactive pending, MessageEvent message, bool mentioned)
+    {
+        pending.Batch.Add(message);
+        if (pending.Batch.Count > MaxProactiveBatch) pending.Batch.RemoveAt(0);
+        if (mentioned) pending.Mentioned = message;
+    }
+
+    private async Task RunProactiveWindowAsync(string groupKey, CancellationToken token)
+    {
+        try
+        {
+            while (true)
+            {
+                MessageEvent[] batch;
+                MessageEvent? mentioned;
+                TimeSpan wait;
+                lock (_backgroundGate)
+                {
+                    var pending = _pendingProactive[groupKey];
+                    batch = pending.Batch.ToArray();
+                    mentioned = pending.Mentioned;
+                    wait = pending.Due - DateTimeOffset.UtcNow;
+                    // 开始判断后再进来的消息另起一批。
+                    if (wait <= TimeSpan.Zero)
+                    {
+                        pending.Batch.Clear();
+                        pending.Mentioned = null;
+                    }
+                }
+                if (wait > TimeSpan.Zero)
+                {
+                    await Task.Delay(wait, token).ConfigureAwait(false);
+                    continue;
+                }
+
+                TimeSpan? retry = null;
+                if (ProactiveTrigger.IsAllowedGroup(_config.Proactive, batch[^1].Channel.Id))
+                    retry = await TryProactiveReplyAsync(batch, mentioned).ConfigureAwait(false);
+
+                lock (_backgroundGate)
+                {
+                    var pending = _pendingProactive[groupKey];
+                    var latest = batch[^1];
+                    var age = DateTimeOffset.UtcNow - (latest.Timestamp == default ? DateTimeOffset.UtcNow : latest.Timestamp);
+                    if (retry is { } r && age + r <= MaxProactiveDeferral)
+                    {
+                        // 没有判断成：这批消息放回去，到时和之后的新消息一起判断。
+                        pending.Batch.InsertRange(0, batch);
+                        if (pending.Batch.Count > MaxProactiveBatch) pending.Batch.RemoveRange(0, pending.Batch.Count - MaxProactiveBatch);
+                        pending.Mentioned ??= mentioned;
+                        var retryAt = DateTimeOffset.UtcNow + r + TimeSpan.FromMilliseconds(500);
+                        if (pending.Due < retryAt) pending.Due = retryAt;
+                        continue;
+                    }
+                    // 判断期间又有新消息：它已经设好了新的安静窗口，继续等。
+                    if (pending.Batch.Count > 0) continue;
+                    _pendingProactive.Remove(groupKey);
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex) { BotLog.Warning($"[AiChat] 主动回复判断失败: {ex.Message}"); }
+        lock (_backgroundGate) _pendingProactive.Remove(groupKey);
+    }
+
+    /// <summary>判断一次是否主动回复；只因冷却或并发已满而没有判断时返回还需等待的时间。</summary>
+    private async Task<TimeSpan?> TryProactiveReplyAsync(IReadOnlyList<MessageEvent> batch, MessageEvent? mentionedBy)
+    {
+        var config = _config.Proactive;
+        // 有人提到机器人时以那条为准，否则以最后一条为准；但这批新消息都会交给模型，任何一条都可以回应。
+        var message = mentionedBy ?? batch[^1];
+        var mentioned = mentionedBy is not null;
+        var groupKey = ProactiveKey(message);
+        // 正在处理的请求已占满并发时先不插话，优先保证被 @ 的回复，稍后再看。
+        if (_globalConcurrency.CurrentCount == 0) return TimeSpan.FromSeconds(5);
+        var decision = _proactive.Evaluate(groupKey, mentioned, config, DateTimeOffset.UtcNow);
+        if (decision.Prompt is not { } prompt) return decision.RetryAfter;
+        try
+        {
+            var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
+            var transcript = await GetRecentGroupMessagesAsync(batch[0], config.ContextMessages, selfName, recordedAfter: batch.Count, _backgroundStop.Token).ConfigureAwait(false);
+            var fresh = string.Join('\n', batch.Select(m => ProactiveTrigger.FormatLine(m.Timestamp,
+                m.Member?.DisplayName ?? m.Sender.Name ?? m.Sender.Id, DescribeMessage(m))));
+            BotLog.Info($"[AiChat] 群 {message.Channel.Id} 主动回复判断: {(mentioned ? "被提到" : "主动插话")}，新消息 {batch.Count} 条，附带之前 {CountLines(transcript)} 条群消息");
+            var key = ResolveConversationKey(ChatScene.Group, PeerId(message), SenderId(message));
+            await ProcessAiAsync(message, key, prefixToStrip: null, isGroup: true, invokedByMention: false,
+                new ProactiveRequest(groupKey, ProactiveTrigger.BuildContext(transcript, fresh, prompt))).ConfigureAwait(false);
+        }
+        finally
+        {
+            // 冷却从这次判断结束算起。
+            _proactive.MarkReplied(groupKey, DateTimeOffset.UtcNow);
+        }
+        return null;
     }
 
     private async Task<string> SummarizeFetchedPageAsync(string untrustedPage, CancellationToken ct)
@@ -691,10 +990,10 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         _config.Behaviour.CancelOnRecall ? _pendingRequests.CancelBeforeReplyAsync(message) : Task.CompletedTask;
 
     private async Task ProcessAiAsync(MessageEvent message, ConversationKey key,
-        string? prefixToStrip, bool isGroup, bool invokedByMention)
+        string? prefixToStrip, bool isGroup, bool invokedByMention, ProactiveRequest? proactive = null)
     {
         using var pending = _pendingRequests.Register(message);
-        try { await ProcessAiCoreAsync(message, key, prefixToStrip, isGroup, invokedByMention, pending).ConfigureAwait(false); }
+        try { await ProcessAiCoreAsync(message, key, prefixToStrip, isGroup, invokedByMention, pending, proactive).ConfigureAwait(false); }
         catch (Exception) when (pending.Token.IsCancellationRequested)
         {
             BotLog.Info("[AiChat] 请求已取消，停止处理。");
@@ -702,7 +1001,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     }
 
     private async Task ProcessAiCoreAsync(MessageEvent message, ConversationKey key,
-        string? prefixToStrip, bool isGroup, bool invokedByMention, PendingAiRequest pending)
+        string? prefixToStrip, bool isGroup, bool invokedByMention, PendingAiRequest pending, ProactiveRequest? proactive = null)
     {
         var ct = pending.Token;
         var collector = new ResourceCollector(Context, _fetcher, _cache, _config.Resources);
@@ -740,12 +1039,15 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
         if (parts.Count == 0)
         {
-            if (_config.Behaviour.HintOnEmptyInput)
+            if (_config.Behaviour.HintOnEmptyInput && proactive is null)
             {
                 await ReplyAsync(message, isGroup, "[AiChat] 没有可处理的内容。发送 #aihelp 查看用法。").ConfigureAwait(false);
             }
             return;
         }
+
+        // 被 @ 的回复开始时就算机器人在说话，期间进来的消息等回复结束、冷却过后再判断要不要插话。
+        if (isGroup && proactive is null) _proactive.MarkReplied(ProactiveKey(message), DateTimeOffset.UtcNow);
 
         var senderId = SenderId(message);
         var settings = _userSettings.GetOrCreate(ScopedUser(senderId));
@@ -771,7 +1073,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 {
                     model = fallbackModel;
                     await ReplyAsync(message, isGroup,
-                        $"[AiChat] 模型 {modelName} 不可用，已自动回退到 {model.Name}。可用 #model 重新选择。").ConfigureAwait(false);
+                        $"[AiChat] 模型 {modelName} 不可用，已自动回退到 {model.Name}。可用 #model list 查看并重新选择。").ConfigureAwait(false);
                     if (isSharedMode && convo is not null)
                     {
                         convo.SharedModel = null;
@@ -812,17 +1114,21 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             try
             {
                 var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
-                using var timer = _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled
+                // 主动插话不是用户的请求，不允许预约定时消息。
+                using var timer = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled
                     ? new TimerTool(_timerScheduler, _config.ToolUse.TimerTool, message) : null;
                 using var memoryTool = convo is not null && _config.ToolUse.Enabled && _config.ToolUse.Memory.Enabled
                     ? new MemoryTool(_memory, _config.ToolUse.Memory, key) : null;
-                IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>()];
+                var mcpTools = McpToolsFor(message, proactive);
+                IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>(), .. mcpTools];
                 var contextualTools = contextual.Length > 0 ? contextual : null;
-                var replyModes = _config.Behaviour.ReplyModes;
+                var replyStyle = _config.Behaviour.ReplyStyle();
+                var replyModes = replyStyle != "answer";
+                var forceChat = replyStyle == "chat";
                 await using var delivery = new OfficialReplyDelivery(Context, message, _config.Behaviour, pending.TryBeginReply, ct)
                 {
                     // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
-                    PreviewFilter = replyModes ? ParsedReply.StreamPreview : null
+                    PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
                 var systemPrompt = isSharedMode && convo?.SharedPrompt is not null
@@ -843,7 +1149,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 systemPrompt = ApplyOwnerPrompt(systemPrompt);
                 if (timer is not null) systemPrompt += "\n" + timer.SystemPrompt;
                 if (memoryTool is not null) systemPrompt += "\n" + memoryTool.SystemPrompt;
-                if (replyModes) systemPrompt += "\n" + ParsedReply.SystemPrompt;
+                if (mcpTools.Count > 0) systemPrompt += "\n" + McpChatTool.Prompt;
+                if (replyModes) systemPrompt += "\n" + (forceChat ? ParsedReply.ChatOnlyPrompt : ParsedReply.SystemPrompt);
                 systemPrompt = OfficialReplyDelivery.ApplyPromptPolicy(systemPrompt, _config.Behaviour.UseMarkdown);
                 // 长期记忆放在末尾，前面稳定的部分仍可命中上游前缀缓存。
                 if (!string.IsNullOrWhiteSpace(convo?.Summary))
@@ -865,6 +1172,15 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 // 历史只保存消息本身；会话上下文每轮都相同，只附在本次请求里，避免在历史中重复占用 token。
                 var userTurn = new ChatTurn("user", userParts, userTimestamp.ToUnixTimeMilliseconds());
                 var requestUserTurn = userTurn with { Parts = AppendUserContext(userParts, message, selfName) };
+                // 群聊最近消息和插话提示只附在本次请求里，不写入历史。
+                if (proactive is not null) requestUserTurn = requestUserTurn with { Parts = [.. requestUserTurn.Parts, new TextPart(proactive.Context)] };
+                else if (isGroup && await GetRecentGroupMessagesAsync(message, _config.History.GroupContextMessages, selfName,
+                    recordedAfter: 0, ct).ConfigureAwait(false) is { Length: > 0 } recent)
+                {
+                    requestUserTurn = requestUserTurn with { Parts = [.. requestUserTurn.Parts, new TextPart(
+                        "[群聊最近消息：按时间顺序，用来理解大家在聊什么，不需要逐条回应]\n" + recent)] };
+                    BotLog.Info($"[AiChat] 附带最近 {CountLines(recent)} 条群消息");
+                }
 
                 string assistantText;
                 try
@@ -926,6 +1242,12 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 }
 
                 ct.ThrowIfCancellationRequested();
+                if (proactive is not null && (ProactiveTrigger.IsSkip(assistantText) ||
+                    replyModes && ProactiveTrigger.IsSkip(ParsedReply.Parse(assistantText, 1).Text)))
+                {
+                    BotLog.Info($"[AiChat] 群 {message.Channel.Id} 主动回复：模型选择沉默。");
+                    return;
+                }
                 if (!pending.TryBeginReply()) throw new OperationCanceledException(ct);
                 if (timer is not null)
                 {
@@ -941,7 +1263,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 holdsGlobal = false;
                 if (replyModes)
                 {
-                    var reply = ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages);
+                    var reply = ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat);
+                    // 主动插话可能回应的是这批新消息里的任意一条，不引用，避免引错人。
+                    if (proactive is not null) reply = reply with { Quote = false };
                     BotLog.Info($"[AiChat] 回复 mode={(reply.Mode == ReplyMode.Chat ? reply.Quote ? "chat+reply" : "chat" : "answer")} " +
                         $"条数={reply.Messages.Count} 字数={reply.Text.Length}:\n{ForLog(reply.Text)}");
                     // 历史只保存去掉标记后的正文，关闭该功能后模型不会继续模仿标记。
@@ -956,12 +1280,23 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                         await ReplyFoldableAsync(message, isGroup, reply.Text, _config.Behaviour.AnswerFoldAboveChars).ConfigureAwait(false);
                     }
                 }
+                else if (proactive is not null)
+                {
+                    // 主动插话像群友一样直接发，不引用也不 @ 触发的那条消息。
+                    BotLog.Info($"[AiChat] 主动回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
+                    var threshold = _config.Behaviour.FoldAboveChars;
+                    if (threshold > 0 && assistantText.EnumerateRunes().Count() > threshold)
+                        await ReplyFoldableAsync(message, isGroup, assistantText, threshold).ConfigureAwait(false);
+                    else
+                        await SendChatMessagesAsync(message, isGroup, delivery, new ParsedReply(ReplyMode.Chat, false, assistantText, [assistantText])).ConfigureAwait(false);
+                }
                 else
                 {
                     BotLog.Info($"[AiChat] 回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
                     var delivered = await delivery.CompleteAsync(assistantText).ConfigureAwait(false);
                     if (!delivered) await ReplyAssistantAsync(message, isGroup, assistantText).ConfigureAwait(false);
                 }
+                if (proactive is null && isGroup) _proactive.MarkReplied(ProactiveKey(message), DateTimeOffset.UtcNow);
 
                 // single 模式不保存历史
                 if (convo is not null)
@@ -1165,7 +1500,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         // shared 模式：修改操作写入共享会话，仅 admin 可操作
         if (mode == "shared")
         {
-            if (!string.IsNullOrEmpty(arg) && !Context.IsAdmin(message.Sender.Id))
+            if (!IsModelViewArg(arg) && !Context.IsAdmin(message.Sender.Id))
             {
                 await ReplyToGroup(message, "共享模式下仅管理员可切换模型。").ConfigureAwait(false);
                 return;
@@ -1176,6 +1511,12 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             try
             {
                 if (string.IsNullOrEmpty(arg))
+                {
+                    await ReplyToGroup(message, $"当前共享模型: {FormatSelectedModel(convo.SharedModel, includeDefaultMark: true)}\n" +
+                        "#model list 查看可用模型；管理员 #model <name> 切换，#model - 恢复默认").ConfigureAwait(false);
+                    return;
+                }
+                if (IsModelViewArg(arg))
                 {
                     // 查看列表，30s 后撤回
                     await ApplyModelAsync(SenderId(message), arg, isAdmin: Context.IsAdmin(message.Sender.Id),
@@ -1222,8 +1563,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             return;
         }
 
-        // 非 shared 模式
-        if (string.IsNullOrEmpty(arg))
+        // 非 shared 模式：列表较长，30s 后撤回
+        if (IsModelViewArg(arg) && !string.IsNullOrEmpty(arg))
         {
             await ApplyModelAsync(SenderId(message), arg, isAdmin: Context.IsAdmin(message.Sender.Id),
                 async reply =>
@@ -1243,6 +1584,13 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         var settings = _userSettings.GetOrCreate(ScopedUser(userId));
 
         if (string.IsNullOrEmpty(arg))
+        {
+            await reply($"当前模型: {FormatSelectedModel(settings.PreferredModel, includeDefaultMark: true)}\n" +
+                "#model list 查看可用模型；#model <name> 切换；#model - 恢复默认").ConfigureAwait(false);
+            return;
+        }
+
+        if (IsModelViewArg(arg))
         {
             var sb = new StringBuilder();
             sb.AppendLine("可用模型:");
@@ -1293,6 +1641,63 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         settings.PreferredModel = GetModelDisplayId(target);
         await _userSettings.SaveAsync().ConfigureAwait(false);
         await reply($"已切换到模型: {GetModelDisplayId(target)}").ConfigureAwait(false);
+    }
+
+    /// <summary>空参数查看当前模型，list 查看可用模型列表；都不修改设置。</summary>
+    private static bool IsModelViewArg(string arg) =>
+        string.IsNullOrEmpty(arg) || string.Equals(arg, "list", StringComparison.OrdinalIgnoreCase) || arg == "列表";
+
+    // -------- MCP --------
+
+    /// <summary>配置变化时重建 MCP 连接；旧连接在后台关闭，卸载时等待。</summary>
+    private void UpdateMcpHub()
+    {
+        var config = _config.ToolUse.Mcp;
+        var key = _config.ToolUse.Enabled && config.Enabled ? PluginJson.Serialize(config) : null;
+        if (key == _mcpConfigKey) return;
+        _mcpConfigKey = key;
+        if (_mcp is { } old)
+        {
+            _mcp = null;
+            lock (_backgroundGate)
+            {
+                var task = Task.Run(async () => await old.DisposeAsync().ConfigureAwait(false));
+                _recallTasks.Add(task);
+                _ = task.ContinueWith(completed =>
+                {
+                    lock (_backgroundGate) _recallTasks.Remove(completed);
+                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+        }
+        if (key is null) return;
+        BotLog.Warning("[AiChat] ⚠️ 已启用 MCP 工具：模型可以调用机器人所在电脑上配置的 MCP 服务，可能读写文件、执行命令或访问网络。" +
+            (config.AllowEveryone ? "当前所有人都能让模型调用，风险很高！" : "当前仅所有者/管理员发起的对话可用。"));
+        _mcp = new McpHub(config, typeof(AiChatPlugin).Assembly.GetName().Version?.ToString(3) ?? "0.0.0");
+    }
+
+    /// <summary>本次请求可用的 MCP 工具：主动插话不提供；默认只对所有者/管理员提供。</summary>
+    private List<IChatTool> McpToolsFor(MessageEvent message, ProactiveRequest? proactive)
+    {
+        var config = _config.ToolUse.Mcp;
+        if (proactive is not null || _mcp is not { } hub || !_config.ToolUse.Enabled || !config.Enabled) return [];
+        if (!config.AllowEveryone && !Context.IsAdmin(message.Sender.Id)) return [];
+        var maxCalls = Math.Clamp(config.MaxCallsPerTurn, 1, 20);
+        return hub.Tools.Select(t => (IChatTool)new McpChatTool(hub, t.ToolName, t.Server, t.Tool, maxCalls)).ToList();
+    }
+
+    private async Task HandleMcpAsync(MessageEvent message)
+    {
+        var isGroup = !message.IsDirect;
+        if (!Context.IsAdmin(message.Sender.Id))
+        {
+            await ReplyAsync(message, isGroup, "仅机器人所有者或管理员可以查看 MCP 服务。").ConfigureAwait(false);
+            return;
+        }
+        var config = _config.ToolUse.Mcp;
+        var text = _mcp is null
+            ? "MCP 工具未启用（tool_use.enabled 与 tool_use.mcp.enabled 都需要开启）。"
+            : "MCP 服务" + (config.AllowEveryone ? "（⚠️ 所有人可用）" : "（仅所有者/管理员可用）") + "：\n" + _mcp.Describe();
+        await ReplyAsync(message, isGroup, text).ConfigureAwait(false);
     }
 
     // -------- #memory --------
@@ -1748,7 +2153,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         var matches = FindModelCandidates(keyword, maxCount: 12);
         if (matches.Count == 0)
         {
-            return $"未找到模型: {keyword}。发送 #model 查看可用列表。";
+            return $"未找到模型: {keyword}。发送 #model list 查看可用列表。";
         }
 
         var sb = new StringBuilder();

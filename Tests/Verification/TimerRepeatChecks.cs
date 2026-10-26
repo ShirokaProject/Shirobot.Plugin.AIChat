@@ -36,7 +36,7 @@ internal static class TimerRepeatChecks
         var root = Path.Combine(Path.GetTempPath(), "aichat-repeat-" + Guid.NewGuid().ToString("N"));
         var message = new MessageEvent { Platform = "custom", InstanceId = "adapter-one", MessageId = "m1", Channel = Channel.Group("group"), Sender = new User("user") { Name = "用户" }, Segments = [] };
         var config = new TimerToolSection { Enabled = true, MaxPendingPerUser = 5, MinRepeatIntervalMinutes = 30, AllowRepeat = true };
-        Check(!new TimerToolSection().AllowRepeat && !new PluginConfig().Behaviour.ReplyModes, "Repeat reminders and reply modes must be off by default.");
+        Check(!new TimerToolSection().AllowRepeat && new PluginConfig().Behaviour.ReplyStyle() == "answer", "Repeat reminders and reply modes must be off by default.");
         using (var basic = new TimerTool(null!, new TimerToolSection(), message))
         {
             var schema = JsonSerializer.Serialize(basic.Definition.Function.Parameters);
