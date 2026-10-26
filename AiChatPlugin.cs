@@ -18,7 +18,7 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.0")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.1")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -29,7 +29,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.4.0",
+    Version = "1.4.1",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -1093,6 +1093,13 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         string? prefixToStrip, bool isGroup, bool invokedByMention, PendingAiRequest pending, ProactiveRequest? proactive = null)
     {
         var ct = pending.Token;
+        // 错误和提示只发给主动找机器人的人；主动插话出错时静默，只记日志。
+        Task NotifyAsync(string text)
+        {
+            if (proactive is null) return ReplyAsync(message, isGroup, text);
+            BotLog.Warning($"[AiChat] 群 {message.Channel.Id} 主动回复失败，已静默: {text}");
+            return Task.CompletedTask;
+        }
         var collector = new ResourceCollector(Context, _fetcher, _cache, _config.Resources);
         List<ChatPart> parts;
         try
@@ -1105,7 +1112,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             BotLog.Error($"[AiChat] 收集资源失败: {ex}");
-            await ReplyAsync(message, isGroup, $"响应失败了哦，原因：处理消息资源失败，{ex.Message}").ConfigureAwait(false);
+            await NotifyAsync($"响应失败了哦，原因：处理消息资源失败，{ex.Message}").ConfigureAwait(false);
             return;
         }
 
@@ -1161,7 +1168,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 if (fallbackModel is not null)
                 {
                     model = fallbackModel;
-                    await ReplyAsync(message, isGroup,
+                    await NotifyAsync(
                         $"[AiChat] 模型 {modelName} 不可用，已自动回退到 {model.Name}。可用 #model list 查看并重新选择。").ConfigureAwait(false);
                     if (isSharedMode && convo is not null)
                     {
@@ -1177,7 +1184,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             }
             if (model is null)
             {
-                await ReplyAsync(message, isGroup, $"[AiChat] 未找到模型 {modelName}，请联系管理员检查配置。").ConfigureAwait(false);
+                await NotifyAsync($"[AiChat] 未找到模型 {modelName}，请联系管理员检查配置。").ConfigureAwait(false);
                 return;
             }
 
@@ -1318,7 +1325,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 {
                     ct.ThrowIfCancellationRequested();
                     if (!pending.TryBeginReply()) throw new OperationCanceledException(ct);
-                    await ReplyAsync(message, isGroup, "响应失败了哦，原因：请求超时，重试后仍未收到响应。").ConfigureAwait(false);
+                    await NotifyAsync("响应失败了哦，原因：请求超时，重试后仍未收到响应。").ConfigureAwait(false);
                     return;
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
@@ -1326,7 +1333,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     ct.ThrowIfCancellationRequested();
                     if (!pending.TryBeginReply()) throw new OperationCanceledException(ct);
                     BotLog.Warning($"[AiChat] 上游调用失败: {ex.Message}");
-                    await ReplyAsync(message, isGroup, $"响应失败了哦，原因：{ex.Message}").ConfigureAwait(false);
+                    await NotifyAsync($"响应失败了哦，原因：{ex.Message}").ConfigureAwait(false);
                     return;
                 }
 
@@ -1344,7 +1351,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     catch (Exception ex)
                     {
                         BotLog.Warning($"[AiChat] 保存定时任务失败: {ex.Message}");
-                        await ReplyAsync(message, isGroup, $"响应失败了哦，原因：保存定时任务失败，{ex.Message}").ConfigureAwait(false);
+                        await NotifyAsync($"响应失败了哦，原因：保存定时任务失败，{ex.Message}").ConfigureAwait(false);
                         return;
                     }
                 }

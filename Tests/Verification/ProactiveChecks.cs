@@ -1,7 +1,9 @@
 using System.Reflection;
 using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.Proactive;
+using ShiroBot.AiChatPlugin.UserState;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
@@ -206,5 +208,34 @@ internal static class ProactiveChecks
             "Recalling a message that is being judged must cancel the judgment.");
         state.GetType().GetField("Judging")!.SetValue(state, null);
         Console.WriteLine("PASS: recalled messages are dropped from proactive context, batches and running judgments");
+
+        // 主动插话出错时不往群里发错误提示。
+        var sends = new List<string>();
+        ((TestProxy)(object)msg).Call = (m, _) =>
+        {
+            sends.Add(m.Name);
+            throw new InvalidOperationException("must not send");
+        };
+        ((TestProxy)(object)ctx).Call = (m, _) => m.Name switch
+        {
+            "get_Message" => msg,
+            "get_InstanceId" => "i",
+            _ => throw new NotSupportedException(m.Name)
+        };
+        var noModels = new PluginConfig();
+        noModels.Default.Model = "missing";
+        noModels.Models = [new ModelEntry { Name = "other" }];
+        typeof(AiChatPlugin).GetField("_config", flags)!.SetValue(plugin, noModels);
+        var stateRoot = Path.Combine(Path.GetTempPath(), "aichat-proactive-" + Guid.NewGuid().ToString("N"));
+        typeof(AiChatPlugin).GetField("_userSettings", flags)!.SetValue(plugin, new UserSettingsStore(stateRoot));
+        typeof(AiChatPlugin).GetField("_conversations", flags)!.SetValue(plugin, new ConversationStore(stateRoot, false, 4));
+        var process = typeof(AiChatPlugin).GetMethod("ProcessAiAsync", flags)!;
+        var resolveKey = typeof(AiChatPlugin).GetMethod("ResolveConversationKey", flags)!;
+        var failing = Msg("p3", "alice", 8, new TextSegment("在吗"));
+        var convoKey = resolveKey.Invoke(plugin, [Enum.Parse(resolveKey.GetParameters()[0].ParameterType, "Group"), "g1", "alice"]);
+        await (Task)process.Invoke(plugin, [failing, convoKey, null, true, false, new ProactiveRequest("i:g1", "ctx")])!;
+        Directory.Delete(stateRoot, true);
+        Check(sends.Count == 0, "Proactive failures must stay silent: " + string.Join(", ", sends));
+        Console.WriteLine("PASS: proactive failures are logged without replying in the group");
     }
 }
