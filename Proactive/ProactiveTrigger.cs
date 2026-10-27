@@ -5,7 +5,7 @@ namespace ShiroBot.AiChatPlugin.Proactive;
 
 /// <summary>
 /// 群聊主动回复：缓存各群最近的消息，决定什么时候交给模型判断；说不说由模型决定（输出 [skip] 表示沉默）。
-/// 被提到（命中称呼）时冷却短；主动插话要求冷却足够长、期间群里有足够多的新消息。
+/// 被提到（命中称呼）时和被 @ 一样没有冷却，连续消息由调用方的安静窗口合并；主动插话要求冷却足够长、期间群里有足够多的新消息。
 /// 内存中的最近消息用于计数，以及适配器不支持历史消息接口时的上下文兜底；重启后清空。
 /// </summary>
 internal sealed class ProactiveTrigger
@@ -120,11 +120,12 @@ internal sealed class ProactiveTrigger
                 // 刚启动时也要先攒够消息，避免第一条消息就带着几乎空白的上下文插话。
                 if (state.MessagesSince < Math.Clamp(config.MinMessagesBetween, 0, 1000)) return default;
             }
-            var cooldown = TimeSpan.FromSeconds(Math.Clamp(mentioned ? config.KeywordCooldownSeconds : config.CooldownSeconds, 0, 86400));
+            var cooldown = mentioned ? TimeSpan.Zero : TimeSpan.FromSeconds(Math.Clamp(config.CooldownSeconds, 0, 86400));
             var since = state.LastSpoke is { } last ? now - last : TimeSpan.MaxValue;
             if (since < cooldown) return new ProactiveDecision(null, cooldown - since);
+            var previous = (state.LastSpoke, state.MessagesSince);
             Spoke(state, now);
-            return new ProactiveDecision(mentioned ? KeywordPrompt : InterjectPrompt(config), null);
+            return new ProactiveDecision(mentioned ? KeywordPrompt : InterjectPrompt(config), null, previous.LastSpoke, previous.MessagesSince);
         }
     }
 
@@ -136,6 +137,17 @@ internal sealed class ProactiveTrigger
             if (count <= 0 || !_groups.TryGetValue(groupKey, out var state)) return "";
             var end = Math.Max(0, state.Recent.Count - excludeLatest);
             return Format(state.Recent.Take(end).Skip(Math.Max(0, end - count)));
+        }
+    }
+
+    /// <summary>判断在回复发出前被取消（被打断或撤回）：恢复触发前的冷却和消息计数，不算一次发言。</summary>
+    public void Restore(string groupKey, ProactiveDecision decision)
+    {
+        lock (_groups)
+        {
+            var state = GetState(groupKey);
+            state.LastSpoke = decision.PreviousSpoke;
+            state.MessagesSince += decision.PreviousCount;
         }
     }
 
@@ -204,7 +216,9 @@ internal sealed class ProactiveTrigger
 }
 
 /// <summary>主动回复判断结果：Prompt 不为空表示交给模型；只因冷却未到时 RetryAfter 为还需等待的时间。</summary>
-internal readonly record struct ProactiveDecision(string? Prompt, TimeSpan? RetryAfter);
+/// <param name="PreviousSpoke">触发前的冷却状态，判断被取消时用 Restore 恢复。</param>
+internal readonly record struct ProactiveDecision(string? Prompt, TimeSpan? RetryAfter,
+    DateTimeOffset? PreviousSpoke = null, int PreviousCount = 0);
 
 /// <summary>一次主动回复请求：所在群和附加在本次请求中的群聊上下文与提示。</summary>
 /// <param name="Abort">依据的消息被撤回时触发，回复发出前取消这次请求。</param>

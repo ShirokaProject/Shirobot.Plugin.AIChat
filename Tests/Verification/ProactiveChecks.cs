@@ -18,7 +18,7 @@ internal static class ProactiveChecks
     public static void Run()
     {
         var config = new ProactiveSection { Enabled = true, Groups = ["g1"], Keywords = ["露露", "喵"], CooldownSeconds = 600,
-            MinMessagesBetween = 3, KeywordCooldownSeconds = 60, ContextMessages = 3 };
+            MinMessagesBetween = 3, ContextMessages = 3 };
         Check(!ProactiveTrigger.IsAllowedGroup(new ProactiveSection { Groups = ["g1"] }, "g1"), "Proactive replies must be off by default.");
         Check(!ProactiveTrigger.IsAllowedGroup(new ProactiveSection { Enabled = true }, "g1"), "An empty whitelist must not allow any group.");
         Check(ProactiveTrigger.IsAllowedGroup(config, "g1") && !ProactiveTrigger.IsAllowedGroup(config, "g2"), "Only whitelisted groups are allowed.");
@@ -46,12 +46,13 @@ internal static class ProactiveChecks
         Check(trigger.TryTrigger("g1", "随便聊聊", config, now.AddSeconds(300)) is null, "Interjections must respect their long cooldown.");
         Check(trigger.TryTrigger("g1", "随便聊聊", config, now.AddSeconds(700)) == ProactiveTrigger.MediumPrompt, "Interjections resume after cooldown and enough messages.");
 
-        // 被提到：冷却 60 秒，不需要新消息数；机器人名称也算称呼。
-        Check(trigger.TryTrigger("g1", "露露在吗", config, now.AddSeconds(730)) is null, "Mentions must respect their short cooldown.");
-        Check(trigger.TryTrigger("g1", "露露在吗", config, now.AddSeconds(761)) == ProactiveTrigger.KeywordPrompt, "Mentions are judged after the short cooldown.");
-        Check(trigger.TryTrigger("g1", "小白你说呢", config, now.AddSeconds(830), ["小白"]) == ProactiveTrigger.KeywordPrompt, "The bot name must count as a mention.");
+        // 被提到：和 @ 一样没有冷却，也不需要新消息数；机器人名称也算称呼。
+        Check(trigger.TryTrigger("g1", "露露在吗", config, now.AddSeconds(701)) == ProactiveTrigger.KeywordPrompt, "Mentions must not wait for a cooldown.");
+        Check(trigger.TryTrigger("g1", "小白你说呢", config, now.AddSeconds(702), ["小白"]) == ProactiveTrigger.KeywordPrompt, "The bot name must count as a mention.");
         trigger.MarkReplied("g1", now.AddHours(2));
-        Check(trigger.TryTrigger("g1", "露露", config, now.AddHours(2).AddSeconds(10)) is null, "A normal @ reply must start the cooldown.");
+        Check(trigger.TryTrigger("g1", "露露", config, now.AddHours(2).AddSeconds(10)) is not null, "A mention right after a reply must still be judged.");
+        for (var i = 0; i < 3; i++) trigger.Record("g1", "X", "又一条" + i, config.ContextMessages, at);
+        Check(trigger.TryTrigger("g1", "随便聊聊", config, now.AddHours(2).AddSeconds(20)) is null, "Replies must still start the interjection cooldown.");
         Check(trigger.TryTrigger("g2", "露露", config, now.AddHours(2).AddSeconds(10)) is not null, "Cooldowns are per group.");
         Check(trigger.TryTrigger("g2", "随便聊聊", config, now.AddHours(3)) is null, "A fresh group needs enough messages before interjecting.");
         var mentionsOnly = new ProactiveSection { Enabled = true, Groups = ["g3"], Keywords = ["露露"], Interject = false, MinMessagesBetween = 0 };
@@ -59,7 +60,7 @@ internal static class ProactiveChecks
             "With interjection off only mentions are judged.");
         // 冷却未到时给出补判等待时间；其他原因不触发时不补判。回复结束时冷却重新计时，但消息计数不清零。
         var deferral = new ProactiveTrigger();
-        var cfg = new ProactiveSection { Enabled = true, CooldownSeconds = 10, MinMessagesBetween = 1, KeywordCooldownSeconds = 60 };
+        var cfg = new ProactiveSection { Enabled = true, CooldownSeconds = 10, MinMessagesBetween = 1 };
         deferral.Record("g", "A", "先说一句", 20, now);
         Check(deferral.Evaluate("g", "先说一句", cfg, now).Prompt is not null, "The first eligible message must trigger.");
         deferral.Record("g", "B", "紧跟着一句", 20, now.AddSeconds(3));
@@ -237,5 +238,34 @@ internal static class ProactiveChecks
         Directory.Delete(stateRoot, true);
         Check(sends.Count == 0, "Proactive failures must stay silent: " + string.Join(", ", sends));
         Console.WriteLine("PASS: proactive failures are logged without replying in the group");
+
+        // 判断期间同一个人继续发消息：打断这次判断，和新消息一起重新判断；别人发的不打断。
+        var first = Msg("q1", "alice", 9, new TextSegment("看这个"));
+        schedule.Invoke(plugin, ["i:g2", first, false]);
+        var g2 = pendingMap["i:g2"]!;
+        T Get<T>(string name) => (T)g2.GetType().GetField(name)!.GetValue(g2)!;
+        using var judgingAbort = new CancellationTokenSource();
+        lock (typeof(AiChatPlugin).GetField("_backgroundGate", flags)!.GetValue(plugin)!)
+        {
+            Get<List<MessageEvent>>("Batch").Clear();
+            g2.GetType().GetField("Judging")!.SetValue(g2, new[] { first });
+            g2.GetType().GetField("JudgingAbort")!.SetValue(g2, judgingAbort);
+        }
+        schedule.Invoke(plugin, ["i:g2", Msg("q2", "bob", 9, new TextSegment("别人说的")), false]);
+        Check(!judgingAbort.IsCancellationRequested && !Get<bool>("Interrupted"), "Other people's messages must not interrupt a judgment.");
+        schedule.Invoke(plugin, ["i:g2", Msg("q3", "alice", 9, new TextSegment("现在这样好像省额度")), false]);
+        Check(judgingAbort.IsCancellationRequested && Get<bool>("Interrupted") && Get<List<MessageEvent>>("Batch").Select(m => m.MessageId).SequenceEqual(["q2", "q3"]),
+            "A follow-up from the same sender must interrupt the running judgment and queue behind it.");
+        g2.GetType().GetField("Judging")!.SetValue(g2, null);
+
+        // 被取消的判断不算发言：冷却和消息计数恢复到触发前。
+        var restore = new ProactiveTrigger();
+        var rcfg = new ProactiveSection { Enabled = true, CooldownSeconds = 600, MinMessagesBetween = 1 };
+        restore.Record("r", "A", "一", 20, t0);
+        var fired = restore.Evaluate("r", mentioned: false, rcfg, t0);
+        Check(fired.Prompt is not null && restore.Evaluate("r", mentioned: false, rcfg, t0.AddSeconds(5)).Prompt is null, "A fired judgment starts the cooldown.");
+        restore.Restore("r", fired);
+        Check(restore.Evaluate("r", mentioned: false, rcfg, t0.AddSeconds(6)).Prompt is not null, "A cancelled judgment must not start the cooldown or consume messages.");
+        Console.WriteLine("PASS: same-sender follow-ups interrupt a running judgment and cancelled judgments keep the cooldown");
     }
 }

@@ -124,7 +124,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         httpReq.Content = new StreamingChatContent(model.Name, messages, stream: onContent is not null,
-            maxCompletionTokens: defaults.MaxOutputTokens);
+            maxCompletionTokens: defaults.OutputTokenLimit());
 
         var imageCount = messages.Sum(m => m.Segments.Count(s => s.Kind == SegmentKind.Image));
         BotLog.Info($"[AiChat] 流式请求 {model.Name}: messages={messages.Count}, image 段={imageCount}");

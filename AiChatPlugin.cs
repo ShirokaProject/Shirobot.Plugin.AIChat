@@ -18,7 +18,7 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.1")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.2")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -29,7 +29,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.4.1",
+    Version = "1.4.2",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -62,6 +62,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         public CancellationTokenSource? JudgingAbort;
         /// <summary>判断期间被撤回的消息 ID。</summary>
         public readonly HashSet<string> RecalledWhileJudging = [];
+        /// <summary>判断期间同一个人又发了消息：取消这次判断，和新消息一起重新判断。</summary>
+        public bool Interrupted;
     }
     private readonly record struct ProactiveOutcome(TimeSpan? RetryAfter, bool ReplyStarted);
     private const int MaxProactiveBatch = 30;
@@ -186,7 +188,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         # 默认 system prompt。保持稳定以提高上游前缀缓存命中率；动态时间和会话信息会附在每条用户消息末尾。
         default_prompt = "你是一个乐于助人的助手。"
         # shared 模式额外追加的稳定 system prompt；留空则不追加。
-        shared_prompt_suffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明。"
+        shared_prompt_suffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代。闲聊时像群聊成员一样自然、简短地回复；有人认真提问、需要详细说明时可以完整回答。"
         # 请求超时（秒）
         timeout_seconds = 60
         # 超时或临时网络失败时的总尝试次数（含首次请求）
@@ -195,8 +197,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         retry_on_timeout_delay_ms = 1000
         # 全局最大并发请求数
         max_concurrency = 4
-        # 每次模型请求的最大输出 token 数（含工具调用轮次）
-        max_output_tokens = 8192
+        # 每次模型请求的最大输出 token 数（含工具调用轮次）；0 表示不限制
+        max_output_tokens = 0
         # 默认对话模式: single(单次) / multi(用户独立多轮) / shared(群聊共享)
         default_chat_mode = "shared"
 
@@ -205,26 +207,32 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         template = ""
 
         [history]
-        # 单会话保留的最大轮次（user+assistant 各算一轮）
-        max_turns = 20
-        # 单次请求的估算 token 上限：超出时本次请求跳过最早的历史；历史超过 75% 时并入长期记忆
-        max_tokens = 16000
+        # 单会话保留的最大轮次（user+assistant 算一轮）；0 表示不按轮数限制，只按 max_tokens 压缩
+        max_turns = 0
+        # 单次请求的估算 token 上限：超出时本次请求跳过最早的历史；历史超过 75% 时并入历史摘要
+        max_tokens = 128000
         # 是否落盘到 JSONL
         persist = true
         # 后续请求中重新发送图片的最近用户轮次数；0 表示只保留文字摘要
         image_memory_turns = 1
         # 群聊被 @ 或 #ai 时附带最近多少条群消息（优先用适配器历史消息接口；仅本次请求，不写入历史）；0 表示不附带
         group_context_messages = 0
-        # 合并长期记忆使用的模型；留空使用当前对话的模型
+        # 生成历史摘要使用的模型；留空使用当前对话的模型
         compact_model = ""
-        # 合并长期记忆使用的 system prompt；留空使用内置默认值
-        compact_prompt = "你负责维护聊天机器人在这个会话中的长期记忆。把【已有长期记忆】和【新增对话】合并成更新后的完整记忆，只输出记忆本身，不要回复对话。\n按以下分类用简短条目记录，没有内容的分类省略：\n人物：每个人的称呼和 ID、身份、偏好、提到的个人信息\n事实与约定：已确认的事实、做出的决定、对机器人的要求或设定\n进行中：未完成的话题、待办、答应过的事\n近期话题：最近聊过的主要内容，每项一句话\n保留名字、数字、时间等具体细节，删除寒暄和已经过时的内容。总长度控制在 800 字以内。"
+        # 生成历史摘要使用的 system prompt；留空使用内置默认值
+        compact_prompt = "你负责维护聊天机器人在这个会话中的历史摘要。把【已有历史摘要】和【新增对话】合并成更新后的完整摘要，只输出摘要本身，不要回复对话。\n按以下分类用简短条目记录，没有内容的分类省略：\n人物：每个人的称呼和 ID、身份、偏好、提到的个人信息\n事实与约定：已确认的事实、做出的决定、对机器人的要求或设定\n进行中：未完成的话题、待办、答应过的事\n近期话题：最近聊过的主要内容，每项一句话\n保留名字、数字、时间等具体细节，删除寒暄和已经过时的内容。总长度控制在 800 字以内。"
 
         [resources]
         # 单张图片最大字节
         max_image_bytes = 8388608
         # 读取文本类文件的最大字节
         max_inline_text_bytes = 524288
+        # 单个文件写入提示词的最大字符数，超出截断
+        max_file_excerpt_chars = 16000
+        # 作为文本读取的文件扩展名（不含点）；不写使用内置列表（txt、md、json、代码文件等），例如：
+        # inline_text_extensions = ["txt", "md", "json", "py"]
+        # 递归展开引用消息和合并转发的最大层数
+        recursive_depth = 3
         # 资源缓存目录（相对插件目录）
         cache_dir = "data/resource_cache"
         # 缓存保留天数；小于等于 0 表示不按时间清理
@@ -342,6 +350,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         # command = "/opt/homebrew/bin/npx"
         # args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/Documents"]
         # env = []                     # 每项 "KEY=VALUE"
+        # working_directory = ""       # 进程工作目录；留空使用宿主的工作目录
         # allowed_tools = ["read_text_file", "list_directory"]   # 留空提供全部，建议只放只读工具
         #
         # Streamable HTTP：
@@ -368,8 +377,6 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         keywords = []
         # 机器人当前的群昵称/名称也算称呼
         include_bot_name = true
-        # 被提到时距机器人上次回复结束的冷却（秒）
-        keyword_cooldown_seconds = 60
         # 没被提到时也让模型判断要不要插话；false 表示只在被提到时判断
         interject = true
         # 主动插话距机器人上次回复结束的最小间隔（秒）；冷却期间的消息会在冷却结束后补判（最多等 2 分钟）
@@ -378,7 +385,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         min_messages_between = 1
         # 交给模型参考的群聊最近消息条数（优先用适配器历史消息接口）
         context_messages = 20
-        # 安静窗口：来消息后随机等 quiet_min_seconds~quiet_max_seconds 秒，期间有新消息就重新计时，安静下来只判断最新一条
+        # 安静窗口：来消息后随机等 quiet_min_seconds~quiet_max_seconds 秒，期间有新消息就重新计时，安静下来把这段时间的新消息一起判断一次
         quiet_min_seconds = 3
         quiet_max_seconds = 10
         # 没被提到时插话的积极程度：low（只在有人找它时）/ medium（被问到、求助、有价值或很好笑时）/ high（除非完全无关都接）
@@ -426,14 +433,21 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         """;
 
 
+    /// <summary>旧版本的默认提示词升级成当前默认值；用户自定义的提示词保持不变。</summary>
+    internal static void UpgradeLegacyDefaults(PluginConfig config)
+    {
+        // 旧默认配置升级后也由 Markdown 开关统一控制格式。
+        if (config.Default.SharedPromptSuffix is DefaultSection.LegacySharedPromptSuffix or DefaultSection.ShortOnlySharedPromptSuffix)
+            config.Default.SharedPromptSuffix = DefaultSection.DefaultSharedPromptSuffix;
+        if (config.History.CompactPrompt is HistorySection.LegacyCompactPrompt or HistorySection.PreviousCompactPrompt
+            or HistorySection.LongTermMemoryCompactPrompt)
+            config.History.CompactPrompt = HistorySection.DefaultCompactPrompt;
+    }
+
     private void ApplyConfigDerivatives(bool initial)
     {
         var pluginRoot = PluginRoot;
-        // 旧默认配置升级后也由 Markdown 开关统一控制格式；保留用户自定义提示词。
-        if (_config.Default.SharedPromptSuffix == DefaultSection.LegacySharedPromptSuffix)
-            _config.Default.SharedPromptSuffix = DefaultSection.DefaultSharedPromptSuffix;
-        if (_config.History.CompactPrompt is HistorySection.LegacyCompactPrompt or HistorySection.PreviousCompactPrompt)
-            _config.History.CompactPrompt = HistorySection.DefaultCompactPrompt;
+        UpgradeLegacyDefaults(_config);
 
         // 仅在首次加载时构造长期持有状态的服务，避免热重载冲掉内存里的会话/限流。
         if (initial)
@@ -486,7 +500,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     private async Task<int> FetchAndMergeProviderModelsAsync()
     {
         var totalAdded = 0;
-        foreach (var provider in _config.Providers.Where(p => p.FetchModels))
+        // 没填 api_key 的 provider（例如默认模板里的示例）不拉取，避免每次启动都报失败。
+        foreach (var provider in _config.Providers.Where(p => p.FetchModels && !string.IsNullOrWhiteSpace(p.ApiKey)))
         {
             try
             {
@@ -739,7 +754,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     }
 
     /// <summary>
-    /// 安静窗口：每来一条消息就把这个群的判断时间推迟一个随机窗口，群里安静下来后只用最新一条判断一次。
+    /// 安静窗口：每来一条消息就把这个群的判断时间推迟一个随机窗口，群里安静下来后把这批新消息一起判断一次。
     /// 冷却未到时也在这里等，到时再判断最新的消息。
     /// </summary>
     private void ScheduleProactive(string groupKey, MessageEvent message, bool mentioned)
@@ -752,6 +767,13 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             {
                 AddToBatch(pending, message, mentioned);
                 pending.Due = due;
+                // 正在判断的消息的发送者还在继续说：打断这次请求，等他说完后连同新消息一起判断。
+                if (pending.Judging is { } judging && !pending.Interrupted && judging.Any(m => m.Sender.Id == message.Sender.Id))
+                {
+                    pending.Interrupted = true;
+                    pending.JudgingAbort?.Cancel();
+                    BotLog.Info($"[AiChat] 群 {message.Channel.Id} 主动回复判断被 {message.Sender.Id} 的新消息打断，稍后一起判断。");
+                }
                 return;
             }
             pending = new PendingProactive(due);
@@ -844,6 +866,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                         pending.Judging = batch;
                         pending.JudgingAbort = abort;
                         pending.RecalledWhileJudging.Clear();
+                        pending.Interrupted = false;
                     }
                 }
                 if (wait > TimeSpan.Zero)
@@ -876,12 +899,18 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     var recalled = pending.RecalledWhileJudging.ToHashSet();
                     pending.RecalledWhileJudging.Clear();
                     var remaining = batch.Where(m => !recalled.Contains(m.MessageId)).ToArray();
-                    if (recalled.Count > 0 && !outcome.ReplyStarted)
+                    var interrupted = pending.Interrupted;
+                    pending.Interrupted = false;
+                    if ((recalled.Count > 0 || interrupted) && !outcome.ReplyStarted)
                     {
-                        // 判断期间有消息被撤回、回复还没发出：去掉撤回的消息，剩下的重新等安静窗口再判断。
+                        // 判断期间有消息被撤回或被同一个人的新消息打断、回复还没发出：去掉撤回的消息，
+                        // 剩下的放回去，等安静窗口后和新消息一起判断（打断时新消息已经设好了安静窗口）。
                         Requeue(pending, remaining, mentions);
-                        var again = DateTimeOffset.UtcNow + QuietWindow(_config.Proactive);
-                        if (pending.Due < again) pending.Due = again;
+                        if (!interrupted)
+                        {
+                            var again = DateTimeOffset.UtcNow + QuietWindow(_config.Proactive);
+                            if (pending.Due < again) pending.Due = again;
+                        }
                         continue;
                     }
                     var latest = batch[^1];
@@ -933,8 +962,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         }
         finally
         {
-            // 冷却从这次判断结束算起。
-            _proactive.MarkReplied(groupKey, DateTimeOffset.UtcNow);
+            // 回复发出前被取消不算发言，恢复冷却；否则冷却从这次判断结束算起。
+            if (abort.IsCancellationRequested && request?.ReplyStarted != true) _proactive.Restore(groupKey, decision);
+            else _proactive.MarkReplied(groupKey, DateTimeOffset.UtcNow);
         }
         return new(null, request?.ReplyStarted == true);
     }
@@ -1038,9 +1068,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                             new() { Role = "user", Content = request }
                         };
                         return useTools
-                            ? _tools.ChatAsync(_openAi, requestModel, messages, _config.ToolUse.MaxRounds, ct: ct, readOnlyOnly: true, maxOutputTokens: _config.Default.MaxOutputTokens)
+                            ? _tools.ChatAsync(_openAi, requestModel, messages, _config.ToolUse.MaxRounds, ct: ct, readOnlyOnly: true, maxOutputTokens: _config.Default.OutputTokenLimit())
                             : _openAi.ChatAsync(_config.Default, requestModel,
-                                new OpenAiChatRequest { Model = requestModel.Name, Messages = messages, MaxCompletionTokens = _config.Default.MaxOutputTokens }, ct);
+                                new OpenAiChatRequest { Model = requestModel.Name, Messages = messages, MaxCompletionTokens = _config.Default.OutputTokenLimit() }, ct);
                     }, ct: ct).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
@@ -1248,9 +1278,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 if (mcpTools.Count > 0) systemPrompt += "\n" + McpChatTool.Prompt;
                 if (replyModes) systemPrompt += "\n" + (forceChat ? ParsedReply.ChatOnlyPrompt : ParsedReply.SystemPrompt);
                 systemPrompt = OfficialReplyDelivery.ApplyPromptPolicy(systemPrompt, _config.Behaviour.UseMarkdown);
-                // 长期记忆放在末尾，前面稳定的部分仍可命中上游前缀缓存。
+                // 历史摘要放在末尾，前面稳定的部分仍可命中上游前缀缓存。
                 if (!string.IsNullOrWhiteSpace(convo?.Summary))
-                    systemPrompt += "\n\n[长期记忆：更早对话的整理摘要，可能不完整；与最近对话冲突时以最近对话为准]\n" + convo.Summary;
+                    systemPrompt += "\n\n[历史摘要：更早对话的整理摘要，可能不完整；与最近对话冲突时以最近对话为准]\n" + convo.Summary;
                 if (memoryTool is not null)
                 {
                     try
@@ -1285,7 +1315,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     var requestHistory = (convo?.Turns ?? []).ToList();
                     TrimHistoryToTokenBudget(systemPrompt, requestHistory, requestUserTurn);
                     BotLog.Info($"[AiChat] 请求 {GetModelDisplayId(model)}: 历史 {requestHistory.Count}/{convo?.Turns.Count ?? 0} turns, " +
-                        $"长期记忆 {convo?.Summary?.Length ?? 0} 字, 估算 {EstimateRequestTokens(systemPrompt, requestHistory, requestUserTurn)} tokens");
+                        $"历史摘要 {convo?.Summary?.Length ?? 0} 字, 估算 {EstimateRequestTokens(systemPrompt, requestHistory, requestUserTurn)} tokens");
                     if (hasImageInCurrent && !_tools.HasTools && contextualTools is null)
                     {
                         assistantText = await ExecuteWithRetryAsync(() =>
@@ -1305,11 +1335,11 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                                     requestModel.SupportsVision);
                                 if (_tools.HasTools || contextualTools is not null)
                                     return _tools.ChatAsync(_openAi, requestModel, messages, _config.ToolUse.MaxRounds, onContent, ct,
-                                        contextualTools, maxOutputTokens: _config.Default.MaxOutputTokens);
+                                        contextualTools, maxOutputTokens: _config.Default.OutputTokenLimit());
                                 var request = new OpenAiChatRequest
                                 {
                                     Model = requestModel.Name, Messages = messages, Stream = false,
-                                    MaxCompletionTokens = _config.Default.MaxOutputTokens
+                                    MaxCompletionTokens = _config.Default.OutputTokenLimit()
                                 };
                                 return onContent is null
                                     ? _openAi.ChatAsync(_config.Default, requestModel, request, ct)
@@ -1943,17 +1973,18 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
     /// <summary>
     /// Context compact：轮数达到 maxTurns 的 80% 或历史估算 token 超过上限的 75% 时，
-    /// 把较早的对话合并进会话的长期记忆，只保留最近的对话原文。
-    /// 长期记忆每次在旧记忆基础上增量更新，不会对摘要反复再摘要。
+    /// 把较早的对话合并进会话的历史摘要，只保留最近的对话原文。
+    /// 历史摘要每次在旧摘要基础上增量更新，不会对摘要反复再摘要。
     /// </summary>
     private bool NeedsCompaction(ConversationState convo) =>
-        convo.Turns.Count >= (int)(_config.History.MaxTurns * 2 * 0.8) ||
+        _config.History.MaxTurns > 0 && convo.Turns.Count >= (int)(_config.History.MaxTurns * 2 * 0.8) ||
         convo.Turns.Sum(EstimateTurnTokens) > Math.Max(1000, _config.History.MaxTokens) * 3 / 4;
 
     private async Task TryCompactConversationAsync(ConversationState convo, ModelEntry model)
     {
         if (!NeedsCompaction(convo)) return;
-        var maxItems = _config.History.MaxTurns * 2; // user+assistant 配对
+        // user+assistant 配对；不按轮数限制时只看 token 预算。
+        var maxItems = _config.History.MaxTurns > 0 ? _config.History.MaxTurns * 2 : int.MaxValue;
         var tokenBudget = Math.Max(1000, _config.History.MaxTokens);
 
         // 从最新往前保留不超过一半轮数、一半 token 预算的原文，至少保留最近一对。
@@ -1975,9 +2006,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             transcript.Append(turn.Role == "user" ? "用户: " : "机器人: ").AppendLine(TurnToTranscript(turn));
 
         var input = new StringBuilder();
-        input.AppendLine("【已有长期记忆】").AppendLine(string.IsNullOrWhiteSpace(convo.Summary) ? "（暂无）" : convo.Summary)
+        input.AppendLine("【已有历史摘要】").AppendLine(string.IsNullOrWhiteSpace(convo.Summary) ? "（暂无）" : convo.Summary)
             .AppendLine().AppendLine("【新增对话】").Append(transcript)
-            .AppendLine().Append("请输出合并后的完整长期记忆。");
+            .AppendLine().Append("请输出合并后的完整历史摘要。");
         var summaryMessages = new List<OpenAiMessage>
         {
             new()
@@ -2002,7 +2033,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 Model = model.Name,
                 Messages = summaryMessages,
                 Stream = false,
-                MaxCompletionTokens = Math.Min(_config.Default.MaxOutputTokens, 2048)
+                MaxCompletionTokens = _config.Default.OutputTokenLimit() is { } limit ? Math.Min(limit, 2048) : 2048
             };
 
             var summary = (await _openAi.ChatAsync(_config.Default, model, summaryRequest).ConfigureAwait(false)).Trim();
@@ -2012,7 +2043,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
             convo.Summary = summary;
             await _conversations.RewriteAsync(convo).ConfigureAwait(false);
 
-            BotLog.Info($"[AiChat] Context compact 完成: {compactCount} turns 并入长期记忆, 剩余 {convo.Turns.Count} turns, 记忆 {summary.Length} 字:\n{ForLog(summary)}");
+            BotLog.Info($"[AiChat] Context compact 完成: {compactCount} turns 并入历史摘要, 剩余 {convo.Turns.Count} turns, 摘要 {summary.Length} 字:\n{ForLog(summary)}");
         }
         catch (Exception ex)
         {

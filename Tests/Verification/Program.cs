@@ -130,6 +130,33 @@ toolsConfig.ToolUse.Tavily.Enabled = true;
 using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(!registry.HasTools && registry.SystemPrompt == "", "Disabled tools must not advertise capabilities.");
 Console.WriteLine("PASS: TOML template, nested Tavily config, removed legacy entry and tool disable");
 
+// 0 表示不限制：最大输出 token 不发送参数，历史轮数只按 token 预算压缩；模板字段与默认值一致。
+Check(config.Default.MaxOutputTokens == 0 && config.Default.OutputTokenLimit() is null && new DefaultSection { MaxOutputTokens = 4096 }.OutputTokenLimit() == 4096,
+    "Zero max output tokens must mean no limit.");
+Check(config.History.MaxTurns == 0 && config.History.MaxTokens == 128000 && config.Resources.RecursiveDepth == 3 && config.Resources.MaxFileExcerptChars == 16000
+    && config.Default.SharedPromptSuffix == DefaultSection.DefaultSharedPromptSuffix, "Template defaults must match the config class.");
+Check(!config.History.CompactPrompt.Contains("长期记忆") && DefaultSection.DefaultSharedPromptSuffix.Contains("完整回答"),
+    "History compaction must be called a history summary and group replies may answer in full.");
+{
+    var limits = new AiChatPlugin();
+    var limitConfig = new PluginConfig();
+    limitConfig.History.MaxTurns = 0;
+    limitConfig.History.MaxTokens = 100_000;
+    Set(limits, "_config", limitConfig);
+    var many = new ConversationState(new ConversationKey("i", ChatScene.Group, "g", "u"));
+    for (var i = 0; i < 200; i++) many.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart("嗯")], i));
+    Check(!(bool)Invoke(limits, "NeedsCompaction", many), "Unlimited turns must only compact by token budget.");
+    limitConfig.History.MaxTurns = 20;
+    Check((bool)Invoke(limits, "NeedsCompaction", many), "A turn limit must still trigger compaction.");
+    // 旧版本默认提示词升级成当前默认值，自定义内容保持不变。
+    limitConfig.History.CompactPrompt = HistorySection.LongTermMemoryCompactPrompt;
+    limitConfig.Default.SharedPromptSuffix = DefaultSection.ShortOnlySharedPromptSuffix;
+    AiChatPlugin.UpgradeLegacyDefaults(limitConfig);
+    Check(limitConfig.History.CompactPrompt == HistorySection.DefaultCompactPrompt && limitConfig.Default.SharedPromptSuffix == DefaultSection.DefaultSharedPromptSuffix,
+        "Previous default prompts must upgrade to the current defaults.");
+}
+Console.WriteLine("PASS: unlimited output tokens and history turns, template defaults and prompt upgrades");
+
 var plugin = new AiChatPlugin();
 var primary = Model("primary");
 var backup = Model("backup");

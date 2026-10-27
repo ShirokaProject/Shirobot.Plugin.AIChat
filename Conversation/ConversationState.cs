@@ -8,7 +8,7 @@ internal sealed class ConversationState
     public ConversationKey Key { get; }
     public List<ChatTurn> Turns { get; } = [];
 
-    /// <summary>早期对话合并成的长期记忆，随会话历史一起保存和清空。</summary>
+    /// <summary>早期对话合并成的历史摘要，随会话历史一起保存和清空。</summary>
     public string? Summary { get; set; }
 
     /// <summary>共享会话的公共 system prompt（仅 shared 模式使用）。null 表示用默认。</summary>

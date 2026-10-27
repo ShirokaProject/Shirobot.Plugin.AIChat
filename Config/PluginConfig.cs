@@ -33,7 +33,9 @@ public sealed class PluginConfig
 
 public sealed class DefaultSection
 {
-    public const string DefaultSharedPromptSuffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明。";
+    public const string DefaultSharedPromptSuffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代。闲聊时像群聊成员一样自然、简短地回复；有人认真提问、需要详细说明时可以完整回答。";
+    /// <summary>1.4.1 及之前的默认值：一律要求简短，会压住需要详细解答的问题。</summary>
+    public const string ShortOnlySharedPromptSuffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明。";
     public const string LegacySharedPromptSuffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。";
     [ConfigField("填写已注册模型名或 provider-model。", Label = "默认模型")]
     public string Model { get; set; } = "gpt-4o-mini";
@@ -59,8 +61,11 @@ public sealed class DefaultSection
     public int MaxConcurrency { get; set; } = 4;
 
     /// <summary>单次模型请求允许生成的最大输出 token 数。</summary>
-    [ConfigField("每次模型请求的最大输出 token 数，适用于普通回复和工具调用轮次。", Label = "最大输出 Token", Min = 1)]
-    public int MaxOutputTokens { get; set; } = 8192;
+    [ConfigField("每次模型请求的最大输出 token 数，适用于普通回复和工具调用轮次；0 表示不限制（不向上游发送该参数，由模型自身上限决定）。", Label = "最大输出 Token", Min = 0)]
+    public int MaxOutputTokens { get; set; }
+
+    /// <summary>请求中的 max_completion_tokens；0 或负数时不发送。</summary>
+    public int? OutputTokenLimit() => MaxOutputTokens > 0 ? MaxOutputTokens : null;
 
     /// <summary>默认对话模式：single / multi / shared。</summary>
     [ConfigField("single：单次；multi：用户独立多轮；shared：群聊共享。", Label = "默认对话模式", Options = new[] { "single", "multi", "shared" })]
@@ -70,7 +75,7 @@ public sealed class DefaultSection
 public sealed class HistorySection
 {
     public const string DefaultCompactPrompt =
-        "你负责维护聊天机器人在这个会话中的长期记忆。把【已有长期记忆】和【新增对话】合并成更新后的完整记忆，只输出记忆本身，不要回复对话。\n" +
+        "你负责维护聊天机器人在这个会话中的历史摘要。把【已有历史摘要】和【新增对话】合并成更新后的完整摘要，只输出摘要本身，不要回复对话。\n" +
         "按以下分类用简短条目记录，没有内容的分类省略：\n" +
         "人物：每个人的称呼和 ID、身份、偏好、提到的个人信息\n" +
         "事实与约定：已确认的事实、做出的决定、对机器人的要求或设定\n" +
@@ -80,23 +85,32 @@ public sealed class HistorySection
     /// <summary>旧版本的默认值，加载时升级为新的结构化记忆提示词。</summary>
     public const string PreviousCompactPrompt = "请用简洁的中文总结以下对话的关键信息和结论，保留重要的事实、决定和上下文。";
     public const string LegacyCompactPrompt = PreviousCompactPrompt + "不要使用Markdown格式。";
+    /// <summary>1.4.1 及之前的默认提示词（称为“长期记忆”），升级时换成当前默认值。</summary>
+    public const string LongTermMemoryCompactPrompt =
+        "你负责维护聊天机器人在这个会话中的长期记忆。把【已有长期记忆】和【新增对话】合并成更新后的完整记忆，只输出记忆本身，不要回复对话。\n" +
+        "按以下分类用简短条目记录，没有内容的分类省略：\n" +
+        "人物：每个人的称呼和 ID、身份、偏好、提到的个人信息\n" +
+        "事实与约定：已确认的事实、做出的决定、对机器人的要求或设定\n" +
+        "进行中：未完成的话题、待办、答应过的事\n" +
+        "近期话题：最近聊过的主要内容，每项一句话\n" +
+        "保留名字、数字、时间等具体细节，删除寒暄和已经过时的内容。总长度控制在 800 字以内。";
 
     /// <summary>压缩历史时的 system prompt；留空使用默认提示词。</summary>
     [ConfigField("compact 摘要请求的 system prompt；留空使用内置提示词。", Label = "上下文压缩提示词", Type = "text")]
     public string CompactPrompt { get; set; } = DefaultCompactPrompt;
-    [ConfigField("合并长期记忆使用的模型名称，可填更便宜的模型；留空使用当前对话的模型。", Label = "上下文压缩模型")]
+    [ConfigField("生成历史摘要使用的模型名称，可填更便宜的模型；留空使用当前对话的模型。", Label = "上下文压缩模型")]
     public string CompactModel { get; set; } = "";
     /// <summary>
     /// 单会话保留的最大轮次（user+assistant 各算一轮）。
     /// </summary>
-    [ConfigField("保留的对话轮数，每轮包含用户消息和 AI 回复；接近上限时自动压缩。", Label = "最大历史轮数", Min = 2)]
-    public int MaxTurns { get; set; } = 20;
+    [ConfigField("保留的对话轮数，每轮包含用户消息和 AI 回复；接近上限时自动压缩成历史摘要。0 表示不按轮数限制，只按“上下文 Token 软上限”压缩。", Label = "最大历史轮数", Min = 0)]
+    public int MaxTurns { get; set; }
 
     /// <summary>
     /// 单次请求的软上限 token，超出则按最早 turn 裁剪。
     /// </summary>
-    [ConfigField("单次请求的估算 token 上限：超过时本次请求跳过最早的历史；历史超过其 75% 时自动并入长期记忆。", Label = "上下文 Token 软上限", Min = 1000)]
-    public int MaxTokens { get; set; } = 16000;
+    [ConfigField("单次请求的估算 token 上限：超过时本次请求跳过最早的历史；历史超过其 75% 时自动并入历史摘要。", Label = "上下文 Token 软上限", Min = 1000)]
+    public int MaxTokens { get; set; } = 128000;
 
     /// <summary>
     /// 是否落盘到 JSONL。
@@ -221,17 +235,15 @@ public sealed class ProactiveSection
     public string[] Keywords { get; set; } = [];
     [ConfigField("把机器人当前的群昵称/名称也当作称呼关键词。", Label = "名称算作称呼")]
     public bool IncludeBotName { get; set; } = true;
-    [ConfigField("被提到时距机器人上次在本群回复结束（含被 @ 的回复和模型选择沉默）至少间隔的秒数；冷却期间的消息会在冷却结束后补判。", Label = "被提到时的冷却（秒）", Min = 0, Max = 86400)]
-    public int KeywordCooldownSeconds { get; set; } = 60;
     [ConfigField("没有提到机器人的普通消息也交给模型判断是否插话；关闭时只在被提到时判断。", Label = "允许主动插话")]
     public bool Interject { get; set; } = true;
-    [ConfigField("主动插话距机器人上次在本群回复结束（含被 @ 的回复和模型选择沉默）至少间隔的秒数；冷却期间进来的消息会在冷却结束后用最新一条补判，等待超过 2 分钟的不补判。", Label = "主动插话冷却（秒）", Min = 0, Max = 86400)]
+    [ConfigField("主动插话距机器人上次在本群回复结束（含被 @ 的回复和模型选择沉默）至少间隔的秒数；冷却期间进来的消息会在冷却结束后一起补判，等待超过 2 分钟的不补判。", Label = "主动插话冷却（秒）", Min = 0, Max = 86400)]
     public int CooldownSeconds { get; set; } = 10;
     [ConfigField("主动插话前，自上次判断以来群里至少要有这么多条其他消息，避免冷清时自说自话。", Label = "主动插话最少间隔消息数", Min = 0, Max = 1000)]
     public int MinMessagesBetween { get; set; } = 1;
     [ConfigField("交给模型参考的群聊最近消息条数，优先通过适配器的历史消息接口获取。", Label = "参考最近消息数", Min = 1, Max = 100)]
     public int ContextMessages { get; set; } = 20;
-    [ConfigField("群里来消息后先等一个随机的安静窗口（最短秒数），期间有新消息就重新计时，安静下来后只用最新一条判断一次，避免连续发消息时每条都请求模型。", Label = "安静窗口最短（秒）", Min = 0, Max = 120)]
+    [ConfigField("群里来消息后先等一个随机的安静窗口（最短秒数），期间有新消息就重新计时，安静下来后把这段时间的新消息一起判断一次，避免连续发消息时每条都请求模型。", Label = "安静窗口最短（秒）", Min = 0, Max = 120)]
     public int QuietMinSeconds { get; set; } = 3;
     [ConfigField("安静窗口的最长秒数，每次在最短和最长之间随机取值。", Label = "安静窗口最长（秒）", Min = 0, Max = 120)]
     public int QuietMaxSeconds { get; set; } = 10;
@@ -265,7 +277,7 @@ public sealed class ToolUseSection
     public HttpFetchSection HttpFetch { get; set; } = new();
     [ConfigField("预约消息，到点使用默认模型生成回复并 @ 用户。", Label = "定时消息工具")]
     public TimerToolSection TimerTool { get; set; } = new();
-    [ConfigField("让模型自主维护每个会话的长期记忆本，可选每日自动整理。", Label = "记忆本工具")]
+    [ConfigField("让模型自主维护每个会话的记忆本，可选每日自动整理。", Label = "记忆本工具")]
     public MemoryToolSection Memory { get; set; } = new();
     [ConfigField("⚠️ 让模型调用本机或远程的 MCP 服务，有安全风险，默认关闭。", Label = "MCP 工具")]
     public McpSection Mcp { get; set; } = new();

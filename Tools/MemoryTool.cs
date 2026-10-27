@@ -10,7 +10,7 @@ namespace ShiroBot.AiChatPlugin.Tools;
 /// <summary>让模型维护当前会话的记忆本。修改立即生效，同一条内容重复新增时直接返回已有条目。</summary>
 internal sealed class MemoryTool(MemoryNotebookStore store, MemoryToolSection config, ConversationKey key) : IChatTool
 {
-    internal const string Prompt = "你有一个长期记忆本，现有条目列在 [记忆本] 中，可用 memory_note 增改删。用户要求你记住或忘记某事时必须使用。也可以主动记录以后对话仍然有用的长期信息，例如某人的称呼、身份、偏好、约定和重要事实；不要记录寒暄、一次性问题或记忆本里已有的内容。信息变化时用 update 修改原条目，过时或错误时用 delete 删除。每条一句话，写清是谁的信息（群聊中带上对方的称呼）。记忆本满时先删除或合并旧条目。";
+    internal const string Prompt = "你有一个记忆本，现有条目列在 [记忆本] 中，可用 memory_note 增改删。用户要求你记住或忘记某事时必须使用。也可以主动记录以后对话仍然有用的长期信息，例如某人的称呼、身份、偏好、约定和重要事实；不要记录寒暄、一次性问题或记忆本里已有的内容。信息变化时用 update 修改原条目，过时或错误时用 delete 删除。每条一句话，写清是谁的信息（群聊中带上对方的称呼）。记忆本满时先删除或合并旧条目。";
     public string SystemPrompt => Prompt;
     public int MaxCallsPerTurn => 5;
     public OpenAiTool Definition { get; } = new()

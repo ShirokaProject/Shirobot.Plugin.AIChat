@@ -11,7 +11,7 @@ namespace ShiroBot.AiChatPlugin.Conversation;
 /// </summary>
 internal sealed class ConversationStore
 {
-    /// <summary>会话文件中保存长期记忆的特殊行，始终位于第一行。</summary>
+    /// <summary>会话文件中保存历史摘要的特殊行，始终位于第一行。</summary>
     internal const string SummaryRole = "summary";
     private const string LegacySummaryPrefix = "[对话摘要] ";
 
@@ -19,13 +19,15 @@ internal sealed class ConversationStore
     private readonly string _conversationsDir;
     private readonly bool _persist;
     private readonly int _maxTurns;
+    internal const int UnlimitedTurnsCap = 1000;
     private readonly JsonSerializerOptions _jsonOptions;
 
     public ConversationStore(string pluginRootDir, bool persist, int maxTurns)
     {
         _conversationsDir = Path.Combine(pluginRootDir, "data", "conversations");
         _persist = persist;
-        _maxTurns = Math.Max(2, maxTurns);
+        // 0 表示不按轮数限制（由 token 预算触发压缩）；仍保留一个很大的安全上限，避免压缩一直失败时文件无限增长。
+        _maxTurns = maxTurns <= 0 ? UnlimitedTurnsCap : Math.Max(2, maxTurns);
         _jsonOptions = new JsonSerializerOptions
         {
             WriteIndented = false,
@@ -241,7 +243,7 @@ internal sealed class ConversationStore
                 }
             }
 
-            // 旧版本把摘要存成第一条 assistant 消息，读取时转为长期记忆。
+            // 旧版本把摘要存成第一条 assistant 消息，读取时转为历史摘要。
             if (state.Summary is null && state.Turns.Count > 0 && state.Turns[0] is { Role: "assistant" } first &&
                 first.Parts is [TextPart { Text: var legacy }] && legacy.StartsWith(LegacySummaryPrefix, StringComparison.Ordinal))
             {
