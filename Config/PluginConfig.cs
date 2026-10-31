@@ -279,8 +279,22 @@ public sealed class ToolUseSection
     public TimerToolSection TimerTool { get; set; } = new();
     [ConfigField("让模型自主维护每个会话的记忆本，可选每日自动整理。", Label = "记忆本工具")]
     public MemoryToolSection Memory { get; set; } = new();
+    [ConfigField("让模型在轻松聊天时从 MemePlugin 的本地表情库挑选并发送表情；需要安装并启用 MemePlugin。", Label = "表情包工具")]
+    public MemeToolSection Meme { get; set; } = new();
     [ConfigField("⚠️ 让模型调用本机或远程的 MCP 服务，有安全风险，默认关闭。", Label = "MCP 工具")]
     public McpSection Mcp { get; set; } = new();
+}
+
+public sealed class MemeToolSection
+{
+    [ConfigField("启用后向模型提供 send_meme 工具；MemePlugin 未安装或未启用时自动跳过。", Label = "启用表情包工具")]
+    public bool Enabled { get; set; } = true;
+
+    [ConfigField("主动插话时是否也允许发一张表情；默认关闭，避免刷屏。", Label = "主动回复可用")]
+    public bool AllowProactive { get; set; }
+
+    [ConfigField("私聊是否允许模型发表情；默认允许。私聊流式回复期间不会提供该工具。", Label = "私聊可用")]
+    public bool AllowDirect { get; set; } = true;
 }
 
 public sealed class McpSection

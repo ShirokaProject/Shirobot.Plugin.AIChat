@@ -8,6 +8,7 @@ using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.AiChatPlugin.UserState;
+using ShiroBot.Meme.Contracts;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Abstractions;
@@ -410,6 +411,43 @@ await RecallChecks.RunAsync();
 await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
 await IdentityScopeChecks.RunAsync();
+
+// Meme tool only selects; the reply pipeline sends. Verify the tool contract and selection state.
+{
+    var service = new FakeMemeService();
+    var memeMessage = new MessageEvent
+    {
+        Platform = "qq",
+        InstanceId = "test",
+        SelfId = "bot",
+        MessageId = "m1",
+        Channel = Channel.Group("g1"),
+        Sender = new User("u1"),
+        Segments = [new TextSegment("发个猫猫")],
+    };
+    using var tool = new MemeTool(service, memeMessage);
+    var result = await tool.ExecuteAsync("""{"query":"猫","emotion":"happy"}""");
+    Check(tool.Selected is not null && tool.Selected.Id == "m1", "MemeTool must retain the selected meme.");
+    Check(result.Contains("selected", StringComparison.OrdinalIgnoreCase), "MemeTool must report selection without sending.");
+    Check(tool.Definition.Function.Name == "send_meme", "MemeTool definition name.");
+    var definitionJson = PluginJson.Serialize(tool.Definition);
+    Check(definitionJson.Contains("send_meme") && definitionJson.Contains("emotion"),
+        "MemeTool definition serializes.");
+    Console.WriteLine("PASS: meme tool selection contract");
+}
+
+sealed class FakeMemeService : IMemeService
+{
+    public Task<MemeSelection?> SelectAsync(MemeQuery query, CancellationToken cancellationToken = default) =>
+        Task.FromResult<MemeSelection?>(new MemeSelection("m1", "猫猫", ["猫"], "/tmp/meme.png", "image/png"));
+
+    public Task<MemeSendResult> SendAsync(MemeSelection selection, MemeSendTarget target,
+        string? caption = null, CancellationToken cancellationToken = default) =>
+        Task.FromResult(new MemeSendResult(true, "sent"));
+
+    public Task<MemeLibraryStats> GetStatsAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult(new MemeLibraryStats(1, 100, DateTimeOffset.UtcNow));
+}
 
 sealed class StubHandler : HttpMessageHandler
 {
