@@ -375,6 +375,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         allow_proactive = false
         # 私聊是否允许模型发表情；私聊流式回复期间不会提供该工具
         allow_direct = true
+        # auto：轻松聊天时主动配表情；explicit：只在用户明确要求时
+        use_policy = "auto"
 
         [proactive]
         # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
@@ -1270,7 +1272,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                                   !delivery.IsStreaming
                     ? Context.Services.GetService<IMemeService>()
                     : null;
-                using var memeTool = memeService is null ? null : new MemeTool(memeService, message);
+                using var memeTool = memeService is null ? null : new MemeTool(memeService, message, _config.ToolUse.Meme.UsePolicy);
                 IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool, memeTool }.OfType<IChatTool>(), .. mcpTools];
                 var contextualTools = contextual.Length > 0 ? contextual : null;
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
