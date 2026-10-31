@@ -11,6 +11,7 @@ using ShiroBot.AiChatPlugin.Mcp;
 using ShiroBot.AiChatPlugin.Memory;
 using ShiroBot.AiChatPlugin.Proactive;
 using ShiroBot.AiChatPlugin.Timers;
+using ShiroBot.Meme.Contracts;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Core;
@@ -32,7 +33,7 @@ namespace ShiroBot.AiChatPlugin;
     Version = "1.4.2",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
-    SharedAssemblies = "ShiroBot.Model.QQ")]
+    SharedAssemblies = "ShiroBot.Model.QQ;ShiroBot.Meme.Contracts")]
 public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConfig>
 {
     private PluginConfig _config = new();
@@ -366,6 +367,16 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         daily_review = false
         max_entries = 50
         max_entry_chars = 200
+
+        [tool_use.meme]
+        # 向模型提供 send_meme，从 MemePlugin 的本地表情库挑选并发送；需要安装并启用 MemePlugin
+        enabled = true
+        # 主动插话时也允许发表情；默认关闭，避免刷屏
+        allow_proactive = false
+        # 私聊是否允许模型发表情；私聊流式回复期间不会提供该工具
+        allow_direct = true
+        # auto：轻松聊天时主动配表情；explicit：只在用户明确要求时
+        use_policy = "auto"
 
         [proactive]
         # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
@@ -1246,8 +1257,6 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 using var memoryTool = convo is not null && _config.ToolUse.Enabled && _config.ToolUse.Memory.Enabled
                     ? new MemoryTool(_memory, _config.ToolUse.Memory, key) : null;
                 var mcpTools = McpToolsFor(message, proactive);
-                IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>(), .. mcpTools];
-                var contextualTools = contextual.Length > 0 ? contextual : null;
                 var replyStyle = _config.Behaviour.ReplyStyle();
                 var replyModes = replyStyle != "answer";
                 var forceChat = replyStyle == "chat";
@@ -1256,6 +1265,16 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
+                // 表情工具只负责选图，由下面的回复管线统一发送。流式私聊无法撤回已推送文本，因此不提供。
+                var memeService = replyModes && _config.ToolUse.Enabled && _config.ToolUse.Meme.Enabled &&
+                                  (proactive is null || _config.ToolUse.Meme.AllowProactive) &&
+                                  (!message.IsDirect || _config.ToolUse.Meme.AllowDirect) &&
+                                  !delivery.IsStreaming
+                    ? Context.Services.GetService<IMemeService>()
+                    : null;
+                using var memeTool = memeService is null ? null : new MemeTool(memeService, message, _config.ToolUse.Meme.UsePolicy);
+                IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool, memeTool }.OfType<IChatTool>(), .. mcpTools];
+                var contextualTools = contextual.Length > 0 ? contextual : null;
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
                 var systemPrompt = isSharedMode && convo?.SharedPrompt is not null
                     ? convo.SharedPrompt
@@ -1275,6 +1294,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 systemPrompt = ApplyOwnerPrompt(systemPrompt);
                 if (timer is not null) systemPrompt += "\n" + timer.SystemPrompt;
                 if (memoryTool is not null) systemPrompt += "\n" + memoryTool.SystemPrompt;
+                if (memeTool is not null) systemPrompt += "\n" + memeTool.SystemPrompt;
                 if (mcpTools.Count > 0) systemPrompt += "\n" + McpChatTool.Prompt;
                 if (replyModes) systemPrompt += "\n" + (forceChat ? ParsedReply.ChatOnlyPrompt : ParsedReply.SystemPrompt);
                 systemPrompt = OfficialReplyDelivery.ApplyPromptPolicy(systemPrompt, _config.Behaviour.UseMarkdown);
@@ -1387,7 +1407,47 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 }
                 _globalConcurrency.Release();
                 holdsGlobal = false;
-                if (replyModes)
+
+                var memeSent = false;
+                if (memeTool?.Selected is { } memeSelection)
+                {
+                    var memeCaption = replyModes
+                        ? ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat).Text
+                        : assistantText;
+                    if (string.IsNullOrWhiteSpace(memeCaption))
+                        memeCaption = memeTool.SuggestedCaption ?? "";
+                    var target = new MemeSendTarget(
+                        message.Platform,
+                        message.InstanceId,
+                        message.Channel.Type.ToString(),
+                        message.Channel.Id,
+                        message.MessageId,
+                        message.Sender.Id,
+                        !message.IsDirect,
+                        proactive is null && _config.Behaviour.ReplyWithMention,
+                        proactive is null && _config.Behaviour.ReplyWithQuote);
+                    try
+                    {
+                        var memeResult = await memeService!.SendAsync(memeSelection, target, memeCaption, ct)
+                            .ConfigureAwait(false);
+                        if (memeResult.Success)
+                        {
+                            memeSent = true;
+                            assistantText = memeCaption;
+                            BotLog.Info($"[AiChat] 已发送表情 {memeSelection.Id} 字数={memeCaption.Length}:\n{ForLog(memeCaption)}");
+                        }
+                        else
+                        {
+                            BotLog.Warning($"[AiChat] 表情发送失败，回退文字: {memeResult.Error}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        BotLog.Warning($"[AiChat] 表情发送异常，回退文字: {ex.Message}");
+                    }
+                }
+
+                if (!memeSent && replyModes)
                 {
                     var reply = ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat);
                     // 主动插话可能回应的是这批新消息里的任意一条，不引用，避免引错人。
@@ -1406,7 +1466,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                         await ReplyFoldableAsync(message, isGroup, reply.Text, _config.Behaviour.AnswerFoldAboveChars).ConfigureAwait(false);
                     }
                 }
-                else if (proactive is not null)
+                else if (!memeSent && proactive is not null)
                 {
                     // 主动插话像群友一样直接发，不引用也不 @ 触发的那条消息。
                     BotLog.Info($"[AiChat] 主动回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
@@ -1416,7 +1476,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     else
                         await SendChatMessagesAsync(message, isGroup, delivery, new ParsedReply(ReplyMode.Chat, false, assistantText, [assistantText])).ConfigureAwait(false);
                 }
-                else
+                else if (!memeSent)
                 {
                     BotLog.Info($"[AiChat] 回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
                     var delivered = await delivery.CompleteAsync(assistantText).ConfigureAwait(false);

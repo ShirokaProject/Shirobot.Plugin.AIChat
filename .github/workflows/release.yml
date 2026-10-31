@@ -26,20 +26,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout Meme contracts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Shirobot.Plugin.Meme
+          path: Shirobot.Plugin.Meme
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
 
       - name: Publish
-        run: dotnet publish "$PROJECT_DIR" --configuration Release
+        run: dotnet publish "$PROJECT_DIR" --configuration Release -p:MemeContractsProject=Shirobot.Plugin.Meme/ShiroBot.Meme.Contracts/ShiroBot.Meme.Contracts.csproj
 
       - name: Check packaged plugin version
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
         run: |
-          version="$(dotnet msbuild ShiroBot.AiChatPlugin.csproj -nologo -getProperty:Version -p:Configuration=Release)"
+          version="$(dotnet msbuild ShiroBot.AiChatPlugin.csproj -nologo -getProperty:Version -p:Configuration=Release -p:MemeContractsProject=Shirobot.Plugin.Meme/ShiroBot.Meme.Contracts/ShiroBot.Meme.Contracts.csproj)"
           dotnet run --project scripts/version-check/VersionCheck.csproj -c Release -- \
             "$PUBLISH_DIR/ShiroBot.AiChatPlugin.dll" "$version" "${RELEASE_TAG#v}"
 
@@ -54,19 +60,28 @@ jobs:
             exit 1
           fi
 
+          CONTRACT_DLL="$PUBLISH_DIR/ShiroBot.Meme.Contracts.dll"
+          if [ ! -f "$CONTRACT_DLL" ]; then
+            echo "Meme contract DLL not found: $CONTRACT_DLL"
+            ls -la "$PUBLISH_DIR"
+            exit 1
+          fi
+
           unexpected_dlls=()
           for dll in "$PUBLISH_DIR"/*.dll; do
             [ -e "$dll" ] || continue
-            [ "$dll" = "$PLUGIN_DLL" ] || unexpected_dlls+=("$dll")
+            if [ "$dll" != "$PLUGIN_DLL" ] && [ "$dll" != "$CONTRACT_DLL" ]; then
+              unexpected_dlls+=("$dll")
+            fi
           done
           if [ "${#unexpected_dlls[@]}" -ne 0 ]; then
-            echo "Publish output contains DLLs other than the single-file plugin:"
+            echo "Publish output contains unexpected DLLs:"
             printf '%s\n' "${unexpected_dlls[@]}"
             exit 1
           fi
 
           mkdir -p release
-          cp "$PLUGIN_DLL" release/
+          cp "$PLUGIN_DLL" "$CONTRACT_DLL" release/
 
       - name: Upload DLL to Release
         uses: softprops/action-gh-release@v2
