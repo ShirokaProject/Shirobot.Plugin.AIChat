@@ -411,6 +411,47 @@ await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
 await IdentityScopeChecks.RunAsync();
 
+// Meme tool only selects; the reply pipeline sends. Verify the tool contract and selection state.
+{
+    var service = new FakeMemeService();
+    var memeMessage = new MessageEvent
+    {
+        Platform = "qq",
+        InstanceId = "test",
+        SelfId = "bot",
+        MessageId = "m1",
+        Channel = Channel.Group("g1"),
+        Sender = new User("u1"),
+        Segments = [new TextSegment("发个猫猫")],
+    };
+    using var tool = new MemeTool(service, memeMessage);
+    using var autoTool = new MemeTool(service, memeMessage, "auto");
+    using var explicitTool = new MemeTool(service, memeMessage, "explicit");
+    Check(autoTool.SystemPrompt.Contains("不需要等用户明确要求", StringComparison.Ordinal),
+        "MemeTool auto policy should encourage proactive use.");
+    Check(explicitTool.SystemPrompt.Contains("用户没有明确要求时不要主动发", StringComparison.Ordinal),
+        "MemeTool explicit policy should require an explicit request.");
+    var result = await tool.ExecuteAsync("""{"query":"猫","emotion":"happy"}""");
+    Check(tool.Selected is not null && tool.Selected.Id == "m1", "MemeTool must retain the selected meme.");
+    Check(result.Contains("selected", StringComparison.OrdinalIgnoreCase), "MemeTool must report selection without sending.");
+    Check(tool.Definition.Function.Name == "send_meme", "MemeTool definition name.");
+    var definitionJson = PluginJson.Serialize(tool.Definition);
+    Check(definitionJson.Contains("send_meme") && definitionJson.Contains("emotion"),
+        "MemeTool definition serializes.");
+    Console.WriteLine("PASS: meme tool selection contract");
+}
+
+sealed class FakeMemeService : IMemeToolService
+{
+    public Task<MemeSelectionInfo?> SelectAsync(string query, string? emotion, string? channelId,
+        string? userId, int limit, CancellationToken cancellationToken = default) =>
+        Task.FromResult<MemeSelectionInfo?>(new MemeSelectionInfo("m1", "猫猫", ["猫"], new object()));
+
+    public Task<MemeSendResultInfo> SendAsync(MemeSelectionInfo selection, MemeSendTargetInfo target,
+        string? caption, CancellationToken cancellationToken = default) =>
+        Task.FromResult(new MemeSendResultInfo(true));
+}
+
 sealed class StubHandler : HttpMessageHandler
 {
     public List<JsonElement> Requests { get; } = [];
