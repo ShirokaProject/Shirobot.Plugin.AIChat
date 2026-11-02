@@ -1264,8 +1264,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
-                // 表情工具只负责选图，由下面的回复管线统一发送。流式私聊无法撤回已推送文本，因此不提供。
-                var memeService = replyModes && _config.ToolUse.Enabled && _config.ToolUse.Meme.Enabled &&
+                // 表情工具只负责选图，文字回复后再单独发图，任何回复模式都可用。
+                // 流式回复无法撤回已推送的文本，因此不提供。
+                var memeService = _config.ToolUse.Enabled && _config.ToolUse.Meme.Enabled &&
                                   (proactive is null || _config.ToolUse.Meme.AllowProactive) &&
                                   (!message.IsDirect || _config.ToolUse.Meme.AllowDirect) &&
                                   !delivery.IsStreaming
