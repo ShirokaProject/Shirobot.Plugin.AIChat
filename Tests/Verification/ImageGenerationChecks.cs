@@ -20,7 +20,7 @@ internal static class ImageGenerationChecks
         using var listener = new HttpListener();
         var port = Random.Shared.Next(20000, 40000);
         listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
-        var calls = 0;
+        var calls = 0; var forbidden = false;
         string? lastSize = null, lastQuality = null;
         var serve = Task.Run(async () =>
         {
@@ -29,6 +29,7 @@ internal static class ImageGenerationChecks
                 HttpListenerContext ctx;
                 try { ctx = await listener.GetContextAsync(); } catch { return; }
                 calls++;
+                if (forbidden) { ctx.Response.StatusCode = 403; ctx.Response.Close(); continue; }
                 Check(ctx.Request.Url!.AbsolutePath == "/v1/images/generations", "Wrong image endpoint.");
                 Check(ctx.Request.Headers["Authorization"] == "Bearer image-key", "Missing provider authorization.");
                 using var reader = new StreamReader(ctx.Request.InputStream);
@@ -44,6 +45,7 @@ internal static class ImageGenerationChecks
         var config = new PluginConfig(); config.ToolUse.ImageGen.Enabled = true;
         config.Models = [new() { Name = "gpt-image-2.5-sunburst", Provider = "test" }];
         config.Providers = [new() { Name = "test", BaseUrl = $"http://127.0.0.1:{port}/v1", ApiKey = "image-key" }];
+        var deleted = new List<string>();
         var sent = new List<MessageSegment>(); var reactions = new List<bool>();
         var reaction = DispatchProxy.Create<IMessageReactionService, TestProxy>();
         ((TestProxy)(object)reaction).Call = (method, args) => method.Name switch {
@@ -52,6 +54,7 @@ internal static class ImageGenerationChecks
         Task RecordReaction(bool add) { reactions.Add(add); return Task.CompletedTask; }
         var messages = DispatchProxy.Create<IMessageContext, TestProxy>();
         ((TestProxy)(object)messages).Call = (method, args) => {
+            if (method.Name == "DeleteMessageAsync") { deleted.Add((string)args![1]!); return Task.CompletedTask; }
             if (method.Name == "SendMessageAsync") { sent.AddRange((IReadOnlyList<MessageSegment>)args![1]!); return Task.FromResult(new SentMessage("sent")); }
             return null;
         };
@@ -70,7 +73,7 @@ internal static class ImageGenerationChecks
             Sender = new User("u"), MessageId = "m", Segments = [] };
         var method = typeof(AiChatPlugin).GetMethod("GenerateAndSendImageAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
         async Task<string> Generate(string prompt, string? size, string? quality, CancellationToken ct)
-        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct, size, quality])!; }
+        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct, size, quality, null])!; }
         using var tool = new ImageGenerationTool(Generate);
         Check(await tool.ExecuteAsync("{\"prompt\":\"一只猫\",\"size\":\"1536x1024\",\"quality\":\"high\"}") == "图片已生成并发送。", "Image tool failed.");
         Check(lastSize == "1536x1024" && lastQuality == "high", "Tool size and quality were not forwarded.");
@@ -85,8 +88,12 @@ internal static class ImageGenerationChecks
         using var canceled = new CancellationTokenSource(); canceled.Cancel();
         try { await Generate("cat", null, null, canceled.Token); throw new Exception("Cancellation ignored."); } catch (OperationCanceledException) { }
         Check(calls == 2, "Canceled generation reached upstream.");
+        Check(deleted.SequenceEqual(new[] { "sent" }), "Successful generation must retract progress text.");
+        forbidden = true;
+        var failure = await Generate("cat", null, null, CancellationToken.None);
+        Check(failure.Contains("HTTP 403") && deleted.Count == 2, "Forbidden generation must explain permissions and retract progress text.");
         config.ToolUse.ImageGen.Enabled = false;
-        Check(await Generate("cat", null, null, CancellationToken.None) == "生图功能未启用。" && calls == 2, "Disabled generation called upstream.");
+        Check(await Generate("cat", null, null, CancellationToken.None) == "生图功能未启用。" && calls == 3, "Disabled generation called upstream.");
         listener.Stop(); await serve;
         Console.WriteLine("PASS: image generation provider request, one-image delivery, reaction cleanup, text fallback, retry deduplication, cancellation and enabled switch");
     }

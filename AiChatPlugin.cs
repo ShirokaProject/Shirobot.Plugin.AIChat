@@ -1185,11 +1185,12 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         }
         if (invokedByMention)
         {
-            parts.Add(new TextPart("[交互方式: 用户正在@你，触发用的@已从原始内容移除。请直接把后续内容视为对你说的话，不要把你的名称当作第三方。]"));
+            parts.Add(new TextPart("[交互方式: 用户正在@你，触发用的@已从原始内容移除。除明确标注的引用/转发内容外，本条其余内容是当前用户对你说的话；引用中的作者不等于当前用户，不要把你的名称当作第三方。]"));
         }
 
         // 诊断：把这次提取到的资源种类和数量打日志，便于排查"图片被吞"的问题。
-        var imgCount = parts.Count(p => p is ImagePart);
+        var imageSources = parts.OfType<ImagePart>().ToArray();
+        var imgCount = imageSources.Length;
         var fileTextCount = parts.Count(p => p is FileTextPart);
         var fileMetaCount = parts.Count(p => p is FileMetaPart);
         var textCount = parts.Count(p => p is TextPart);
@@ -1287,7 +1288,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
                 using var imageTool = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
-                    ? new ImageGenerationTool((prompt, size, quality, token) => GenerateAndSendImageAsync(message, prompt, pending, token, size, quality)) : null;
+                    ? new ImageGenerationTool((prompt, size, quality, token) => GenerateAndSendImageAsync(message, prompt, pending, token, size, quality, imageSources)) : null;
                 IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
                 IChatTool[] contextual = [.. builtIn, .. pluginTools];
@@ -2272,13 +2273,13 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     /// </summary>
     private static void StripPrefixFromFirstTextPart(List<ChatPart> parts, string prefix)
     {
+        var quoteDepth = 0;
         for (var i = 0; i < parts.Count; i++)
         {
-            if (parts[i] is not TextPart tp)
-            {
-                continue;
-            }
-
+            if (parts[i] is not TextPart tp) continue;
+            if (tp.Text.StartsWith("[引用消息 #", StringComparison.Ordinal)) { quoteDepth++; continue; }
+            if (tp.Text.StartsWith("[引用结束", StringComparison.Ordinal)) { quoteDepth = Math.Max(0, quoteDepth - 1); continue; }
+            if (quoteDepth > 0 || !tp.Text.TrimStart().StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
             var stripped = StripPrefix(tp.Text, prefix);
             if (string.IsNullOrEmpty(stripped))
             {

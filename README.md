@@ -183,3 +183,10 @@ timeout_seconds = 600
 协议参考：[OpenAI Images API](https://developers.openai.com/api/reference/resources/images/methods/generate)。
 
 AI 生图工具可传可选 `size`（auto、1024x1024、1536x1024、1024x1536）和 `quality`（auto、low、medium、high、xhigh、max），根据用户描述选择横竖比例与质量；省略时沿用配置，单次选择不会修改全局配置。`#imagegen` 直接命令使用配置默认值。
+
+等待文字在成功、失败或取消后尝试撤回（需要适配器支持删除自己的消息）；撤回失败只记诊断，不影响图片发送。HTTP 401/403 会明确提示鉴权或分组生图权限问题。支持附图编辑：有附图时将原图提交到 `/images/edits`。
+
+
+附图并 @AI 要求修改，或附图发送 `#imagegen 修改要求`，会自动使用 OpenAI 兼容的 multipart `/images/edits`；无附图使用 `/images/generations`。
+支持当前消息及引用消息中的 PNG、JPEG、WebP，最多 4 张，不会取更早聊天历史的图片。原图读取失败时明确提示，不静默退成文生图。
+引用内容会标注原作者昵称、用户 ID 和消息 ID，并标明引用结束后恢复当前用户发言，避免把别人的原话当成发起人的话。

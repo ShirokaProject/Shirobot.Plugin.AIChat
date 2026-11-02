@@ -414,6 +414,7 @@ await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
 await ModelApiChecks.RunAsync();
 await ImageGenerationChecks.RunAsync();
+await ImageEditQuoteChecks.RunAsync();
 await IdentityScopeChecks.RunAsync();
 
 // Plugin tools: discovered through the ChatTools contract, called with the model's arguments and the conversation,
