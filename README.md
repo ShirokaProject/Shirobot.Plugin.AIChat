@@ -23,25 +23,85 @@ dotnet publish ShiroBot.AiChatPlugin.csproj -c Release
 
 ## 插件工具
 
-其他插件可以按名称提供 `chat.tool.<工具名>` 服务，AIChat 每轮对话列出当前可用的工具交给模型；
-AIChat 不引用提供方的任何类型，提供方可以随时卸载、更新，不影响 AIChat。`[tool_use.plugin_tools]`
-可关闭全部插件工具、允许主动插话时使用，或用 `disabled` 去掉某个工具。
+其他插件可以向 AIChat 提供工具，AIChat 每轮把当前所有工具交给模型。AIChat 不知道也不关心是哪个插件提供的：
+工具插件装上就能用，卸载或更新后 AIChat 自动跟着变化，双方都不需要声明依赖。机制见宿主文档
+[插件之间互相调用](https://docs.shiroka.org/plugin/interop)。需要宿主 1.0.3。
 
-提供方注册时附带描述：
+`[tool_use.plugin_tools]` 可关闭全部插件工具、允许主动插话时使用，或用 `disabled` 去掉某个工具。
+
+### 写一个工具
+
+AIChat 定义了这个扩展点，所以由它提供契约：把 `ShiroBot.AiChatPlugin.dll` 放进工具插件的 `contracts` 目录，
+构建时会生成 `ShiroBot.AiChatPlugin.Contracts` 里的 `ChatTools` 等类型，成品里不包含 AIChat 的 DLL。
+
+```csharp
+using System.ComponentModel;
+using ShiroBot.AiChatPlugin.Contracts;
+using ShiroBot.SDK.Plugin;
+
+// 工具自己的参数，[Description] 会成为模型看到的参数说明
+[PluginJson]
+public sealed record WeatherArgs([property: Description("城市名，例如 上海")] string City);
+
+[BotPlugin("weather", Name = "天气")]
+public sealed class WeatherPlugin : PluginBase
+{
+    protected override Task LoadAsync()
+    {
+        ChatTools.Tools.Provide(Context, "query_weather",
+            async (call, ct) =>
+            {
+                var args = call.Arguments.As<WeatherArgs>()!;
+                return new ChatToolResult(await QueryAsync(args.City, ct));
+            },
+            new ChatToolInfo("查询城市当前天气。用户问天气时使用。", PluginJsonSchema.For<WeatherArgs>()));
+        return Task.CompletedTask;
+    }
+}
+```
+
+参数格式由 `WeatherArgs` 生成，不需要手写 JSON Schema。
+
+### 契约里的类型
+
+| 类型 | 说明 |
+| --- | --- |
+| `ChatToolInfo(Description, Parameters, Prompt, MaxCallsPerTurn)` | 工具说明（交给模型，AIChat 会加上 `[提供方插件 ID]`）、参数格式、追加到系统提示的使用说明、每轮最多调用次数（1–5，默认 1） |
+| `ChatToolCall(Arguments, Context)` | `Arguments` 是模型给的参数，用 `As<T>()` 读取；`Context` 是触发回复的会话：平台、实例、会话类型和 ID、消息 ID、发送者、是否群聊、是否主动插话 |
+| `ChatToolResult(Content, AfterReply)` | `Content` 交给模型；`AfterReply` 见下文 |
+
+工具名只能用字母、数字、下划线和连字符，最长 64 个字符；和内置工具、MCP 工具或其他插件工具重名时跳过。
+没有合适结果时，在 `Content` 里让模型改用文字回复，不要抛异常；提供方不在或出错时，AIChat 也会让模型改用文字。
+
+工具说明和使用说明每轮原样交给模型，并排在系统提示中稳定的部分，不会破坏上游的前缀缓存。不要把冷却、剩余次数这类
+会变的状态写进说明，放进调用结果。
+
+### 回复后的动作
+
+发图片、文件这类跟在回复后面的内容，不要在工具里直接发：那时模型还没写出回复，顺序会乱，模型也可能最后不回复。
+提供一个回复后动作，在工具结果里指向它，AIChat 发出文字后再调用：
+
+```csharp
+ChatTools.AfterReply.Provide(Context, "send_meme", async (call, ct) =>
+{
+    var args = call.Arguments.As<SendMemeArgs>()!;
+    // call.Reply.TextSent 为 false 时没有发出文字，由这个动作代替回复，并按 Mention / Quote @、引用
+    var sent = await SendAsync(args.Id, call.Context, call.Reply, ct);
+    return new ChatAfterReplyResult(sent, History: "[表情]");
+}, new ChatAfterReplyInfo("发送选中的表情"));
+
+// 工具里只选图，然后要求回复后发送
+return new ChatToolResult("已选好表情，回复一句短评即可。",
+    new ChatAfterReply("send_meme", PluginJson.ToNode(new SendMemeArgs(selection.Id))!.AsObject()));
+```
 
 | 字段 | 说明 |
 | --- | --- |
-| `description` | 必填，交给模型的工具说明 |
-| `parameters` | 参数的 JSON Schema，缺省为无参数 |
-| `prompt` | 追加到系统提示的使用说明 |
-| `max_calls_per_turn` | 每轮最多调用次数，1–5，默认 1 |
+| `Reply.TextSent` | AIChat 是否已经发出文字回复 |
+| `Reply.Mention` / `Reply.Quote` | 没有发出文字时，这个动作是否应该 @ 发送者、引用触发消息（按 AIChat 的设置） |
+| 返回的 `History` | 没有发出文字时，代替空回复写入对话历史，例如 `[表情：猫猫]` |
 
-调用时收到 `{ "arguments": 模型给的参数, "context": 会话信息 }`，`context` 含 `platform`、`instance_id`、
-`channel_type`、`channel_id`、`message_id`、`sender_id`、`is_group`、`proactive`。返回
-`{ "content": 交给模型的结果 }`；需要在文字回复之后再做的事（例如发图）放在
-`"after_reply": { "service": 服务名, "arguments": … }`。AIChat 发出文字后调用该服务，额外传
-`reply: { text_sent, mention, quote }`：模型没写文字时 `text_sent` 为 false，由这个动作按 AIChat 的设置
-@/引用触发消息；它返回的 `history` 文本会写入对话历史。
+MemePlugin 的发表情就是这样实现的。
 
 ## 本地开发
 

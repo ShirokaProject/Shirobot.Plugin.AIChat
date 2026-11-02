@@ -7,6 +7,7 @@ using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
+using PluginJson = ShiroBot.AiChatPlugin.PluginJson;
 
 internal static class TimerLimitChecks
 {

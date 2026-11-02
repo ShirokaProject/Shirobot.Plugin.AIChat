@@ -2,6 +2,7 @@
 using System.Text;
 using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
@@ -2674,53 +2675,39 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         var config = _config.ToolUse.PluginTools;
         if (!_config.ToolUse.Enabled || !config.Enabled || proactive is not null && !config.AllowProactive) return [];
         var reserved = new HashSet<string>(_tools.Names.Concat(builtIn.Select(tool => tool.Definition.Function.Name)), StringComparer.Ordinal);
-        return PluginChatTool.Discover(Context.Services, ToolContext(message, proactive), reserved, config.Disabled);
+        return PluginChatTool.Discover(Context, ToolContext(message, proactive), reserved, config.Disabled);
     }
 
     /// <summary>传给插件工具的会话信息，提供方据此选择内容或自行发送消息。</summary>
-    private static JsonObject ToolContext(MessageEvent message, ProactiveRequest? proactive) => new()
-    {
-        ["platform"] = message.Platform,
-        ["instance_id"] = message.InstanceId,
-        ["channel_type"] = message.Channel.Type.ToString(),
-        ["channel_id"] = message.Channel.Id,
-        ["message_id"] = message.MessageId,
-        ["sender_id"] = message.Sender.Id,
-        ["is_group"] = !message.IsDirect,
-        ["proactive"] = proactive is not null
-    };
+    private static ChatToolContext ToolContext(MessageEvent message, ProactiveRequest? proactive) => new(
+        message.Platform, message.InstanceId, message.Channel.Type.ToString(), message.Channel.Id,
+        message.MessageId, message.Sender.Id, !message.IsDirect, proactive is not null);
 
     /// <summary>
-    /// 依次调用插件工具要求的后续服务。没有发出文字时，由第一个后续动作按设置 @/引用触发消息。
-    /// 返回提供方给出的 <c>history</c> 文本，用于写入历史；失败只记日志。
+    /// 依次执行插件工具要求的回复后动作。没有发出文字时，由第一个动作按设置 @/引用触发消息。
+    /// 返回动作给出的 History 文本，用于写入历史；失败只记日志。
     /// </summary>
-    private async Task<string> RunFollowUpsAsync(List<PluginToolFollowUp> followUps, MessageEvent message,
+    private async Task<string> RunFollowUpsAsync(List<ChatAfterReply> followUps, MessageEvent message,
         ProactiveRequest? proactive, bool textSent, CancellationToken ct)
     {
         var history = new List<string>();
         for (var i = 0; i < followUps.Count; i++)
         {
             var decorate = !textSent && i == 0 && proactive is null;
+            var reply = new ChatReplyState(textSent, decorate && _config.Behaviour.ReplyWithMention, decorate && _config.Behaviour.ReplyWithQuote);
             try
             {
-                var result = await Context.Services.CallAsync(followUps[i].Service, new JsonObject
-                {
-                    ["arguments"] = followUps[i].Arguments?.DeepClone(),
-                    ["context"] = ToolContext(message, proactive),
-                    ["reply"] = new JsonObject
-                    {
-                        ["text_sent"] = textSent,
-                        ["mention"] = decorate && _config.Behaviour.ReplyWithMention,
-                        ["quote"] = decorate && _config.Behaviour.ReplyWithQuote
-                    }
-                }, ct).ConfigureAwait(false);
-                if (result?["history"] is JsonValue value && value.TryGetValue<string>(out var text) && text.Length > 0)
-                    history.Add(text);
-                BotLog.Info($"[AiChat] 插件工具后续动作完成: {followUps[i].Service}");
+                var result = await ChatTools.AfterReply.CallAsync(Context, followUps[i].Name,
+                    new ChatAfterReplyCall(followUps[i].Arguments, ToolContext(message, proactive), reply), ct).ConfigureAwait(false);
+                if (result is { Ok: true, History.Length: > 0 }) history.Add(result.History);
+                if (result is { Ok: false })
+                    BotLog.Warning($"[AiChat] 回复后动作未完成: {followUps[i].Name} - {result.Error}");
+                else
+                    BotLog.Info($"[AiChat] 回复后动作完成: {followUps[i].Name}");
             }
             catch (Exception ex) when (ex is PluginServiceUnavailableException or PluginServiceException)
             {
-                BotLog.Warning($"[AiChat] 插件工具后续动作失败: {followUps[i].Service} - {ex.Message}");
+                BotLog.Warning($"[AiChat] 回复后动作失败: {followUps[i].Name} - {ex.Message}");
             }
         }
         return string.Join("\n", history);

@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
@@ -14,6 +15,7 @@ using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Plugin;
+using PluginJson = ShiroBot.AiChatPlugin.PluginJson;
 using Tomlyn;
 
 static void Check(bool condition, string message)
@@ -412,59 +414,65 @@ await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
 await IdentityScopeChecks.RunAsync();
 
-// Plugin tools: discovered by the chat.tool. prefix, called with arguments and context, follow-ups kept for after the reply.
+// Plugin tools: discovered through the ChatTools contract, called with the model's arguments and the conversation,
+// after-reply actions kept for after the text reply.
 {
     var services = new FakePluginServices();
-    services.Tools["chat.tool.send_meme"] = new PluginServiceInfo("chat.tool.send_meme", "MemePlugin", new JsonObject
-    {
-        ["description"] = "Send a meme.",
-        ["prompt"] = "Use memes sparingly.",
-        ["parameters"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject { ["query"] = new JsonObject { ["type"] = "string" } } }
-    });
-    services.Tools["chat.tool.web_fetch"] = new PluginServiceInfo("chat.tool.web_fetch", "Other", new JsonObject { ["description"] = "Clashes with a built-in." });
-    services.Tools["chat.tool.bad name"] = new PluginServiceInfo("chat.tool.bad name", "Other", new JsonObject { ["description"] = "Invalid name." });
-    services.Tools["chat.tool.no_description"] = new PluginServiceInfo("chat.tool.no_description", "Other", null);
-    services.Results["chat.tool.send_meme"] = new JsonObject
-    {
-        ["content"] = "selected",
-        ["after_reply"] = new JsonObject { ["service"] = "meme.send", ["arguments"] = new JsonObject { ["id"] = "m1" } }
-    };
-    var toolContext = new JsonObject { ["channel_id"] = "g1" };
-    var tools = PluginChatTool.Discover(services, toolContext, new HashSet<string> { "web_fetch" }, []);
+    services.Add("chat.tool.send_meme", "MemePlugin",
+        new ChatToolInfo("Send a meme.", new JsonObject { ["type"] = "object", ["properties"] = new JsonObject { ["query"] = new JsonObject { ["type"] = "string" } } },
+            "Use memes sparingly."),
+        request =>
+        {
+            services.LastCall = ShiroBot.SDK.Plugin.PluginJson.Deserialize<ChatToolCall>(request);
+            return ShiroBot.SDK.Plugin.PluginJson.Serialize(new ChatToolResult("selected", new ChatAfterReply("send_meme", new JsonObject { ["id"] = "m1" })));
+        });
+    services.Add("chat.tool.web_fetch", "Other", new ChatToolInfo("Clashes with a built-in."), _ => []);
+    services.Add("chat.tool.bad name", "Other", new ChatToolInfo("Invalid name."), _ => []);
+    services.Add("chat.tool.no_description", "Other", new ChatToolInfo(""), _ => []);
+    var toolBot = DispatchProxy.Create<IBotContext, TestProxy>();
+    ((TestProxy)(object)toolBot).Call = (method, _) => method.Name == "get_Services" ? services : throw new NotSupportedException(method.Name);
+    var chat = new ChatToolContext("qq", "test", "Group", "g1", "m1", "u1", true, false);
+
+    var tools = PluginChatTool.Discover(toolBot, chat, new HashSet<string> { "web_fetch" }, []);
     Check(tools is [{ Definition.Function.Name: "send_meme", SystemPrompt: "Use memes sparingly.", MaxCallsPerTurn: 1 }],
-        "Plugin tools must skip clashing, invalid and undescribed services.");
+        "Plugin tools must skip clashing, invalid and undescribed tools.");
     Check(tools[0].Definition.Function.Description == "[MemePlugin] Send a meme.", "Plugin tool descriptions name their provider.");
-    Check(PluginChatTool.Discover(services, toolContext, new HashSet<string>(), ["SEND_MEME"]).All(tool => tool.Definition.Function.Name != "send_meme"),
+    Check(PluginChatTool.Discover(toolBot, chat, new HashSet<string>(), ["SEND_MEME"]).All(tool => tool.Definition.Function.Name != "send_meme"),
         "Disabled plugin tools must not be offered.");
     var result = await tools[0].ExecuteAsync("""{"query":"猫"}""");
-    var call = services.Calls.Single();
-    Check(result == "selected" && call.Name == "chat.tool.send_meme" &&
-          (string?)call.Arguments?["arguments"]?["query"] == "猫" && (string?)call.Arguments?["context"]?["channel_id"] == "g1",
+    Check(result == "selected" && services.LastCall is { Context.ChannelId: "g1", Context.IsGroup: true } &&
+          (string?)services.LastCall.Arguments["query"] == "猫",
         "Plugin tools must pass the model's arguments and the conversation context.");
-    Check(tools[0].FollowUps is [{ Service: "meme.send" } followUp] && (string?)followUp.Arguments?["id"] == "m1",
-        "Plugin tools must keep after_reply follow-ups.");
-    services.Results.Clear();
+    Check(tools[0].FollowUps is [{ Name: "send_meme" } followUp] && (string?)followUp.Arguments?["id"] == "m1",
+        "Plugin tools must keep after-reply actions.");
+    services.Handlers.Clear();
     Check((await tools[0].ExecuteAsync("{}")).Contains("not available", StringComparison.Ordinal),
         "A provider that went away must turn into a text reply.");
-    Console.WriteLine("PASS: plugin tool discovery, calls, follow-ups and unavailable providers");
+    Console.WriteLine("PASS: plugin tool discovery, calls, after-reply actions and unavailable providers");
 }
 
 sealed class FakePluginServices : IPluginServices
 {
-    public Dictionary<string, PluginServiceInfo> Tools { get; } = new(StringComparer.Ordinal);
-    public Dictionary<string, JsonNode?> Results { get; } = new(StringComparer.Ordinal);
-    public List<(string Name, JsonNode? Arguments)> Calls { get; } = [];
+    public Dictionary<string, (string Provider, byte[] Metadata)> Infos { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, Func<byte[], byte[]>> Handlers { get; } = new(StringComparer.Ordinal);
+    public ChatToolCall? LastCall { get; set; }
+
+    public void Add(string name, string provider, ChatToolInfo info, Func<byte[], byte[]> handler)
+    {
+        Infos[name] = (provider, ShiroBot.SDK.Plugin.PluginJson.Serialize(info));
+        Handlers[name] = handler;
+    }
 
     public IReadOnlyList<PluginServiceInfo> Find(string prefix) =>
-        [.. Tools.Values.Where(tool => tool.Name.StartsWith(prefix, StringComparison.Ordinal)).OrderBy(tool => tool.Name, StringComparer.Ordinal)];
+    [
+        .. Infos.Where(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal)).OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new PluginServiceInfo(pair.Key, pair.Value.Provider, null) { MetadataUtf8 = pair.Value.Metadata })
+    ];
 
-    public Task<JsonNode?> CallAsync(string name, JsonNode? arguments = null, CancellationToken cancellationToken = default)
-    {
-        Calls.Add((name, arguments));
-        return Results.TryGetValue(name, out var result)
-            ? Task.FromResult(result?.DeepClone())
+    public Task<ReadOnlyMemory<byte>> CallUtf8Async(string name, ReadOnlyMemory<byte> request, CancellationToken cancellationToken = default) =>
+        Handlers.TryGetValue(name, out var handler)
+            ? Task.FromResult<ReadOnlyMemory<byte>>(handler(request.ToArray()))
             : throw new PluginServiceUnavailableException(name);
-    }
 }
 
 sealed class StubHandler : HttpMessageHandler
