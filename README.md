@@ -160,3 +160,24 @@ dotnet run --project Tests/ContractConsumer -c Release -- bin/Release/net10.0/pu
 ## 许可证
 
 [GPL-3.0-only](LICENSE)
+
+## 图片生成
+
+配置 `[tool_use.image_gen]`，复用 `[[providers]]` 的 OpenAI 兼容地址和密钥：
+
+```toml
+[tool_use.image_gen]
+enabled = true
+model = "openai-gpt-image-2.5-sunburst" # 已注册模型或 provider-model
+size = "1024x1024"
+quality = "auto"
+timeout_seconds = 600
+```
+
+用户可发送 `#imagegen 提示词`，也可聊天要求画图，让 AI 调用 `imagegen` 工具。
+工具受全局 `tool_use.enabled` 控制；直接命令只需生图开关开启。主动插话和定时生成不提供此工具。
+等待时优先给原消息添加 🎨 表情回应，QQ 旧接口尝试平台表情；不支持或失败时发送“生成图片中...”。结束后撤下等待表情。
+每次生成一张，并发串行执行；使用独立长超时，不自动重试生图请求，同轮聊天重试也复用结果，避免重复生成。
+撤回取消开关开启时，尚未开始最终回复的请求可随原消息撤回取消；卸载时取消全部待处理请求。
+调用 `POST /images/generations`，要求返回 `data[0].b64_json`（GPT Image 默认格式）；不会把 Base64 或接口密钥交给聊天模型。
+协议参考：[OpenAI Images API](https://developers.openai.com/api/reference/resources/images/methods/generate)。

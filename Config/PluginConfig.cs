@@ -268,6 +268,8 @@ public sealed class PermissionsSection
 
 public sealed class ToolUseSection
 {
+    [ConfigField("OpenAI 兼容生图接口，支持 AI 工具和 #imagegen。", Label = "图片生成")]
+    public ImageGenerationSection ImageGen { get; set; } = new();
     [ConfigField("关闭后不向模型发送任何工具定义及工具提示词。", Label = "启用工具调用")]
     public bool Enabled { get; set; } = true;
     /// <summary>每次请求最多允许的工具调用轮数（1-8），之后要求模型给出最终回答。</summary>
@@ -442,4 +444,18 @@ public sealed class OwnerPromptSection
     public bool Enabled { get; set; }
     [ConfigField("直接填写主人介绍、QQ 号、机器人框架等文字，开启后原样追加；留空不追加。", Label = "主人提示词", Type = "text")]
     public string Template { get; set; } = "";
+}
+
+public sealed class ImageGenerationSection
+{
+    [ConfigField("同时控制生图工具和 #imagegen 命令。", Label = "启用生图")]
+    public bool Enabled { get; set; }
+    [ConfigField("填写已注册模型名或 provider-model。", Label = "生图模型")]
+    public string Model { get; set; } = "gpt-image-2.5-sunburst";
+    [ConfigField("生图独立超时，不沿用聊天超时。", Label = "生图超时（秒）", Min = 30, Max = 1800)]
+    public int TimeoutSeconds { get; set; } = 600;
+    [ConfigField("发送给 images/generations 的 size。", Label = "图片尺寸")]
+    public string Size { get; set; } = "1024x1024";
+    [ConfigField("auto、low、medium、high 等，按服务商支持填写。", Label = "图片质量")]
+    public string Quality { get; set; } = "auto";
 }

@@ -35,7 +35,7 @@ namespace ShiroBot.AiChatPlugin;
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
-public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConfig>
+public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConfig>
 {
     private PluginConfig _config = new();
     private readonly CancellationTokenSource _backgroundStop = new();
@@ -118,6 +118,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         // 私聊
         DirectCommands.MapExact("#aihelp", HandleFriendHelpAsync);
         DirectCommands.MapPrefix("#aimode", HandleFriendAiModeAsync);
+        DirectCommands.MapPrefix("#imagegen", HandleImageGenAsync);
         DirectCommands.MapPrefix("#ai", HandleFriendAiAsync);
         DirectCommands.MapPrefix("#prompt", HandleFriendPromptAsync);
         DirectCommands.MapExact("#clear", HandleFriendClearAsync);
@@ -131,6 +132,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         // 群聊
         GroupCommands.MapExact("#aihelp", HandleGroupHelpAsync);
         GroupCommands.MapPrefix("#aimode", HandleGroupAiModeAsync);
+        GroupCommands.MapPrefix("#imagegen", HandleImageGenAsync);
         GroupCommands.MapPrefix("#ai", HandleGroupAiAsync);
         GroupCommands.MapPrefix("#prompt", HandleGroupPromptAsync);
         GroupCommands.MapExact("#clear", HandleGroupClearAsync);
@@ -373,6 +375,13 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         max_entries = 50
         max_entry_chars = 200
 
+        [tool_use.image_gen]
+        enabled = false
+        model = "gpt-image-2.5-sunburst"
+        timeout_seconds = 600
+        size = "1024x1024"
+        quality = "auto"
+
         [tool_use.plugin_tools]
         # 向模型提供其他插件以 chat.tool.* 注册的工具（例如 MemePlugin 的 send_meme）；需要宿主 1.0.3
         enabled = true
@@ -584,6 +593,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         """
         AiChat 命令:
           #ai <内容>     与AI对话
+          #imagegen <提示词>  生成一张图片
           @机器人 <内容>  群里另一种触发方式
           #aimode        查看当前对话模式
           #aimode <模式>  切换对话模式
@@ -1276,7 +1286,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
-                IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>(), .. mcpTools];
+                using var imageTool = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
+                    ? new ImageGenerationTool((prompt, token) => GenerateAndSendImageAsync(message, prompt, pending, token)) : null;
+                IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
                 IChatTool[] contextual = [.. builtIn, .. pluginTools];
                 var contextualTools = contextual.Length > 0 ? contextual : null;
@@ -1297,6 +1309,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 }
 
                 systemPrompt = ApplyOwnerPrompt(systemPrompt);
+                if (imageTool is not null) systemPrompt += "\n" + imageTool.SystemPrompt;
                 if (timer is not null) systemPrompt += "\n" + timer.SystemPrompt;
                 if (memoryTool is not null) systemPrompt += "\n" + memoryTool.SystemPrompt;
                 foreach (var tool in pluginTools)
