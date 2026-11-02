@@ -8,7 +8,7 @@ namespace ShiroBot.AiChatPlugin.Tools;
 /// 让模型从 MemePlugin 的本地表情库中挑选一张表情。工具只负责选中，不直接发送；
 /// 回复管线在最终文本确定后统一发送，避免工具副作用和空回复。
 /// </summary>
-internal sealed class MemeTool(IMemeToolService service, MessageEvent message, string usePolicy = "auto") : IChatTool
+internal sealed class MemeTool(IMemeToolService service, MessageEvent message, string usePolicy = "explicit") : IChatTool
 {
     public MemeSelectionInfo? Selected { get; private set; }
     public string? SuggestedCaption { get; private set; }

@@ -296,8 +296,8 @@ public sealed class MemeToolSection
     [ConfigField("私聊是否允许模型发表情；默认允许。私聊流式回复期间不会提供该工具。", Label = "私聊可用")]
     public bool AllowDirect { get; set; } = true;
 
-    [ConfigField("auto：轻松聊天时主动配表情，不必等用户明确要求；explicit：只在用户明确要求发表情/斗图时使用。", Label = "表情使用倾向")]
-    public string UsePolicy { get; set; } = "auto";
+    [ConfigField("explicit（默认）：只在用户明确要求发表情/斗图时使用；auto：轻松聊天时主动配表情，不必等用户明确要求。", Label = "表情使用倾向")]
+    public string UsePolicy { get; set; } = "explicit";
 }
 
 public sealed class McpSection

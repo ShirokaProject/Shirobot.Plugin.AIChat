@@ -374,8 +374,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         allow_proactive = false
         # 私聊是否允许模型发表情；私聊流式回复期间不会提供该工具
         allow_direct = true
-        # auto：轻松聊天时主动配表情；explicit：只在用户明确要求时
-        use_policy = "auto"
+        # explicit：只在用户明确要求时；auto：轻松聊天时主动配表情
+        use_policy = "explicit"
 
         [proactive]
         # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
@@ -1407,43 +1407,21 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 _globalConcurrency.Release();
                 holdsGlobal = false;
 
+                // 表情只是配图：文字照常走下面的回复管线，之后再单独发图。
+                // 模型只选了表情没写文字时，表情带上建议配文，并按设置 @/引用。
+                var memeSelection = memeTool?.Selected;
                 var memeSent = false;
-                if (memeTool?.Selected is { } memeSelection)
-                {
-                    var memeCaption = replyModes
+                if (memeSelection is not null &&
+                    string.IsNullOrWhiteSpace(replyModes
                         ? ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat).Text
-                        : assistantText;
-                    if (string.IsNullOrWhiteSpace(memeCaption))
-                        memeCaption = memeTool.SuggestedCaption ?? "";
-                    var target = new MemeSendTargetInfo(
-                        message.Platform,
-                        message.InstanceId,
-                        message.Channel.Type.ToString(),
-                        message.Channel.Id,
-                        message.MessageId,
-                        message.Sender.Id,
-                        !message.IsDirect,
-                        proactive is null && _config.Behaviour.ReplyWithMention,
-                        proactive is null && _config.Behaviour.ReplyWithQuote);
-                    try
-                    {
-                        var memeResult = await memeService!.SendAsync(memeSelection, target, memeCaption, ct)
-                            .ConfigureAwait(false);
-                        if (memeResult.Success)
-                        {
-                            memeSent = true;
-                            assistantText = memeCaption;
-                            BotLog.Info($"[AiChat] 已发送表情 {memeSelection.Id} 字数={memeCaption.Length}:\n{ForLog(memeCaption)}");
-                        }
-                        else
-                        {
-                            BotLog.Warning($"[AiChat] 表情发送失败，回退文字: {memeResult.Error}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        BotLog.Warning($"[AiChat] 表情发送异常，回退文字: {ex.Message}");
-                    }
+                        : assistantText))
+                {
+                    var memeCaption = memeTool!.SuggestedCaption ?? "";
+                    memeSent = await SendMemeAsync(memeService!, memeSelection, message, memeCaption,
+                        proactive is null, ct).ConfigureAwait(false);
+                    // 发送失败时回退为配文文字，不再重试发图。
+                    if (memeSent || memeCaption.Length > 0) assistantText = memeCaption;
+                    memeSelection = null;
                 }
 
                 if (!memeSent && replyModes)
@@ -1481,6 +1459,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     var delivered = await delivery.CompleteAsync(assistantText).ConfigureAwait(false);
                     if (!delivered) await ReplyAssistantAsync(message, isGroup, assistantText).ConfigureAwait(false);
                 }
+                if (memeSelection is not null)
+                    await SendMemeAsync(memeService!, memeSelection, message, "", false, ct).ConfigureAwait(false);
                 if (proactive is null && isGroup) _proactive.MarkReplied(ProactiveKey(message), DateTimeOffset.UtcNow);
 
                 // single 模式不保存历史
@@ -2694,6 +2674,38 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         if (baseMs == 0) return TimeSpan.Zero;
         var typingMs = Math.Min(next.EnumerateRunes().Count() * 60, 3000);
         return TimeSpan.FromMilliseconds(baseMs + typingMs);
+    }
+
+    /// <summary>发送选中的表情；失败只记日志，文字回复不受影响。</summary>
+    private async Task<bool> SendMemeAsync(
+        IMemeToolService service, MemeSelectionInfo selection, MessageEvent message, string caption,
+        bool decorate, CancellationToken ct)
+    {
+        var target = new MemeSendTargetInfo(
+            message.Platform,
+            message.InstanceId,
+            message.Channel.Type.ToString(),
+            message.Channel.Id,
+            message.MessageId,
+            message.Sender.Id,
+            !message.IsDirect,
+            decorate && _config.Behaviour.ReplyWithMention,
+            decorate && _config.Behaviour.ReplyWithQuote);
+        try
+        {
+            var result = await service.SendAsync(selection, target, caption, ct).ConfigureAwait(false);
+            if (result.Success)
+            {
+                BotLog.Info($"[AiChat] 已发送表情 {selection.Id} 配文字数={caption.Length}");
+                return true;
+            }
+            BotLog.Warning($"[AiChat] 表情发送失败: {result.Error}");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            BotLog.Warning($"[AiChat] 表情发送异常: {ex.Message}");
+        }
+        return false;
     }
 
     private async Task ReplyFoldableAsync(MessageEvent message, bool isGroup, string text, int threshold)

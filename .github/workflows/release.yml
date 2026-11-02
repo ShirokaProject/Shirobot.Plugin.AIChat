@@ -43,7 +43,7 @@ jobs:
           dotnet run --project scripts/version-check/VersionCheck.csproj -c Release -- \
             "$PUBLISH_DIR/ShiroBot.AiChatPlugin.dll" "$version" "${RELEASE_TAG#v}"
 
-      - name: Package plugin ZIP
+      - name: Collect Plugin DLL
         shell: bash
         run: |
           PROJECT="$(basename "$(ls *.csproj | head -1)" .csproj)"
@@ -57,25 +57,20 @@ jobs:
           unexpected_dlls=()
           for dll in "$PUBLISH_DIR"/*.dll; do
             [ -e "$dll" ] || continue
-            if [ "$dll" != "$PLUGIN_DLL" ]; then
-              unexpected_dlls+=("$dll")
-            fi
+            [ "$dll" = "$PLUGIN_DLL" ] || unexpected_dlls+=("$dll")
           done
           if [ "${#unexpected_dlls[@]}" -ne 0 ]; then
-            echo "Publish output contains unexpected DLLs:"
+            echo "Publish output contains DLLs other than the single-file plugin:"
             printf '%s\n' "${unexpected_dlls[@]}"
             exit 1
           fi
 
           mkdir -p release
           cp "$PLUGIN_DLL" release/
-          cd release
-          zip -9 ShiroBot.AiChatPlugin.zip ShiroBot.AiChatPlugin.dll
-          unzip -l ShiroBot.AiChatPlugin.zip
 
-      - name: Upload plugin ZIP to Release
+      - name: Upload DLL to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          files: release/ShiroBot.AiChatPlugin.zip
+          files: release/*.dll

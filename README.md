@@ -22,7 +22,8 @@ dotnet publish ShiroBot.AiChatPlugin.csproj -c Release
 发布目录只包含 `ShiroBot.AiChatPlugin.dll`，不再携带 `ShiroBot.Meme.Contracts.dll`。
 表情功能是可选的：安装 [Shirobot.Plugin.Meme](../Shirobot.Plugin.Meme) 后，宿主会把
 Meme 的共享契约加载到默认 AssemblyLoadContext；AIChat 检测到该契约和已注册的
-`IMemeService` 时自动启用 `send_meme`，未安装或未启用时自动跳过。
+`IMemeService` 时自动启用 `send_meme`，未安装或未启用时自动跳过。默认只在用户明确要求时发表情，
+`[tool_use.meme] use_policy = "auto"` 可让模型在轻松聊天时主动配图。
 
 Meme 契约只随 MemePlugin 安装，不需要复制到 `plugins/AiChatPlugin/`。
 
