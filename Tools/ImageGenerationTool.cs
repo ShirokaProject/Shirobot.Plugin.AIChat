@@ -7,7 +7,7 @@ internal sealed class ImageGenerationTool(Func<string, string?, string?, Cancell
 {
     private Task<string>? _result;
     public int MaxCallsPerTurn => 1;
-    public string SystemPrompt => "用户要求画图、生成图片或修改图片时调用 imagegen；本条消息有附图或引用图片时会把原图提交给编辑接口，请在 prompt 描述修改要求；无附图时生成新图。根据用户意图选择 size（横图 1536x1024、竖图 1024x1536、方图 1024x1024，或 auto）和 quality（auto/low/medium/high/xhigh/max）；没有要求时省略，沿用配置默认值。不要在闲聊或主动插话时生成。工具会直接发送图片，成功后简短回复即可，不要输出图片链接或 Base64。";
+    public string SystemPrompt => "用户要求画图、生成图片或修改图片时调用 imagegen；本条消息有附图或引用图片时会把原图提交给编辑接口，请在 prompt 描述修改要求；无附图时生成新图。根据用户意图选择 size（横图 1536x1024、竖图 1024x1536、方图 1024x1024，或 auto）和 quality（auto/low/medium/high/xhigh/max）；没有要求时省略，沿用配置默认值。不要在闲聊或主动插话时生成。工具只提交后台任务，立即返回排队状态；不能声称此时已经生成成功，告诉用户完成后会单独发图。工具参数不能混入之前聊天的内容；生图会使用用户当前这条消息的原文。提交后简短回复即可，不要输出图片链接或 Base64。";
     public OpenAiTool Definition { get; } = new() { Function = new() {
         Name = "imagegen", Description = "Generate and send one image when the user requests an image. May take several minutes.",
         Parameters = new { type = "object", required = new[] { "prompt" }, additionalProperties = false,

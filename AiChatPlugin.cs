@@ -155,6 +155,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         await _backgroundStop.CancelAsync().ConfigureAwait(false);
         // 先取消进行中的 AI 请求：主动回复的补判任务可能正在等待模型。
         await _pendingRequests.StopAsync().ConfigureAwait(false);
+        await _imageRequests.StopAsync().ConfigureAwait(false);
         Task[] recalls;
         lock (_backgroundGate) recalls = _recallTasks.ToArray();
         await Task.WhenAll(recalls).ConfigureAwait(false);
@@ -1131,7 +1132,9 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     private Task HandleMessageDeletedAsync(MessageDeletedEvent message)
     {
         if (message.Channel.Type == ChannelType.Group) ForgetRecalledGroupMessage(message);
-        return _config.Behaviour.CancelOnRecall ? _pendingRequests.CancelBeforeReplyAsync(message) : Task.CompletedTask;
+        return _config.Behaviour.CancelOnRecall
+            ? Task.WhenAll(_pendingRequests.CancelBeforeReplyAsync(message), _imageRequests.CancelBeforeReplyAsync(message))
+            : Task.CompletedTask;
     }
 
     private async Task ProcessAiAsync(MessageEvent message, ConversationKey key,
@@ -1288,7 +1291,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
                 using var imageTool = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
-                    ? new ImageGenerationTool((prompt, size, quality, token) => GenerateAndSendImageAsync(message, prompt, pending, token, size, quality, imageSources)) : null;
+                    ? new ImageGenerationTool((prompt, size, quality, token) =>
+                    { token.ThrowIfCancellationRequested(); return Task.FromResult(QueueImageGeneration(message, CurrentImagePrompt(message), size, quality)); }) : null;
                 IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
                 IChatTool[] contextual = [.. builtIn, .. pluginTools];

@@ -7,6 +7,7 @@ using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
+using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.SDK.Adapter;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
@@ -21,7 +22,10 @@ internal static class ImageGenerationChecks
         var port = Random.Shared.Next(20000, 40000);
         listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
         var calls = 0; var forbidden = false;
-        string? lastSize = null, lastQuality = null;
+        string? lastSize = null, lastQuality = null, lastPrompt = null;
+        var holdImage = false;
+        var imageStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseImage = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var serve = Task.Run(async () =>
         {
             while (listener.IsListening)
@@ -36,6 +40,8 @@ internal static class ImageGenerationChecks
                 using var json = JsonDocument.Parse(await reader.ReadToEndAsync());
                 Check(json.RootElement.GetProperty("model").GetString() == "gpt-image-2.5-sunburst" &&
                     json.RootElement.GetProperty("n").GetInt32() == 1 && !json.RootElement.TryGetProperty("response_format", out _), "Image request mismatch.");
+                lastPrompt = json.RootElement.GetProperty("prompt").GetString();
+                if (holdImage) { imageStarted.TrySetResult(); await releaseImage.Task; }
                 lastSize = json.RootElement.GetProperty("size").GetString();
                 lastQuality = json.RootElement.GetProperty("quality").GetString();
                 var bytes = Encoding.UTF8.GetBytes("{\"data\":[{\"b64_json\":\"" + Convert.ToBase64String(png) + "\"}]}");
@@ -75,9 +81,18 @@ internal static class ImageGenerationChecks
             return null;
         };
         var supportReaction = true;
+        var jobs = new List<Task>();
+        using var stopping = new CancellationTokenSource();
+        var lifetime = DispatchProxy.Create<IPluginLifetime, TestProxy>();
+        ((TestProxy)(object)lifetime).Call = (method, args) =>
+        {
+            if (method.Name == "get_Stopping") return stopping.Token;
+            if (method.Name == "Run") { var task = Task.Run(() => ((Func<CancellationToken, Task>)args![0]!)(stopping.Token)); jobs.Add(task); return task; }
+            return null;
+        };
         var bot = DispatchProxy.Create<IBotContext, TestProxy>();
         ((TestProxy)(object)bot).Call = (method, _) => method.Name switch {
-            "get_Message" => messages, "UseInstance" => null, "CreateTempDirectory" => AllocateTemp(),
+            "get_Message" => messages, "get_Lifetime" => lifetime, "UseInstance" => null, "CreateTempDirectory" => AllocateTemp(),
             "GetAdapterExtension" => supportReaction ? reaction : null, _ => null };
         var plugin = new AiChatPlugin();
         typeof(AiChatPlugin).GetField("_config", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(plugin, config);
@@ -115,6 +130,24 @@ internal static class ImageGenerationChecks
             "Failed send must retain generated file and retract progress message.");
         config.ToolUse.ImageGen.Enabled = false;
         Check(await Generate("cat", null, null, CancellationToken.None) == "生图功能未启用。" && calls == 4, "Disabled generation called upstream.");
+        config.ToolUse.ImageGen.Enabled = true; sendFails = false; holdImage = true;
+        using var fetcher = new ResourceFetcher(5, 10000, 10000, "");
+        typeof(AiChatPlugin).GetField("_fetcher", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, fetcher);
+        typeof(AiChatPlugin).GetField("_cache", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, new ResourceCache(tempRoot, "cache", 1));
+        var queue = typeof(AiChatPlugin).GetMethod("QueueImageGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var request = message with { Segments = [new TextSegment("#ai 画一只白猫")] };
+        var cleanPrompt = AiChatPlugin.CurrentImagePrompt(request);
+        Check(cleanPrompt == "画一只白猫", "Image prompt must use only current user text.");
+        var queued = (string)queue.Invoke(plugin, [request, cleanPrompt, null, null])!;
+        Check(queued.Contains("后台"), "Image queue must return immediately.");
+        await imageStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Check(!jobs.Single().IsCompleted && lastPrompt == cleanPrompt, "Job must stay independent while upstream is blocked, without history rewrite.");
+        Check(((string)queue.Invoke(plugin, [request, cleanPrompt, null, null])!).Contains("已有"), "Same message must not queue duplicate jobs.");
+        // Unrelated work can complete while the image job is still waiting.
+        await Task.Run(() => Check(!jobs.Single().IsCompleted, "Background job unexpectedly completed."));
+        releaseImage.TrySetResult();
+        await Task.WhenAll(jobs).WaitAsync(TimeSpan.FromSeconds(5));
+        Check(calls == 5 && !File.Exists(paths.Last()), "Background job did not deliver exactly once and clean its file.");
         listener.Stop(); await serve;
         Directory.Delete(tempRoot, recursive: true);
         Console.WriteLine("PASS: image generation provider request, one-image delivery, reaction cleanup, text fallback, retry deduplication, cancellation and enabled switch");

@@ -12,22 +12,68 @@ public sealed partial class AiChatPlugin
 {
     private readonly SemaphoreSlim _imageGenerationGate = new(1, 1);
 
-    private async Task HandleImageGenAsync(MessageEvent message)
+    private readonly PendingAiRequests _imageRequests = new();
+
+    private Task HandleImageGenAsync(MessageEvent message)
     {
         var text = message.GetPlainText().Trim();
-        if (text.Length > 9 && !char.IsWhiteSpace(text[9])) return;
+        if (text.Length > 9 && !char.IsWhiteSpace(text[9])) return Task.CompletedTask;
         var prompt = text.Length > 9 ? text[9..].Trim() : "";
-        if (prompt.Length == 0) { await ReplyAsync(message, !message.IsDirect, "用法：#imagegen 提示词"); return; }
-        using var pending = _pendingRequests.Register(message);
+        if (prompt.Length == 0) return ReplyAsync(message, !message.IsDirect, "用法：#imagegen 提示词");
+        var result = QueueImageGeneration(message, prompt, null, null);
+        return result == ImageJobQueued ? Task.CompletedTask : ReplyAsync(message, !message.IsDirect, result);
+    }
+
+    private const string ImageJobQueued = "生图任务已提交后台，完成后会单独发送图片。请勿声称已经生成成功；其他聊天可以继续。";
+
+    internal static string CurrentImagePrompt(MessageEvent message)
+    {
+        // Deliberately use the current user's own text, not the tool's history-influenced rewrite.
+        var text = message.GetPlainText().Trim();
+        foreach (var prefix in new[] { "#imagegen", "#ai" })
+            if (text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                (text.Length == prefix.Length || char.IsWhiteSpace(text[prefix.Length])))
+                return text[prefix.Length..].Trim();
+        return text;
+    }
+
+    private string QueueImageGeneration(MessageEvent message, string prompt, string? size, string? quality)
+    {
+        if (!_config.ToolUse.ImageGen.Enabled) return "生图功能未启用。";
+        if (string.IsNullOrWhiteSpace(prompt) || prompt.Length > 32000) return "请在当前消息写清生图要求（最多 32000 字符）。";
+        PendingAiRequest pending;
+        try { pending = _imageRequests.Register(message); }
+        catch (InvalidOperationException) { return "这条消息已有生图任务，请等待完成。"; }
         try
         {
-            if (!_config.ToolUse.ImageGen.Enabled) { await ReplyAsync(message, !message.IsDirect, "生图功能未启用。"); return; }
-            var parts = await new ResourceCollector(Context, _fetcher, _cache, _config.Resources).CollectAsync(message, pending.Token).ConfigureAwait(false);
-            var result = await GenerateAndSendImageAsync(message, prompt, pending, pending.Token, images: parts.OfType<ImagePart>().ToArray()).ConfigureAwait(false);
-            if (result != "图片已生成并发送。" && pending.TryBeginReply())
-                await ReplyAsync(message, !message.IsDirect, result).ConfigureAwait(false);
+            _ = Context.Lifetime.Run(async stopping =>
+            {
+                using (pending)
+                using (var stop = CancellationTokenSource.CreateLinkedTokenSource(stopping, pending.Token))
+                {
+                    try
+                    {
+                        using var instance = string.IsNullOrWhiteSpace(message.InstanceId) ? null : Context.UseInstance(message.InstanceId);
+                        // Downloads are part of the background job, not the chat turn or adapter dispatch.
+                        var parts = await new ResourceCollector(Context, _fetcher, _cache, _config.Resources)
+                            .CollectAsync(message, stop.Token).ConfigureAwait(false);
+                        var result = await GenerateAndSendImageAsync(message, prompt, pending, stop.Token, size, quality,
+                            parts.OfType<ImagePart>().ToArray()).ConfigureAwait(false);
+                        if (result != "图片已生成并发送。" && pending.TryBeginReply())
+                            await ReplyAsync(message, !message.IsDirect, result).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+                    catch (Exception ex)
+                    {
+                        BotLog.Warning($"[AiChat] 后台生图失败：{ex.GetType().Name}");
+                        if (!stop.IsCancellationRequested && pending.TryBeginReply())
+                            await ReplyAsync(message, !message.IsDirect, "生图任务失败，请重新附图或检查接口。").ConfigureAwait(false);
+                    }
+                }
+            });
         }
-        catch (OperationCanceledException) when (pending.Token.IsCancellationRequested) { }
+        catch { pending.Dispose(); throw; }
+        return ImageJobQueued;
     }
 
     private async Task<string> GenerateAndSendImageAsync(MessageEvent message, string prompt, PendingAiRequest pending, CancellationToken ct, string? size = null, string? quality = null, IReadOnlyList<ImagePart>? images = null)
