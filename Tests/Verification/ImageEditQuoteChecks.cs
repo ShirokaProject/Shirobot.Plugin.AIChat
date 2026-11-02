@@ -6,6 +6,7 @@ using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
+using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
@@ -56,6 +57,22 @@ internal static class ImageEditQuoteChecks
                 throw new Exception("Quoted content lost its original author or current-user boundary.");
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+        var selected = Array.Empty<int>(); var newCalls = 0; var editCalls = 0;
+        using var tool = new ImageGenerationTool((p, size, quality, token) => { newCalls++; return Task.FromResult("new"); },
+            (ids, p, size, quality, token) => { selected = ids; editCalls++; return Task.FromResult("edit queued"); },
+            "\n历史图片 1：上一张生成图；2：用户此前上传的图片");
+        if (!tool.SystemPrompt.Contains("此前上传") ||
+            !(await tool.ExecuteAsync("{\"prompt\":\"改背景\",\"reference_images\":[9]}")).Contains("Invalid"))
+            throw new Exception("Historical reference catalog or range validation failed.");
+        var edit = await tool.ExecuteAsync("{\"prompt\":\"改背景\",\"reference_images\":[2,1,2]}");
+        await tool.ExecuteAsync("{\"prompt\":\"重试\",\"reference_images\":[1]}");
+        if (edit != "edit queued" || !selected.SequenceEqual(new[] { 2, 1 }) || editCalls != 1 || newCalls != 0)
+            throw new Exception("History images must be selected explicitly, deduplicated, and reused on retries.");
+        using var freshTool = new ImageGenerationTool((p, size, quality, token) => { newCalls++; return Task.FromResult("new"); },
+            (ids, p, size, quality, token) => { editCalls++; return Task.FromResult("edit"); }, "历史图片存在");
+        if (await freshTool.ExecuteAsync("{\"prompt\":\"画一张无关的新图\",\"reference_images\":[]}") != "new" || newCalls != 1 || editCalls != 1)
+            throw new Exception("Available history must not force image editing when references are omitted or empty.");
+        Console.WriteLine("PASS: explicit historical image selection, invalid ID rejection and retry deduplication");
         Console.WriteLine("PASS: multipart image edit preserves reference bytes; quoted messages retain original author and current-user boundaries");
     }
 }

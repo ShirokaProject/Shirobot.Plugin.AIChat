@@ -1290,9 +1290,23 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                     // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
+                var historyImages = (convo?.Turns ?? []).SelectMany(turn => turn.Parts.OfType<ImagePart>()
+                    .Select(image => (Image: image, Turn: turn))).Reverse().Take(8).ToArray();
+                var imageCatalog = historyImages.Length == 0 ? "\n当前没有可用历史图片。" :
+                    "\n当前会话历史图片（1 为最近一张，只能引用这些编号）：\n" +
+                    string.Join("\n", historyImages.Select((item, index) => $"{index + 1}: {item.Turn.Role}, {item.Turn.Timestamp}, " +
+                        string.Join(" ", item.Turn.Parts.OfType<TextPart>().Select(text => text.Text)).Take(160).Aggregate("", (a, ch) => a + ch)));
+                Task<string> QueueImage(string? size, string? quality, ImagePart[]? references = null)
+                    => Task.FromResult(QueueImageGeneration(message, CurrentImagePrompt(message), size, quality, references, convo?.Key));
                 using var imageTool = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
                     ? new ImageGenerationTool((prompt, size, quality, token) =>
-                    { token.ThrowIfCancellationRequested(); return Task.FromResult(QueueImageGeneration(message, CurrentImagePrompt(message), size, quality)); }) : null;
+                        { token.ThrowIfCancellationRequested(); return QueueImage(size, quality); },
+                        (ids, prompt, size, quality, token) =>
+                        {
+                            token.ThrowIfCancellationRequested();
+                            if (ids.Any(id => id > historyImages.Length)) return Task.FromResult("历史图片编号不存在，请用户重新附图。");
+                            return QueueImage(size, quality, ids.Select(id => historyImages[id - 1].Image).ToArray());
+                        }, imageCatalog) : null;
                 IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
                 IChatTool[] contextual = [.. builtIn, .. pluginTools];

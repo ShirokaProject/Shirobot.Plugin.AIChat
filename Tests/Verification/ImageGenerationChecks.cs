@@ -104,7 +104,7 @@ internal static class ImageGenerationChecks
             Sender = new User("u"), MessageId = "m", Segments = [] };
         var method = typeof(AiChatPlugin).GetMethod("GenerateAndSendImageAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
         async Task<string> Generate(string prompt, string? size, string? quality, CancellationToken ct)
-        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct, size, quality, null])!; }
+        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct, size, quality, null, null])!; }
         using var tool = new ImageGenerationTool(Generate);
         Check(await tool.ExecuteAsync("{\"prompt\":\"一只猫\",\"size\":\"1536x1024\",\"quality\":\"high\"}") == "图片已生成并发送。", "Image tool failed.");
         Check(lastSize == "1536x1024" && lastQuality == "high", "Tool size and quality were not forwarded.");
@@ -138,11 +138,11 @@ internal static class ImageGenerationChecks
         var request = message with { Segments = [new TextSegment("#ai 画一只白猫")] };
         var cleanPrompt = AiChatPlugin.CurrentImagePrompt(request);
         Check(cleanPrompt == "画一只白猫", "Image prompt must use only current user text.");
-        var queued = (string)queue.Invoke(plugin, [request, cleanPrompt, null, null])!;
+        var queued = (string)queue.Invoke(plugin, [request, cleanPrompt, null, null, null, null])!;
         Check(queued.Contains("后台"), "Image queue must return immediately.");
         await imageStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check(!jobs.Single().IsCompleted && lastPrompt == cleanPrompt, "Job must stay independent while upstream is blocked, without history rewrite.");
-        Check(((string)queue.Invoke(plugin, [request, cleanPrompt, null, null])!).Contains("已有"), "Same message must not queue duplicate jobs.");
+        Check(((string)queue.Invoke(plugin, [request, cleanPrompt, null, null, null, null])!).Contains("已有"), "Same message must not queue duplicate jobs.");
         // Unrelated work can complete while the image job is still waiting.
         await Task.Run(() => Check(!jobs.Single().IsCompleted, "Background job unexpectedly completed."));
         releaseImage.TrySetResult();

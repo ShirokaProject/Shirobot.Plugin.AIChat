@@ -37,7 +37,7 @@ public sealed partial class AiChatPlugin
         return text;
     }
 
-    private string QueueImageGeneration(MessageEvent message, string prompt, string? size, string? quality)
+    private string QueueImageGeneration(MessageEvent message, string prompt, string? size, string? quality, IReadOnlyList<ImagePart>? references = null, ConversationKey? conversationKey = null)
     {
         if (!_config.ToolUse.ImageGen.Enabled) return "生图功能未启用。";
         if (string.IsNullOrWhiteSpace(prompt) || prompt.Length > 32000) return "请在当前消息写清生图要求（最多 32000 字符）。";
@@ -58,7 +58,7 @@ public sealed partial class AiChatPlugin
                         var parts = await new ResourceCollector(Context, _fetcher, _cache, _config.Resources)
                             .CollectAsync(message, stop.Token).ConfigureAwait(false);
                         var result = await GenerateAndSendImageAsync(message, prompt, pending, stop.Token, size, quality,
-                            parts.OfType<ImagePart>().ToArray()).ConfigureAwait(false);
+                            [.. parts.OfType<ImagePart>(), .. references ?? []], conversationKey).ConfigureAwait(false);
                         if (result != "图片已生成并发送。" && pending.TryBeginReply())
                             await ReplyAsync(message, !message.IsDirect, result).ConfigureAwait(false);
                     }
@@ -76,7 +76,7 @@ public sealed partial class AiChatPlugin
         return ImageJobQueued;
     }
 
-    private async Task<string> GenerateAndSendImageAsync(MessageEvent message, string prompt, PendingAiRequest pending, CancellationToken ct, string? size = null, string? quality = null, IReadOnlyList<ImagePart>? images = null)
+    private async Task<string> GenerateAndSendImageAsync(MessageEvent message, string prompt, PendingAiRequest pending, CancellationToken ct, string? size = null, string? quality = null, IReadOnlyList<ImagePart>? images = null, ConversationKey? conversationKey = null)
     {
         var defaults = _config.ToolUse.ImageGen;
         var config = new Config.ImageGenerationSection { Enabled = defaults.Enabled, Model = defaults.Model,
@@ -130,6 +130,25 @@ public sealed partial class AiChatPlugin
                 {
                     BotLog.Warning($"[AiChat] 生图已完成但发送失败，原图暂存：{outputPath}");
                     return "图片已生成，但发送失败；原图已暂存一小时，请管理员检查适配器上传。";
+                }
+                if (conversationKey is { } historyKey)
+                {
+                    try
+                    {
+                        var cached = await _cache.StoreAsync(image, MimeGuesser.ExtensionForMime(outputMime), outputMime).ConfigureAwait(false);
+                        if (cached is not null)
+                        {
+                            var state = await _conversations.AcquireAsync(historyKey, ct).ConfigureAwait(false);
+                            try
+                            {
+                                state.Turns.Add(new ChatTurn("assistant", [new TextPart("[生成图片：" + prompt + "]"),
+                                    new ImagePart(cached, outputMime, image.Length)], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                                await _conversations.RewriteAsync(state).ConfigureAwait(false);
+                            }
+                            finally { _conversations.Release(historyKey); }
+                        }
+                    }
+                    catch (Exception ex) { BotLog.Warning($"[AiChat] 保存生成图片上下文失败：{ex.GetType().Name}"); }
                 }
                 try { File.Delete(outputPath); }
                 catch (Exception ex) { BotLog.Warning($"[AiChat] 清理已发送图片失败：{ex.GetType().Name}，宿主会自动过期清理。"); }
