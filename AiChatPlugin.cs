@@ -1,5 +1,6 @@
 
 using System.Text;
+using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
@@ -367,15 +368,13 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         max_entries = 50
         max_entry_chars = 200
 
-        [tool_use.meme]
-        # 向模型提供 send_meme，从 MemePlugin 的本地表情库挑选并发送；需要安装并启用 MemePlugin
+        [tool_use.plugin_tools]
+        # 向模型提供其他插件以 chat.tool.* 注册的工具（例如 MemePlugin 的 send_meme）；需要宿主 1.0.3
         enabled = true
-        # 主动插话时也允许发表情；默认关闭，避免刷屏
+        # 主动插话时也提供；默认关闭，避免刷屏
         allow_proactive = false
-        # 私聊是否允许模型发表情；私聊流式回复期间不会提供该工具
-        allow_direct = true
-        # explicit：只在用户明确要求时；auto：轻松聊天时主动配表情
-        use_policy = "explicit"
+        # 不提供的工具名称，例如 ["send_meme"]
+        disabled = []
 
         [proactive]
         # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
@@ -1264,16 +1263,9 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
-                // 表情工具只负责选图，文字回复后再单独发图，任何回复模式都可用。
-                // 流式回复无法撤回已推送的文本，因此不提供。
-                var memeService = _config.ToolUse.Enabled && _config.ToolUse.Meme.Enabled &&
-                                  (proactive is null || _config.ToolUse.Meme.AllowProactive) &&
-                                  (!message.IsDirect || _config.ToolUse.Meme.AllowDirect) &&
-                                  !delivery.IsStreaming
-                    ? MemeServiceBridge.TryCreate(Context.Services)
-                    : null;
-                using var memeTool = memeService is null ? null : new MemeTool(memeService, message, _config.ToolUse.Meme.UsePolicy);
-                IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool, memeTool }.OfType<IChatTool>(), .. mcpTools];
+                IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>(), .. mcpTools];
+                var pluginTools = PluginToolsFor(message, proactive, builtIn);
+                IChatTool[] contextual = [.. builtIn, .. pluginTools];
                 var contextualTools = contextual.Length > 0 ? contextual : null;
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
                 var systemPrompt = isSharedMode && convo?.SharedPrompt is not null
@@ -1294,7 +1286,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 systemPrompt = ApplyOwnerPrompt(systemPrompt);
                 if (timer is not null) systemPrompt += "\n" + timer.SystemPrompt;
                 if (memoryTool is not null) systemPrompt += "\n" + memoryTool.SystemPrompt;
-                if (memeTool is not null) systemPrompt += "\n" + memeTool.SystemPrompt;
+                foreach (var tool in pluginTools)
+                    if (!string.IsNullOrWhiteSpace(tool.SystemPrompt)) systemPrompt += "\n" + tool.SystemPrompt;
                 if (mcpTools.Count > 0) systemPrompt += "\n" + McpChatTool.Prompt;
                 if (replyModes) systemPrompt += "\n" + (forceChat ? ParsedReply.ChatOnlyPrompt : ParsedReply.SystemPrompt);
                 systemPrompt = OfficialReplyDelivery.ApplyPromptPolicy(systemPrompt, _config.Behaviour.UseMarkdown);
@@ -1408,24 +1401,22 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 _globalConcurrency.Release();
                 holdsGlobal = false;
 
-                // 表情只是配图：文字照常走下面的回复管线，之后再单独发图。
-                // 模型只选了表情没写文字时，表情带上建议配文，并按设置 @/引用。
-                var memeSelection = memeTool?.Selected;
-                var memeSent = false;
-                if (memeSelection is not null &&
-                    string.IsNullOrWhiteSpace(replyModes
-                        ? ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat).Text
-                        : assistantText))
+                // 插件工具要求的后续动作（例如发表情）在文字回复之后执行；模型没写文字时只执行后续动作，
+                // 并由它负责 @/引用。
+                var followUps = pluginTools.SelectMany(tool => tool.FollowUps).ToList();
+                var textless = followUps.Count > 0 && string.IsNullOrWhiteSpace(replyModes
+                    ? ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat).Text
+                    : assistantText);
+                if (textless)
                 {
-                    var memeCaption = memeTool!.SuggestedCaption ?? "";
-                    memeSent = await SendMemeAsync(memeService!, memeSelection, message, memeCaption,
-                        proactive is null, ct).ConfigureAwait(false);
-                    // 发送失败时回退为配文文字，不再重试发图。
-                    if (memeSent || memeCaption.Length > 0) assistantText = memeCaption;
-                    memeSelection = null;
+                    // 流式回复没有可发的文字，收起已开始的流再交给后续动作。
+                    await delivery.AbandonStreamAsync().ConfigureAwait(false);
+                    var history = await RunFollowUpsAsync(followUps, message, proactive, textSent: false, ct).ConfigureAwait(false);
+                    assistantText = history;
+                    followUps.Clear();
                 }
 
-                if (!memeSent && replyModes)
+                if (!textless && replyModes)
                 {
                     var reply = ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat);
                     // 主动插话可能回应的是这批新消息里的任意一条，不引用，避免引错人。
@@ -1444,7 +1435,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                         await ReplyFoldableAsync(message, isGroup, reply.Text, _config.Behaviour.AnswerFoldAboveChars).ConfigureAwait(false);
                     }
                 }
-                else if (!memeSent && proactive is not null)
+                else if (!textless && proactive is not null)
                 {
                     // 主动插话像群友一样直接发，不引用也不 @ 触发的那条消息。
                     BotLog.Info($"[AiChat] 主动回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
@@ -1454,14 +1445,14 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     else
                         await SendChatMessagesAsync(message, isGroup, delivery, new ParsedReply(ReplyMode.Chat, false, assistantText, [assistantText])).ConfigureAwait(false);
                 }
-                else if (!memeSent)
+                else if (!textless)
                 {
                     BotLog.Info($"[AiChat] 回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
                     var delivered = await delivery.CompleteAsync(assistantText).ConfigureAwait(false);
                     if (!delivered) await ReplyAssistantAsync(message, isGroup, assistantText).ConfigureAwait(false);
                 }
-                if (memeSelection is not null)
-                    await SendMemeAsync(memeService!, memeSelection, message, "", false, ct).ConfigureAwait(false);
+                if (followUps.Count > 0)
+                    await RunFollowUpsAsync(followUps, message, proactive, textSent: true, ct).ConfigureAwait(false);
                 if (proactive is null && isGroup) _proactive.MarkReplied(ProactiveKey(message), DateTimeOffset.UtcNow);
 
                 // single 模式不保存历史
@@ -2677,36 +2668,62 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         return TimeSpan.FromMilliseconds(baseMs + typingMs);
     }
 
-    /// <summary>发送选中的表情；失败只记日志，文字回复不受影响。</summary>
-    private async Task<bool> SendMemeAsync(
-        IMemeToolService service, MemeSelectionInfo selection, MessageEvent message, string caption,
-        bool decorate, CancellationToken ct)
+    /// <summary>其他插件提供的工具；宿主不支持或已关闭时为空。名称与内置工具冲突的跳过。</summary>
+    private List<PluginChatTool> PluginToolsFor(MessageEvent message, ProactiveRequest? proactive, IEnumerable<IChatTool> builtIn)
     {
-        var target = new MemeSendTargetInfo(
-            message.Platform,
-            message.InstanceId,
-            message.Channel.Type.ToString(),
-            message.Channel.Id,
-            message.MessageId,
-            message.Sender.Id,
-            !message.IsDirect,
-            decorate && _config.Behaviour.ReplyWithMention,
-            decorate && _config.Behaviour.ReplyWithQuote);
-        try
+        var config = _config.ToolUse.PluginTools;
+        if (!_config.ToolUse.Enabled || !config.Enabled || proactive is not null && !config.AllowProactive) return [];
+        var reserved = new HashSet<string>(_tools.Names.Concat(builtIn.Select(tool => tool.Definition.Function.Name)), StringComparer.Ordinal);
+        return PluginChatTool.Discover(Context.Services, ToolContext(message, proactive), reserved, config.Disabled);
+    }
+
+    /// <summary>传给插件工具的会话信息，提供方据此选择内容或自行发送消息。</summary>
+    private static JsonObject ToolContext(MessageEvent message, ProactiveRequest? proactive) => new()
+    {
+        ["platform"] = message.Platform,
+        ["instance_id"] = message.InstanceId,
+        ["channel_type"] = message.Channel.Type.ToString(),
+        ["channel_id"] = message.Channel.Id,
+        ["message_id"] = message.MessageId,
+        ["sender_id"] = message.Sender.Id,
+        ["is_group"] = !message.IsDirect,
+        ["proactive"] = proactive is not null
+    };
+
+    /// <summary>
+    /// 依次调用插件工具要求的后续服务。没有发出文字时，由第一个后续动作按设置 @/引用触发消息。
+    /// 返回提供方给出的 <c>history</c> 文本，用于写入历史；失败只记日志。
+    /// </summary>
+    private async Task<string> RunFollowUpsAsync(List<PluginToolFollowUp> followUps, MessageEvent message,
+        ProactiveRequest? proactive, bool textSent, CancellationToken ct)
+    {
+        var history = new List<string>();
+        for (var i = 0; i < followUps.Count; i++)
         {
-            var result = await service.SendAsync(selection, target, caption, ct).ConfigureAwait(false);
-            if (result.Success)
+            var decorate = !textSent && i == 0 && proactive is null;
+            try
             {
-                BotLog.Info($"[AiChat] 已发送表情 {selection.Id} 配文字数={caption.Length}");
-                return true;
+                var result = await Context.Services.CallAsync(followUps[i].Service, new JsonObject
+                {
+                    ["arguments"] = followUps[i].Arguments?.DeepClone(),
+                    ["context"] = ToolContext(message, proactive),
+                    ["reply"] = new JsonObject
+                    {
+                        ["text_sent"] = textSent,
+                        ["mention"] = decorate && _config.Behaviour.ReplyWithMention,
+                        ["quote"] = decorate && _config.Behaviour.ReplyWithQuote
+                    }
+                }, ct).ConfigureAwait(false);
+                if (result?["history"] is JsonValue value && value.TryGetValue<string>(out var text) && text.Length > 0)
+                    history.Add(text);
+                BotLog.Info($"[AiChat] 插件工具后续动作完成: {followUps[i].Service}");
             }
-            BotLog.Warning($"[AiChat] 表情发送失败: {result.Error}");
+            catch (Exception ex) when (ex is PluginServiceUnavailableException or PluginServiceException)
+            {
+                BotLog.Warning($"[AiChat] 插件工具后续动作失败: {followUps[i].Service} - {ex.Message}");
+            }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            BotLog.Warning($"[AiChat] 表情发送异常: {ex.Message}");
-        }
-        return false;
+        return string.Join("\n", history);
     }
 
     private async Task ReplyFoldableAsync(MessageEvent message, bool isGroup, string text, int threshold)

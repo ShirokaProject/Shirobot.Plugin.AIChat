@@ -2,6 +2,7 @@ using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
@@ -411,45 +412,63 @@ await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
 await IdentityScopeChecks.RunAsync();
 
-// Meme tool only selects; the reply pipeline sends. Verify the tool contract and selection state.
+// Plugin tools: discovered by the chat.tool. prefix, called with arguments and context, follow-ups kept for after the reply.
 {
-    var service = new FakeMemeService();
-    var memeMessage = new MessageEvent
+    var services = new FakePluginServices();
+    services.Tools["chat.tool.send_meme"] = new PluginServiceInfo("chat.tool.send_meme", "MemePlugin", new JsonObject
     {
-        Platform = "qq",
-        InstanceId = "test",
-        SelfId = "bot",
-        MessageId = "m1",
-        Channel = Channel.Group("g1"),
-        Sender = new User("u1"),
-        Segments = [new TextSegment("发个猫猫")],
+        ["description"] = "Send a meme.",
+        ["prompt"] = "Use memes sparingly.",
+        ["parameters"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject { ["query"] = new JsonObject { ["type"] = "string" } } }
+    });
+    services.Tools["chat.tool.web_fetch"] = new PluginServiceInfo("chat.tool.web_fetch", "Other", new JsonObject { ["description"] = "Clashes with a built-in." });
+    services.Tools["chat.tool.bad name"] = new PluginServiceInfo("chat.tool.bad name", "Other", new JsonObject { ["description"] = "Invalid name." });
+    services.Tools["chat.tool.no_description"] = new PluginServiceInfo("chat.tool.no_description", "Other", null);
+    services.Results["chat.tool.send_meme"] = new JsonObject
+    {
+        ["content"] = "selected",
+        ["after_reply"] = new JsonObject { ["service"] = "meme.send", ["arguments"] = new JsonObject { ["id"] = "m1" } }
     };
-    using var tool = new MemeTool(service, memeMessage);
-    using var autoTool = new MemeTool(service, memeMessage, "auto");
-    using var explicitTool = new MemeTool(service, memeMessage, "explicit");
-    Check(autoTool.SystemPrompt.Contains("不需要等用户明确要求", StringComparison.Ordinal),
-        "MemeTool auto policy should encourage proactive use.");
-    Check(explicitTool.SystemPrompt.Contains("用户没有明确要求时不要主动发", StringComparison.Ordinal),
-        "MemeTool explicit policy should require an explicit request.");
-    var result = await tool.ExecuteAsync("""{"query":"猫","emotion":"happy"}""");
-    Check(tool.Selected is not null && tool.Selected.Id == "m1", "MemeTool must retain the selected meme.");
-    Check(result.Contains("selected", StringComparison.OrdinalIgnoreCase), "MemeTool must report selection without sending.");
-    Check(tool.Definition.Function.Name == "send_meme", "MemeTool definition name.");
-    var definitionJson = PluginJson.Serialize(tool.Definition);
-    Check(definitionJson.Contains("send_meme") && definitionJson.Contains("emotion"),
-        "MemeTool definition serializes.");
-    Console.WriteLine("PASS: meme tool selection contract");
+    var toolContext = new JsonObject { ["channel_id"] = "g1" };
+    var tools = PluginChatTool.Discover(services, toolContext, new HashSet<string> { "web_fetch" }, []);
+    Check(tools is [{ Definition.Function.Name: "send_meme", SystemPrompt: "Use memes sparingly.", MaxCallsPerTurn: 1 }],
+        "Plugin tools must skip clashing, invalid and undescribed services.");
+    Check(tools[0].Definition.Function.Description == "[MemePlugin] Send a meme.", "Plugin tool descriptions name their provider.");
+    Check(PluginChatTool.Discover(services, toolContext, new HashSet<string>(), ["SEND_MEME"]).All(tool => tool.Definition.Function.Name != "send_meme"),
+        "Disabled plugin tools must not be offered.");
+    var result = await tools[0].ExecuteAsync("""{"query":"猫"}""");
+    var call = services.Calls.Single();
+    Check(result == "selected" && call.Name == "chat.tool.send_meme" &&
+          (string?)call.Arguments?["arguments"]?["query"] == "猫" && (string?)call.Arguments?["context"]?["channel_id"] == "g1",
+        "Plugin tools must pass the model's arguments and the conversation context.");
+    Check(tools[0].FollowUps is [{ Service: "meme.send" } followUp] && (string?)followUp.Arguments?["id"] == "m1",
+        "Plugin tools must keep after_reply follow-ups.");
+    services.Results.Clear();
+    Check((await tools[0].ExecuteAsync("{}")).Contains("not available", StringComparison.Ordinal),
+        "A provider that went away must turn into a text reply.");
+    Console.WriteLine("PASS: plugin tool discovery, calls, follow-ups and unavailable providers");
 }
 
-sealed class FakeMemeService : IMemeToolService
+sealed class FakePluginServices : IPluginServices
 {
-    public Task<MemeSelectionInfo?> SelectAsync(string query, string? emotion, string? channelId,
-        string? userId, int limit, CancellationToken cancellationToken = default) =>
-        Task.FromResult<MemeSelectionInfo?>(new MemeSelectionInfo("m1", "猫猫", ["猫"], new object()));
+    public Dictionary<string, PluginServiceInfo> Tools { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, JsonNode?> Results { get; } = new(StringComparer.Ordinal);
+    public List<(string Name, JsonNode? Arguments)> Calls { get; } = [];
 
-    public Task<MemeSendResultInfo> SendAsync(MemeSelectionInfo selection, MemeSendTargetInfo target,
-        string? caption, CancellationToken cancellationToken = default) =>
-        Task.FromResult(new MemeSendResultInfo(true));
+    public object? GetService(Type serviceType) => null;
+    public void RegisterSingleton<TService>(TService service) where TService : class { }
+    public TService? GetService<TService>() where TService : class => null;
+    public TService GetRequiredService<TService>() where TService : class => throw new InvalidOperationException();
+    public IReadOnlyList<PluginServiceInfo> Find(string prefix) =>
+        [.. Tools.Values.Where(tool => tool.Name.StartsWith(prefix, StringComparison.Ordinal)).OrderBy(tool => tool.Name, StringComparer.Ordinal)];
+
+    public Task<JsonNode?> CallAsync(string name, JsonNode? arguments = null, CancellationToken cancellationToken = default)
+    {
+        Calls.Add((name, arguments));
+        return Results.TryGetValue(name, out var result)
+            ? Task.FromResult(result?.DeepClone())
+            : throw new PluginServiceUnavailableException(name);
+    }
 }
 
 sealed class StubHandler : HttpMessageHandler
