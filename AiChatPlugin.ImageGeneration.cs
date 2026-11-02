@@ -72,9 +72,28 @@ public sealed partial class AiChatPlugin
                 _config.Network.HttpProxy, ct, inputs).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
             if (!pending.TryBeginReply()) throw new OperationCanceledException(ct);
-            var sent = await Context.Message.SendMessageAsync(message.Channel,
-                [new ImageSegment("base64://" + Convert.ToBase64String(image))], ct).ConfigureAwait(false);
-            return sent.IsSuccess ? "图片已生成并发送。" : "图片已生成，但发送失败，请检查适配器的图片支持。";
+            var directory = Context.CreateTempDirectory(TimeSpan.FromHours(1));
+            var outputMime = MimeGuesser.SniffImageMime(image) ?? "image/png";
+            var outputPath = Path.Combine(directory.Path, "generated" + MimeGuesser.ExtensionForMime(outputMime));
+            await File.WriteAllBytesAsync(outputPath, image, ct).ConfigureAwait(false);
+            try
+            {
+                var sent = await Context.Message.SendMessageAsync(message.Channel,
+                    [new ImageSegment(new Uri(Path.GetFullPath(outputPath)).AbsoluteUri) { FileName = Path.GetFileName(outputPath) }], ct).ConfigureAwait(false);
+                if (!sent.IsSuccess)
+                {
+                    BotLog.Warning($"[AiChat] 生图已完成但发送失败，原图暂存：{outputPath}");
+                    return "图片已生成，但发送失败；原图已暂存一小时，请管理员检查适配器上传。";
+                }
+                try { File.Delete(outputPath); }
+                catch (Exception ex) { BotLog.Warning($"[AiChat] 清理已发送图片失败：{ex.GetType().Name}，宿主会自动过期清理。"); }
+                return "图片已生成并发送。";
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                BotLog.Warning($"[AiChat] 生图上传失败：{ex.GetType().Name}，原图暂存：{outputPath}");
+                return "图片已生成，但上传失败；原图已暂存一小时，请管理员检查适配器上传。";
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (OperationCanceledException) { return "生成图片超时，请稍后重新尝试。"; }
