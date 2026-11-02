@@ -111,6 +111,10 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         // 从配置了 fetch_models = true 的 provider 自动拉取模型列表
         await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
 
+        // 对其他插件开放模型；是否开放在每次调用时按当前配置判断。
+        ChatModels.Complete.Provide(Context, HandleModelCompleteAsync);
+        ChatModels.List.Provide(Context, _ => Task.FromResult(ListPluginModels()));
+
         // 私聊
         DirectCommands.MapExact("#aihelp", HandleFriendHelpAsync);
         DirectCommands.MapPrefix("#aimode", HandleFriendAiModeAsync);
@@ -376,6 +380,14 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         allow_proactive = false
         # 不提供的工具名称，例如 ["send_meme"]
         disabled = []
+
+        [plugin_api]
+        # 让其他插件借用这里配置的模型，例如 MemePlugin 的 AI 标注；需要宿主 1.0.3
+        enabled = true
+        # 其他插件不指定模型时使用的模型；留空使用 [default] 的模型，需要识图时改用一个支持识图的模型
+        default_model = ""
+        # 其他插件可以使用的模型；留空表示全部已注册的模型
+        models = []
 
         [proactive]
         # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
@@ -2670,6 +2682,92 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
     }
 
     /// <summary>其他插件提供的工具；宿主不支持或已关闭时为空。名称与内置工具冲突的跳过。</summary>
+    /// <summary>其他插件可以使用的模型：[plugin_api] models 留空时为全部已注册模型。</summary>
+    private List<ModelEntry> PluginModels()
+    {
+        var allowed = _config.PluginApi.Models.Where(name => !string.IsNullOrWhiteSpace(name)).ToList();
+        var models = _config.Models.Count > 0
+            ? _config.Models
+            : ResolveModel(_config.Default.Model) is { } single ? [single] : [];
+        return allowed.Count == 0
+            ? models.ToList()
+            : allowed.Select(ResolveModel).OfType<ModelEntry>().Distinct().ToList();
+    }
+
+    private ModelEntry? PluginDefaultModel(List<ModelEntry> models)
+    {
+        var name = string.IsNullOrWhiteSpace(_config.PluginApi.DefaultModel) ? _config.Default.Model : _config.PluginApi.DefaultModel;
+        var preferred = ResolveModel(name);
+        return preferred is not null && models.Contains(preferred) ? preferred : models.FirstOrDefault();
+    }
+
+    private ChatModelList ListPluginModels()
+    {
+        if (!_config.PluginApi.Enabled) return new ChatModelList("", []);
+        var models = PluginModels();
+        return new ChatModelList(PluginDefaultModel(models) is { } model ? GetModelDisplayId(model) : "",
+            models.Select(model => new ChatModelInfo(GetModelDisplayId(model), model.DisplayName, model.SupportsVision)).ToList());
+    }
+
+    /// <summary>其他插件借用模型：按 [plugin_api] 选模型，和聊天共用并发上限、重试和备用模型。</summary>
+    private async Task<ChatModelResponse> HandleModelCompleteAsync(ChatModelRequest request, CancellationToken ct)
+    {
+        if (!_config.PluginApi.Enabled) throw new InvalidOperationException("AI 聊天插件没有对其他插件开放模型。");
+        if (request.Messages.Count == 0) throw new ArgumentException("至少需要一条消息。");
+
+        var models = PluginModels();
+        ModelEntry model;
+        if (!string.IsNullOrWhiteSpace(request.Model))
+        {
+            model = ResolveModel(request.Model) is { } named && models.Contains(named)
+                ? named
+                : throw new InvalidOperationException($"模型 {request.Model} 不存在或没有对其他插件开放。");
+            if (request.NeedsVision && !model.SupportsVision) throw new InvalidOperationException($"模型 {request.Model} 不支持识图。");
+        }
+        else
+        {
+            var preferred = PluginDefaultModel(models) ?? throw new InvalidOperationException("没有可供其他插件使用的模型。");
+            model = !request.NeedsVision || preferred.SupportsVision
+                ? preferred
+                : models.FirstOrDefault(candidate => candidate.SupportsVision)
+                  ?? throw new InvalidOperationException("没有对其他插件开放的识图模型。");
+        }
+
+        var messages = request.Messages.Select(message =>
+        {
+            var role = message.Role is "system" or "assistant" ? message.Role : "user";
+            if (role != "user" || message.Images is not { Count: > 0 } images)
+                return new OpenAiMessage { Role = role, Content = message.Text };
+            var segments = new List<ContentSegment>();
+            if (message.Text.Length > 0) segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = message.Text });
+            segments.AddRange(images.Select(image => new ContentSegment
+            {
+                Kind = SegmentKind.Image, Mime = image.Mime, InlineBytes = Convert.FromBase64String(image.Base64)
+            }));
+            return new OpenAiMessage { Role = role, Content = new ChatMessageDescriptor { Role = role, Segments = segments } };
+        }).ToList();
+
+        await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            string? used = null;
+            var text = await ExecuteTextWithFallbackAsync(model, requestModel =>
+            {
+                used = GetModelDisplayId(requestModel);
+                return _openAi.ChatAsync(_config.Default, requestModel, new OpenAiChatRequest
+                {
+                    Model = requestModel.Name, Messages = messages,
+                    Temperature = request.Temperature, MaxCompletionTokens = request.MaxOutputTokens
+                }, ct);
+            }, ct: ct).ConfigureAwait(false);
+            return new ChatModelResponse(text, used ?? GetModelDisplayId(model));
+        }
+        finally
+        {
+            _globalConcurrency.Release();
+        }
+    }
+
     private List<PluginChatTool> PluginToolsFor(MessageEvent message, ProactiveRequest? proactive, IEnumerable<IChatTool> builtIn)
     {
         var config = _config.ToolUse.PluginTools;

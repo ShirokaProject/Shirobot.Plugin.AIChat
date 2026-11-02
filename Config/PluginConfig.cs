@@ -27,6 +27,8 @@ public sealed class PluginConfig
     public PermissionsSection Permissions { get; set; } = new();
     [ConfigField("全局工具开关及各工具的独立配置。", Label = "工具调用")]
     public ToolUseSection ToolUse { get; set; } = new();
+    [ConfigField("让其他插件借用这里配置的模型，例如 MemePlugin 的 AI 标注；需要宿主 1.0.3。", Label = "对其他插件开放模型")]
+    public PluginApiSection PluginApi { get; set; } = new();
     [ConfigField("模型和搜索请求共用的代理设置；安全网页抓取使用公网直连。", Label = "网络设置")]
     public NetworkSection Network { get; set; } = new();
 }
@@ -283,6 +285,18 @@ public sealed class ToolUseSection
     public PluginToolSection PluginTools { get; set; } = new();
     [ConfigField("⚠️ 让模型调用本机或远程的 MCP 服务，有安全风险，默认关闭。", Label = "MCP 工具")]
     public McpSection Mcp { get; set; } = new();
+}
+
+public sealed class PluginApiSection
+{
+    [ConfigField("关闭后其他插件不能再借用这里的模型。", Label = "开放模型")]
+    public bool Enabled { get; set; } = true;
+
+    [ConfigField("其他插件不指定模型时使用的模型，填写已注册模型名或 provider-model；留空使用默认模型。需要识图时会改用一个支持识图的模型。", Label = "默认模型")]
+    public string DefaultModel { get; set; } = "";
+
+    [ConfigField("其他插件可以使用的模型；留空表示全部已注册的模型。", Label = "可用模型")]
+    public List<string> Models { get; set; } = [];
 }
 
 public sealed class PluginToolSection

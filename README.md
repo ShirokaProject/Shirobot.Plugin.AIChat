@@ -103,6 +103,28 @@ return new ChatToolResult("已选好表情，回复一句短评即可。",
 
 MemePlugin 的发表情就是这样实现的。
 
+## 对其他插件开放模型
+
+其他插件可以借用这里配置的模型，不需要自己配置接口地址和密钥，例如 MemePlugin 的 AI 标注。同样通过契约调用：
+把 `ShiroBot.AiChatPlugin.dll` 放进对方插件的 `contracts` 目录。
+
+```csharp
+using ShiroBot.AiChatPlugin.Contracts;
+
+var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest(
+    [new ChatModelMessage("user", "这张图里有什么？", [new ChatModelImage("image/png", Convert.ToBase64String(png))])],
+    NeedsVision: true), ct);
+// reply 为 null：AIChat 没有加载；reply.Text 是模型的回复，reply.Model 是实际使用的模型
+```
+
+| 契约 | 说明 |
+| --- | --- |
+| `ChatModels.Complete` | 调用一次模型。`Model` 不填时用开放给插件的默认模型；`NeedsVision` 为 true 时改用支持识图的模型 |
+| `ChatModels.List` | 列出开放给其他插件的模型和默认模型 |
+
+请求和聊天共用并发上限、超时重试和备用模型。`[plugin_api]` 可以关闭这项能力（`enabled`）、指定其他插件的默认模型
+（`default_model`）和限定可用的模型（`models`）。
+
 ## 本地开发
 
 ```sh
