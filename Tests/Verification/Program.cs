@@ -455,10 +455,6 @@ sealed class FakePluginServices : IPluginServices
     public Dictionary<string, JsonNode?> Results { get; } = new(StringComparer.Ordinal);
     public List<(string Name, JsonNode? Arguments)> Calls { get; } = [];
 
-    public object? GetService(Type serviceType) => null;
-    public void RegisterSingleton<TService>(TService service) where TService : class { }
-    public TService? GetService<TService>() where TService : class => null;
-    public TService GetRequiredService<TService>() where TService : class => throw new InvalidOperationException();
     public IReadOnlyList<PluginServiceInfo> Find(string prefix) =>
         [.. Tools.Values.Where(tool => tool.Name.StartsWith(prefix, StringComparison.Ordinal)).OrderBy(tool => tool.Name, StringComparer.Ordinal)];
 
