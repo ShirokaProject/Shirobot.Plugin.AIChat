@@ -1287,7 +1287,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
                 using var imageTool = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
-                    ? new ImageGenerationTool((prompt, token) => GenerateAndSendImageAsync(message, prompt, pending, token)) : null;
+                    ? new ImageGenerationTool((prompt, size, quality, token) => GenerateAndSendImageAsync(message, prompt, pending, token, size, quality)) : null;
                 IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
                 IChatTool[] contextual = [.. builtIn, .. pluginTools];

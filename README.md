@@ -181,3 +181,5 @@ timeout_seconds = 600
 撤回取消开关开启时，尚未开始最终回复的请求可随原消息撤回取消；卸载时取消全部待处理请求。
 调用 `POST /images/generations`，要求返回 `data[0].b64_json`（GPT Image 默认格式）；不会把 Base64 或接口密钥交给聊天模型。
 协议参考：[OpenAI Images API](https://developers.openai.com/api/reference/resources/images/methods/generate)。
+
+AI 生图工具可传可选 `size`（auto、1024x1024、1536x1024、1024x1536）和 `quality`（auto、low、medium、high、xhigh、max），根据用户描述选择横竖比例与质量；省略时沿用配置，单次选择不会修改全局配置。`#imagegen` 直接命令使用配置默认值。

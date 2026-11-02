@@ -21,6 +21,7 @@ internal static class ImageGenerationChecks
         var port = Random.Shared.Next(20000, 40000);
         listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
         var calls = 0;
+        string? lastSize = null, lastQuality = null;
         var serve = Task.Run(async () =>
         {
             while (listener.IsListening)
@@ -34,6 +35,8 @@ internal static class ImageGenerationChecks
                 using var json = JsonDocument.Parse(await reader.ReadToEndAsync());
                 Check(json.RootElement.GetProperty("model").GetString() == "gpt-image-2.5-sunburst" &&
                     json.RootElement.GetProperty("n").GetInt32() == 1 && !json.RootElement.TryGetProperty("response_format", out _), "Image request mismatch.");
+                lastSize = json.RootElement.GetProperty("size").GetString();
+                lastQuality = json.RootElement.GetProperty("quality").GetString();
                 var bytes = Encoding.UTF8.GetBytes("{\"data\":[{\"b64_json\":\"" + Convert.ToBase64String(png) + "\"}]}");
                 await ctx.Response.OutputStream.WriteAsync(bytes); ctx.Response.Close();
             }
@@ -66,21 +69,24 @@ internal static class ImageGenerationChecks
         var message = new MessageEvent { Platform = "test", InstanceId = "one", Channel = Channel.Group("g"),
             Sender = new User("u"), MessageId = "m", Segments = [] };
         var method = typeof(AiChatPlugin).GetMethod("GenerateAndSendImageAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        async Task<string> Generate(string prompt, CancellationToken ct)
-        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct])!; }
+        async Task<string> Generate(string prompt, string? size, string? quality, CancellationToken ct)
+        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct, size, quality])!; }
         using var tool = new ImageGenerationTool(Generate);
-        Check(await tool.ExecuteAsync("{\"prompt\":\"一只猫\"}") == "图片已生成并发送。", "Image tool failed.");
+        Check(await tool.ExecuteAsync("{\"prompt\":\"一只猫\",\"size\":\"1536x1024\",\"quality\":\"high\"}") == "图片已生成并发送。", "Image tool failed.");
+        Check(lastSize == "1536x1024" && lastQuality == "high", "Tool size and quality were not forwarded.");
+        Check(config.ToolUse.ImageGen.Size == "1024x1024" && config.ToolUse.ImageGen.Quality == "auto", "Tool mutated persistent defaults.");
         await tool.ExecuteAsync("{\"prompt\":\"再试一次\"}");
         Check(calls == 1 && reactions.SequenceEqual(new[] { true, false }) && sent.OfType<ImageSegment>().Count() == 1 &&
             !sent.OfType<TextSegment>().Any(), "Tool retry duplicated generation or reaction fallback was sent unnecessarily.");
         supportReaction = false; sent.Clear();
-        await Generate("cat", CancellationToken.None);
+        await Generate("cat", null, null, CancellationToken.None);
+        Check(lastSize == "1024x1024" && lastQuality == "auto", "Omitted options must use defaults.");
         Check(sent.First() is TextSegment { Text: "生成图片中..." } && sent.Last() is ImageSegment, "No-reaction fallback must precede image.");
         using var canceled = new CancellationTokenSource(); canceled.Cancel();
-        try { await Generate("cat", canceled.Token); throw new Exception("Cancellation ignored."); } catch (OperationCanceledException) { }
+        try { await Generate("cat", null, null, canceled.Token); throw new Exception("Cancellation ignored."); } catch (OperationCanceledException) { }
         Check(calls == 2, "Canceled generation reached upstream.");
         config.ToolUse.ImageGen.Enabled = false;
-        Check(await Generate("cat", CancellationToken.None) == "生图功能未启用。" && calls == 2, "Disabled generation called upstream.");
+        Check(await Generate("cat", null, null, CancellationToken.None) == "生图功能未启用。" && calls == 2, "Disabled generation called upstream.");
         listener.Stop(); await serve;
         Console.WriteLine("PASS: image generation provider request, one-image delivery, reaction cleanup, text fallback, retry deduplication, cancellation and enabled switch");
     }

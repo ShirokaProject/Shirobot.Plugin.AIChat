@@ -27,9 +27,11 @@ public sealed partial class AiChatPlugin
         catch (OperationCanceledException) when (pending.Token.IsCancellationRequested) { }
     }
 
-    private async Task<string> GenerateAndSendImageAsync(MessageEvent message, string prompt, PendingAiRequest pending, CancellationToken ct)
+    private async Task<string> GenerateAndSendImageAsync(MessageEvent message, string prompt, PendingAiRequest pending, CancellationToken ct, string? size = null, string? quality = null)
     {
-        var config = _config.ToolUse.ImageGen;
+        var defaults = _config.ToolUse.ImageGen;
+        var config = new Config.ImageGenerationSection { Enabled = defaults.Enabled, Model = defaults.Model,
+            TimeoutSeconds = defaults.TimeoutSeconds, Size = size ?? defaults.Size, Quality = quality ?? defaults.Quality };
         if (!config.Enabled) return "生图功能未启用。";
         if (prompt.Length > 32000) return "生图提示词不能超过 32000 字符。";
         var model = ResolveModel(config.Model);
