@@ -19,7 +19,22 @@ ShiroBot 的 OpenAI-compatible AI 聊天插件。
 dotnet publish ShiroBot.AiChatPlugin.csproj -c Release
 ```
 
-发布目录只包含 `ShiroBot.AiChatPlugin.dll`。
+发布目录 `bin/Release/net10.0/publish/` 中唯一需要安装的文件是 `ShiroBot.AiChatPlugin.dll`，可忽略调试用的 `.pdb`。
+`ChatModels` 和 `ChatTools` 契约已嵌在同一个插件 DLL 内，无需额外的契约 DLL；不要安装 Debug 或中间输出。
+
+## 对外契约
+
+AIChat 已导出以下 `[PluginContract]`，其他插件可从最终的单文件 DLL 生成调用代码：
+
+| 契约 | 服务名 | 用途 |
+| --- | --- | --- |
+| `ChatModels.Complete` | `aichat.model.complete` | 借用配置好的模型生成一次回复，支持图片输入 |
+| `ChatModels.List` | `aichat.model.list` | 查询开放给插件的模型和默认模型 |
+| `ChatTools.Tools` | `chat.tool.*` | 其他插件注册工具，由 AIChat 发现和调用 |
+| `ChatTools.AfterReply` | `chat.after_reply.*` | 其他插件注册在文字回复后执行的动作 |
+
+下面分别给出接入示例。契约通过宿主进程内插件服务交换 JSON，不是公开的 HTTP 接口，也不返回模型服务的 API 密钥。
+模型调用受 `[plugin_api]` 的开关和模型白名单控制；调用方是宿主已加载的受信任插件，不使用 Dashboard 的 Bearer 密钥。
 
 ## 插件工具
 
@@ -131,6 +146,16 @@ var reply = await ChatModels.Complete.TryCallAsync(Context, new ChatModelRequest
 sh scripts/dev.sh --prepare  # 构建插件并准备开发宿主，不启动
 sh scripts/dev.sh            # 构建并启动开发宿主
 ```
+
+## 发布验证
+
+```sh
+dotnet publish ShiroBot.AiChatPlugin.csproj -c Release
+dotnet run --project Tests/ContractConsumer -c Release -- bin/Release/net10.0/publish/ShiroBot.AiChatPlugin.dll
+```
+
+验证项目只把最终 DLL 作为 `PluginContract` 构建输入，不引用 AIChat 项目或程序集，检查模型/工具/回复后动作契约可提取、
+消息可往返、生成的类型仅存在于调用方内部，以及发布目录只有一个插件 DLL。CI 发布前执行同样的检查。
 
 ## 许可证
 
