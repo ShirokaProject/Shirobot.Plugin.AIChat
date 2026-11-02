@@ -34,6 +34,9 @@ jobs:
       - name: Publish
         run: dotnet publish "$PROJECT_DIR" --configuration Release
 
+      - name: Verify exported contracts and isolated consumer
+        run: dotnet run --project Tests/ContractConsumer -c Release -- "$PUBLISH_DIR/ShiroBot.AiChatPlugin.dll"
+
       - name: Check packaged plugin version
         shell: bash
         env:

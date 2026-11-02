@@ -1,6 +1,8 @@
 
 using System.Text;
+using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
@@ -18,7 +20,7 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.2")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.3")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -29,7 +31,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.4.2",
+    Version = "1.4.3",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -108,6 +110,10 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
 
         // 从配置了 fetch_models = true 的 provider 自动拉取模型列表
         await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
+
+        // 对其他插件开放模型；是否开放在每次调用时按当前配置判断。
+        ChatModels.Complete.Provide(Context, HandleModelCompleteAsync);
+        ChatModels.List.Provide(Context, _ => Task.FromResult(ListPluginModels()));
 
         // 私聊
         DirectCommands.MapExact("#aihelp", HandleFriendHelpAsync);
@@ -366,6 +372,22 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         daily_review = false
         max_entries = 50
         max_entry_chars = 200
+
+        [tool_use.plugin_tools]
+        # 向模型提供其他插件以 chat.tool.* 注册的工具（例如 MemePlugin 的 send_meme）；需要宿主 1.0.3
+        enabled = true
+        # 主动插话时也提供；默认关闭，避免刷屏
+        allow_proactive = false
+        # 不提供的工具名称，例如 ["send_meme"]
+        disabled = []
+
+        [plugin_api]
+        # 让其他插件借用这里配置的模型，例如 MemePlugin 的 AI 标注；需要宿主 1.0.3
+        enabled = true
+        # 其他插件不指定模型时使用的模型；留空使用 [default] 的模型，需要识图时改用一个支持识图的模型
+        default_model = ""
+        # 其他插件可以使用的模型；留空表示全部已注册的模型
+        models = []
 
         [proactive]
         # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
@@ -1246,8 +1268,6 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 using var memoryTool = convo is not null && _config.ToolUse.Enabled && _config.ToolUse.Memory.Enabled
                     ? new MemoryTool(_memory, _config.ToolUse.Memory, key) : null;
                 var mcpTools = McpToolsFor(message, proactive);
-                IChatTool[] contextual = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>(), .. mcpTools];
-                var contextualTools = contextual.Length > 0 ? contextual : null;
                 var replyStyle = _config.Behaviour.ReplyStyle();
                 var replyModes = replyStyle != "answer";
                 var forceChat = replyStyle == "chat";
@@ -1256,6 +1276,10 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     // 聊天模式需要拿到完整回复后再分条，流式只预览解答模式的正文。
                     PreviewFilter = forceChat ? static _ => null : replyModes ? ParsedReply.StreamPreview : null
                 };
+                IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool }.OfType<IChatTool>(), .. mcpTools];
+                var pluginTools = PluginToolsFor(message, proactive, builtIn);
+                IChatTool[] contextual = [.. builtIn, .. pluginTools];
+                var contextualTools = contextual.Length > 0 ? contextual : null;
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
                 var systemPrompt = isSharedMode && convo?.SharedPrompt is not null
                     ? convo.SharedPrompt
@@ -1275,6 +1299,8 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 systemPrompt = ApplyOwnerPrompt(systemPrompt);
                 if (timer is not null) systemPrompt += "\n" + timer.SystemPrompt;
                 if (memoryTool is not null) systemPrompt += "\n" + memoryTool.SystemPrompt;
+                foreach (var tool in pluginTools)
+                    if (!string.IsNullOrWhiteSpace(tool.SystemPrompt)) systemPrompt += "\n" + tool.SystemPrompt;
                 if (mcpTools.Count > 0) systemPrompt += "\n" + McpChatTool.Prompt;
                 if (replyModes) systemPrompt += "\n" + (forceChat ? ParsedReply.ChatOnlyPrompt : ParsedReply.SystemPrompt);
                 systemPrompt = OfficialReplyDelivery.ApplyPromptPolicy(systemPrompt, _config.Behaviour.UseMarkdown);
@@ -1387,7 +1413,23 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                 }
                 _globalConcurrency.Release();
                 holdsGlobal = false;
-                if (replyModes)
+
+                // 插件工具要求的后续动作（例如发表情）在文字回复之后执行；模型没写文字时只执行后续动作，
+                // 并由它负责 @/引用。
+                var followUps = pluginTools.SelectMany(tool => tool.FollowUps).ToList();
+                var textless = followUps.Count > 0 && string.IsNullOrWhiteSpace(replyModes
+                    ? ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat).Text
+                    : assistantText);
+                if (textless)
+                {
+                    // 流式回复没有可发的文字，收起已开始的流再交给后续动作。
+                    await delivery.AbandonStreamAsync().ConfigureAwait(false);
+                    var history = await RunFollowUpsAsync(followUps, message, proactive, textSent: false, ct).ConfigureAwait(false);
+                    assistantText = history;
+                    followUps.Clear();
+                }
+
+                if (!textless && replyModes)
                 {
                     var reply = ParsedReply.Parse(assistantText, _config.Behaviour.ChatMaxMessages, forceChat);
                     // 主动插话可能回应的是这批新消息里的任意一条，不引用，避免引错人。
@@ -1406,7 +1448,7 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                         await ReplyFoldableAsync(message, isGroup, reply.Text, _config.Behaviour.AnswerFoldAboveChars).ConfigureAwait(false);
                     }
                 }
-                else if (proactive is not null)
+                else if (!textless && proactive is not null)
                 {
                     // 主动插话像群友一样直接发，不引用也不 @ 触发的那条消息。
                     BotLog.Info($"[AiChat] 主动回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
@@ -1416,12 +1458,14 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
                     else
                         await SendChatMessagesAsync(message, isGroup, delivery, new ParsedReply(ReplyMode.Chat, false, assistantText, [assistantText])).ConfigureAwait(false);
                 }
-                else
+                else if (!textless)
                 {
                     BotLog.Info($"[AiChat] 回复 字数={assistantText.Length}:\n{ForLog(assistantText)}");
                     var delivered = await delivery.CompleteAsync(assistantText).ConfigureAwait(false);
                     if (!delivered) await ReplyAssistantAsync(message, isGroup, assistantText).ConfigureAwait(false);
                 }
+                if (followUps.Count > 0)
+                    await RunFollowUpsAsync(followUps, message, proactive, textSent: true, ct).ConfigureAwait(false);
                 if (proactive is null && isGroup) _proactive.MarkReplied(ProactiveKey(message), DateTimeOffset.UtcNow);
 
                 // single 模式不保存历史
@@ -2635,6 +2679,136 @@ public sealed class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConf
         if (baseMs == 0) return TimeSpan.Zero;
         var typingMs = Math.Min(next.EnumerateRunes().Count() * 60, 3000);
         return TimeSpan.FromMilliseconds(baseMs + typingMs);
+    }
+
+    /// <summary>其他插件提供的工具；宿主不支持或已关闭时为空。名称与内置工具冲突的跳过。</summary>
+    /// <summary>其他插件可以使用的模型：[plugin_api] models 留空时为全部已注册模型。</summary>
+    private List<ModelEntry> PluginModels()
+    {
+        var allowed = _config.PluginApi.Models.Where(name => !string.IsNullOrWhiteSpace(name)).ToList();
+        var models = _config.Models.Count > 0
+            ? _config.Models
+            : ResolveModel(_config.Default.Model) is { } single ? [single] : [];
+        return allowed.Count == 0
+            ? models.ToList()
+            : allowed.Select(ResolveModel).OfType<ModelEntry>().Distinct().ToList();
+    }
+
+    private ModelEntry? PluginDefaultModel(List<ModelEntry> models)
+    {
+        var name = string.IsNullOrWhiteSpace(_config.PluginApi.DefaultModel) ? _config.Default.Model : _config.PluginApi.DefaultModel;
+        var preferred = ResolveModel(name);
+        return preferred is not null && models.Contains(preferred) ? preferred : models.FirstOrDefault();
+    }
+
+    private ChatModelList ListPluginModels()
+    {
+        if (!_config.PluginApi.Enabled) return new ChatModelList("", []);
+        var models = PluginModels();
+        return new ChatModelList(PluginDefaultModel(models) is { } model ? GetModelDisplayId(model) : "",
+            models.Select(model => new ChatModelInfo(GetModelDisplayId(model), model.DisplayName, model.SupportsVision)).ToList());
+    }
+
+    /// <summary>其他插件借用模型：按 [plugin_api] 选模型，和聊天共用并发上限、重试和备用模型。</summary>
+    private async Task<ChatModelResponse> HandleModelCompleteAsync(ChatModelRequest request, CancellationToken ct)
+    {
+        if (!_config.PluginApi.Enabled) throw new InvalidOperationException("AI 聊天插件没有对其他插件开放模型。");
+        if (request.Messages.Count == 0) throw new ArgumentException("至少需要一条消息。");
+
+        var models = PluginModels();
+        ModelEntry model;
+        if (!string.IsNullOrWhiteSpace(request.Model))
+        {
+            model = ResolveModel(request.Model) is { } named && models.Contains(named)
+                ? named
+                : throw new InvalidOperationException($"模型 {request.Model} 不存在或没有对其他插件开放。");
+            if (request.NeedsVision && !model.SupportsVision) throw new InvalidOperationException($"模型 {request.Model} 不支持识图。");
+        }
+        else
+        {
+            var preferred = PluginDefaultModel(models) ?? throw new InvalidOperationException("没有可供其他插件使用的模型。");
+            model = !request.NeedsVision || preferred.SupportsVision
+                ? preferred
+                : models.FirstOrDefault(candidate => candidate.SupportsVision)
+                  ?? throw new InvalidOperationException("没有对其他插件开放的识图模型。");
+        }
+
+        var messages = request.Messages.Select(message =>
+        {
+            var role = message.Role is "system" or "assistant" ? message.Role : "user";
+            if (role != "user" || message.Images is not { Count: > 0 } images)
+                return new OpenAiMessage { Role = role, Content = message.Text };
+            var segments = new List<ContentSegment>();
+            if (message.Text.Length > 0) segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = message.Text });
+            segments.AddRange(images.Select(image => new ContentSegment
+            {
+                Kind = SegmentKind.Image, Mime = image.Mime, InlineBytes = Convert.FromBase64String(image.Base64)
+            }));
+            return new OpenAiMessage { Role = role, Content = new ChatMessageDescriptor { Role = role, Segments = segments } };
+        }).ToList();
+
+        await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            string? used = null;
+            var text = await ExecuteTextWithFallbackAsync(model, requestModel =>
+            {
+                used = GetModelDisplayId(requestModel);
+                return _openAi.ChatAsync(_config.Default, requestModel, new OpenAiChatRequest
+                {
+                    Model = requestModel.Name, Messages = messages,
+                    Temperature = request.Temperature, MaxCompletionTokens = request.MaxOutputTokens
+                }, ct);
+            }, ct: ct).ConfigureAwait(false);
+            return new ChatModelResponse(text, used ?? GetModelDisplayId(model));
+        }
+        finally
+        {
+            _globalConcurrency.Release();
+        }
+    }
+
+    private List<PluginChatTool> PluginToolsFor(MessageEvent message, ProactiveRequest? proactive, IEnumerable<IChatTool> builtIn)
+    {
+        var config = _config.ToolUse.PluginTools;
+        if (!_config.ToolUse.Enabled || !config.Enabled || proactive is not null && !config.AllowProactive) return [];
+        var reserved = new HashSet<string>(_tools.Names.Concat(builtIn.Select(tool => tool.Definition.Function.Name)), StringComparer.Ordinal);
+        return PluginChatTool.Discover(Context, ToolContext(message, proactive), reserved, config.Disabled);
+    }
+
+    /// <summary>传给插件工具的会话信息，提供方据此选择内容或自行发送消息。</summary>
+    private static ChatToolContext ToolContext(MessageEvent message, ProactiveRequest? proactive) => new(
+        message.Platform, message.InstanceId, message.Channel.Type.ToString(), message.Channel.Id,
+        message.MessageId, message.Sender.Id, !message.IsDirect, proactive is not null);
+
+    /// <summary>
+    /// 依次执行插件工具要求的回复后动作。没有发出文字时，由第一个动作按设置 @/引用触发消息。
+    /// 返回动作给出的 History 文本，用于写入历史；失败只记日志。
+    /// </summary>
+    private async Task<string> RunFollowUpsAsync(List<ChatAfterReply> followUps, MessageEvent message,
+        ProactiveRequest? proactive, bool textSent, CancellationToken ct)
+    {
+        var history = new List<string>();
+        for (var i = 0; i < followUps.Count; i++)
+        {
+            var decorate = !textSent && i == 0 && proactive is null;
+            var reply = new ChatReplyState(textSent, decorate && _config.Behaviour.ReplyWithMention, decorate && _config.Behaviour.ReplyWithQuote);
+            try
+            {
+                var result = await ChatTools.AfterReply.CallAsync(Context, followUps[i].Name,
+                    new ChatAfterReplyCall(followUps[i].Arguments, ToolContext(message, proactive), reply), ct).ConfigureAwait(false);
+                if (result is { Ok: true, History.Length: > 0 }) history.Add(result.History);
+                if (result is { Ok: false })
+                    BotLog.Warning($"[AiChat] 回复后动作未完成: {followUps[i].Name} - {result.Error}");
+                else
+                    BotLog.Info($"[AiChat] 回复后动作完成: {followUps[i].Name}");
+            }
+            catch (Exception ex) when (ex is PluginServiceUnavailableException or PluginServiceException)
+            {
+                BotLog.Warning($"[AiChat] 回复后动作失败: {followUps[i].Name} - {ex.Message}");
+            }
+        }
+        return string.Join("\n", history);
     }
 
     private async Task ReplyFoldableAsync(MessageEvent message, bool isGroup, string text, int threshold)

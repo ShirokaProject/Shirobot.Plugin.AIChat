@@ -2,8 +2,10 @@ using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
@@ -13,6 +15,7 @@ using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Plugin;
+using PluginJson = ShiroBot.AiChatPlugin.PluginJson;
 using Tomlyn;
 
 static void Check(bool condition, string message)
@@ -409,7 +412,69 @@ await McpChecks.RunAsync();
 await RecallChecks.RunAsync();
 await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
+await ModelApiChecks.RunAsync();
 await IdentityScopeChecks.RunAsync();
+
+// Plugin tools: discovered through the ChatTools contract, called with the model's arguments and the conversation,
+// after-reply actions kept for after the text reply.
+{
+    var services = new FakePluginServices();
+    services.Add("chat.tool.send_meme", "MemePlugin",
+        new ChatToolInfo("Send a meme.", new JsonObject { ["type"] = "object", ["properties"] = new JsonObject { ["query"] = new JsonObject { ["type"] = "string" } } },
+            "Use memes sparingly."),
+        request =>
+        {
+            services.LastCall = ShiroBot.SDK.Plugin.PluginJson.Deserialize<ChatToolCall>(request);
+            return ShiroBot.SDK.Plugin.PluginJson.Serialize(new ChatToolResult("selected", new ChatAfterReply("send_meme", new JsonObject { ["id"] = "m1" })));
+        });
+    services.Add("chat.tool.web_fetch", "Other", new ChatToolInfo("Clashes with a built-in."), _ => []);
+    services.Add("chat.tool.bad name", "Other", new ChatToolInfo("Invalid name."), _ => []);
+    services.Add("chat.tool.no_description", "Other", new ChatToolInfo(""), _ => []);
+    var toolBot = DispatchProxy.Create<IBotContext, TestProxy>();
+    ((TestProxy)(object)toolBot).Call = (method, _) => method.Name == "get_Services" ? services : throw new NotSupportedException(method.Name);
+    var chat = new ChatToolContext("qq", "test", "Group", "g1", "m1", "u1", true, false);
+
+    var tools = PluginChatTool.Discover(toolBot, chat, new HashSet<string> { "web_fetch" }, []);
+    Check(tools is [{ Definition.Function.Name: "send_meme", SystemPrompt: "Use memes sparingly.", MaxCallsPerTurn: 1 }],
+        "Plugin tools must skip clashing, invalid and undescribed tools.");
+    Check(tools[0].Definition.Function.Description == "[MemePlugin] Send a meme.", "Plugin tool descriptions name their provider.");
+    Check(PluginChatTool.Discover(toolBot, chat, new HashSet<string>(), ["SEND_MEME"]).All(tool => tool.Definition.Function.Name != "send_meme"),
+        "Disabled plugin tools must not be offered.");
+    var result = await tools[0].ExecuteAsync("""{"query":"猫"}""");
+    Check(result == "selected" && services.LastCall is { Context.ChannelId: "g1", Context.IsGroup: true } &&
+          (string?)services.LastCall.Arguments["query"] == "猫",
+        "Plugin tools must pass the model's arguments and the conversation context.");
+    Check(tools[0].FollowUps is [{ Name: "send_meme" } followUp] && (string?)followUp.Arguments?["id"] == "m1",
+        "Plugin tools must keep after-reply actions.");
+    services.Handlers.Clear();
+    Check((await tools[0].ExecuteAsync("{}")).Contains("not available", StringComparison.Ordinal),
+        "A provider that went away must turn into a text reply.");
+    Console.WriteLine("PASS: plugin tool discovery, calls, after-reply actions and unavailable providers");
+}
+
+sealed class FakePluginServices : IPluginServices
+{
+    public Dictionary<string, (string Provider, byte[] Metadata)> Infos { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, Func<byte[], byte[]>> Handlers { get; } = new(StringComparer.Ordinal);
+    public ChatToolCall? LastCall { get; set; }
+
+    public void Add(string name, string provider, ChatToolInfo info, Func<byte[], byte[]> handler)
+    {
+        Infos[name] = (provider, ShiroBot.SDK.Plugin.PluginJson.Serialize(info));
+        Handlers[name] = handler;
+    }
+
+    public IReadOnlyList<PluginServiceInfo> Find(string prefix) =>
+    [
+        .. Infos.Where(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal)).OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new PluginServiceInfo(pair.Key, pair.Value.Provider, null) { MetadataUtf8 = pair.Value.Metadata })
+    ];
+
+    public Task<ReadOnlyMemory<byte>> CallUtf8Async(string name, ReadOnlyMemory<byte> request, CancellationToken cancellationToken = default) =>
+        Handlers.TryGetValue(name, out var handler)
+            ? Task.FromResult<ReadOnlyMemory<byte>>(handler(request.ToArray()))
+            : throw new PluginServiceUnavailableException(name);
+}
 
 sealed class StubHandler : HttpMessageHandler
 {

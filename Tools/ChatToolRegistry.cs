@@ -11,6 +11,7 @@ internal sealed class ChatToolRegistry : IDisposable
 {
     private readonly Dictionary<string, IChatTool> _tools = new(StringComparer.Ordinal);
     public bool HasTools => _tools.Count > 0;
+    public IEnumerable<string> Names => _tools.Keys;
     public bool HasReadOnlyTools => _tools.Values.OfType<IReadOnlyChatTool>().Any();
     public string ReadOnlySystemPrompt => string.Join("\n", _tools.Values.OfType<IReadOnlyChatTool>().Select(tool => tool.SystemPrompt));
     public string SystemPrompt => string.Join("\n", _tools.Values.Select(tool => tool.SystemPrompt));
