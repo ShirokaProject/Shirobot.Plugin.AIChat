@@ -56,7 +56,7 @@ public sealed partial class AiChatPlugin
                 Ui.Metric("本地前缀复用率", Rate(total.LocalRate), $"覆盖 {total.LocalRequests:N0} 次请求；按 UTF-8 字节计算"),
                 Ui.Metric("上游缓存命中率", Rate(total.CacheRate), CacheHint(total)),
                 Ui.Metric("本地复用量", Bytes(total.LocalReusableBytes), $"请求内容共 {Bytes(total.LocalInputBytes)}")),
-            Ui.Text("本地在实际发送时比较同一实例、会话和上游模型的工具定义与消息（含图片），统计完整工具/消息边界前相同的 UTF-8 字节。它确认前缀复用，不代表服务商实际命中缓存；上游命中率按返回的缓存 Token 计算。首次、重启后及独立用途请求从 0 开始。"),
+            Ui.Text("本地在实际发送时比较同一实例、会话和上游模型的工具定义与消息（含图片），统计完整工具/消息边界前相同的 UTF-8 字节。它确认前缀复用，不代表服务商实际命中缓存；上游命中率按返回的缓存 Token 计算；有的上游只在命中时才返回缓存字段，同一上游模型返回过一次后，缺少字段的请求按 0 命中计。首次、重启后及独立用途请求从 0 开始。"),
             Ui.Text(total.ComparedPromptTokens > 0
                 ? $"同时具备两项数据的请求：本地复用 {Rate(total.ComparedLocalRate)}（字节），上游命中 {Rate(total.ComparedCacheRate)}（Token）。"
                 : "还没有同时具备本地前缀和上游缓存信息的请求；上游未返回时仍会记录本地复用。"),

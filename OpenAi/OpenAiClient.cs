@@ -203,7 +203,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
         var eventData = new StringBuilder();
         var finished = false;
         var done = false;
-        TokenUsage? usage = null;
+        UsageReading? usage = null;
         for (string? line = firstLine; line is not null && !done;
              line = done ? null : await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false))
         {
@@ -242,7 +242,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
                 throw new InvalidOperationException(TryExtractErrorMessage(data) ?? "上游流式响应出错。");
             // include_usage 时用量在最后一个 chunk（choices 为空）；也有上游在每个 chunk 里累计返回。
             if (doc.RootElement.TryGetProperty("usage", out var usageElement) && TokenUsage.TryParse(usageElement) is { } parsedUsage)
-                usage = parsedUsage;
+                usage = new UsageReading(parsedUsage, usageElement.GetRawText());
             if (!doc.RootElement.TryGetProperty("choices", out var choices)) return;
             foreach (var choice in choices.EnumerateArray())
             {
@@ -350,11 +350,11 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
     }
 
     /// <summary>从普通 JSON 响应或整段 SSE 文本里读出 usage；SSE 取最后一个带 usage 的 chunk。</summary>
-    private static TokenUsage? ReadUsage(string raw)
+    private static UsageReading? ReadUsage(string raw)
     {
         var trimmed = raw.TrimStart();
         if (!trimmed.StartsWith("data:", StringComparison.Ordinal)) return ParseUsage(trimmed);
-        TokenUsage? last = null;
+        UsageReading? last = null;
         foreach (var line in raw.Split('\n'))
         {
             var data = line.Trim();
@@ -365,21 +365,32 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
         return last;
     }
 
-    private static TokenUsage? ParseUsage(string json)
+    private static UsageReading? ParseUsage(string json)
     {
         try
         {
             using var doc = JsonDocument.Parse(json);
-            return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("usage", out var usage)
-                ? TokenUsage.TryParse(usage) : null;
+            return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("usage", out var usage) &&
+                   TokenUsage.TryParse(usage) is { } tokens
+                ? new UsageReading(tokens, usage.GetRawText()) : null;
         }
         catch (JsonException) { return null; }
     }
 
-    private void Report(ModelEntry model, OpenAiChatRequest request, TokenUsage? tokens)
+    private void Report(ModelEntry model, OpenAiChatRequest request, UsageReading? reading)
     {
         if (usage is null) return;
         var modelId = string.IsNullOrWhiteSpace(model.Provider) ? model.Name : $"{model.Provider}-{model.Name}";
+        var tokens = reading?.Tokens;
+        if (reading is { } sample)
+        {
+            // 每个模型带缓存字段、不带缓存字段的 usage 各记一条原文，用来确认上游的字段格式。
+            var kind = sample.Tokens.CachedTokens is null ? "没有缓存字段" : "带缓存字段";
+            lock (_missingUsageWarned)
+                if (_missingUsageWarned.Add(modelId + "\n" + kind))
+                    BotLog.Info($"[AiChat] {modelId} 返回的 usage 样例（{kind}）: " +
+                        (sample.Raw.Length > 1000 ? sample.Raw[..1000] + "…" : sample.Raw));
+        }
         if (tokens is null)
         {
             lock (_missingUsageWarned)
@@ -395,6 +406,10 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
             var (baseUrl, apiKey) = ResolveEndpoint(model);
             var endpoint = baseUrl + "\n" + apiKey;
             var upstream = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(endpoint)));
+            // 有的上游只在命中缓存时才返回缓存字段：同一上游模型返回过一次后，缺少字段就按 0 命中计，
+            // 否则没命中的请求都被排除在命中率之外，命中率会虚高。
+            if (tokens is { } returned)
+                tokens = returned with { CachedTokens = usage.ResolveCachedTokens(upstream + "\n" + modelId, returned.CachedTokens) };
             var compareKey = purpose switch
             {
                 "chat" or "proactive" => $"{upstream}\n{source}\n{modelId}\nconversation",

@@ -32,3 +32,6 @@ internal readonly record struct TokenUsage(int PromptTokens, int CompletionToken
     private static int? Nested(JsonElement element, string parent, string name) =>
         element.TryGetProperty(parent, out var child) && child.ValueKind == JsonValueKind.Object ? Int(child, name) : null;
 }
+
+/// <summary>解析出的用量和上游返回的 usage 原文；原文只用于在日志里记录样例。</summary>
+internal sealed record UsageReading(TokenUsage Tokens, string Raw);

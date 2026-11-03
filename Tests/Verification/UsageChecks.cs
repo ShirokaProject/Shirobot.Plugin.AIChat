@@ -11,6 +11,10 @@ internal static class UsageChecks
     private static void Check(bool ok, string message) { if (!ok) throw new Exception(message); }
 
     private static readonly ModelEntry Model = new() { Name = "test", BaseUrl = "https://example.invalid/v1", ApiKey = "test" };
+    // 从没返回过缓存字段的模型：缺少字段仍视为未知。
+    private static readonly ModelEntry NoCacheModel = new() { Name = "no-cache", BaseUrl = "https://example.invalid/v1", ApiKey = "test" };
+    // 只在命中时才返回缓存字段的模型。
+    private static readonly ModelEntry HitOnlyModel = new() { Name = "hit-only", BaseUrl = "https://example.invalid/v1", ApiKey = "test" };
 
     private sealed class Upstream(Func<string, HttpResponseMessage> respond) : HttpMessageHandler
     {
@@ -88,7 +92,7 @@ internal static class UsageChecks
                 "data: [DONE]\n\n"));
             using (var client = Client(noCache, stats, streamUsage: false))
             {
-                await client.ChatIncrementalAsync(Model, new OpenAiChatRequest { Model = "test", Messages = Messages(("user", "u")) }, _ => Task.CompletedTask);
+                await client.ChatIncrementalAsync(NoCacheModel, new OpenAiChatRequest { Model = "test", Messages = Messages(("user", "u")) }, _ => Task.CompletedTask);
                 using var body = JsonDocument.Parse(noCache.LastBody);
                 Check(!body.RootElement.TryGetProperty("stream_options", out _), "stream_usage = false must not send stream_options.");
             }
@@ -112,13 +116,37 @@ internal static class UsageChecks
                 "Requests without cache information must not count toward the cache rate.");
             Console.WriteLine("PASS: JsonUsageAndCacheRate");
 
+            // 只在命中时才返回缓存字段的上游：返回过一次之后，缺少字段按 0 命中计，命中率不会只按命中的请求算。
+            var hitOnlyResponses = new Queue<string>([
+                """{"prompt_tokens":1000,"completion_tokens":1}""",
+                """{"prompt_tokens":1000,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":600}}""",
+                """{"prompt_tokens":1000,"completion_tokens":1}"""]);
+            var hitOnly = new Upstream(_ => Json(
+                "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":" + hitOnlyResponses.Dequeue() + "}"));
+            using (var client = Client(hitOnly, stats))
+                for (var i = 0; i < 3; i++)
+                    await client.ChatAsync(new DefaultSection(), HitOnlyModel, new OpenAiChatRequest { Model = "hit-only", Messages = Messages(("user", "u")) });
+            var hitOnlyRecords = stats.Recent(3).Reverse().Select(record => record.CachedTokens).ToArray();
+            Check(hitOnlyRecords.SequenceEqual(new int?[] { null, 600, 0 }),
+                "A miss after the upstream has reported cache tokens must count as 0, before that as unknown: " + string.Join(",", hitOnlyRecords));
+            var hitOnlyTotal = stats.GroupBy(today, key => key.Model).Single(row => row.Name == "hit-only").Totals;
+            Check(hitOnlyTotal.CacheKnownPromptTokens == 2000 && hitOnlyTotal.CachedTokens == 600 && hitOnlyTotal.CacheRate == 0.3,
+                "The cache rate must include misses once the upstream reports cache tokens.");
+            Console.WriteLine("PASS: HitOnlyCacheFieldsCountMissesAsZero");
+
             // 持久化。
             await stats.SaveAsync();
             var loaded = new UsageStats(Path.Combine(root, "usage-stats.json"));
             await loaded.LoadAsync();
             var reloaded = loaded.Total(today);
-            Check(reloaded.Requests == total.Requests && reloaded.CachedTokens == total.CachedTokens && loaded.Recent(10).Count == 3,
+            var saved = stats.Total(today);
+            Check(reloaded.Requests == saved.Requests && reloaded.CachedTokens == saved.CachedTokens && reloaded.CacheKnownPromptTokens == saved.CacheKnownPromptTokens,
                 "Usage must survive a reload.");
+            // 哪些上游返回过缓存字段也随文件保存：重启后缺少字段仍按 0 计。
+            var reporters = typeof(UsageStats).GetField("_cacheReporters", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var known = ((HashSet<string>)reporters.GetValue(loaded)!).Single(key => key.EndsWith("\nhit-only", StringComparison.Ordinal));
+            Check(loaded.ResolveCachedTokens(known, null) == 0 && loaded.ResolveCachedTokens("unknown\nmodel", null) is null,
+                "Which upstreams report cache tokens must survive a reload.");
             Console.WriteLine("PASS: UsagePersists");
         }
         finally

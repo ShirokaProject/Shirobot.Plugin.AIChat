@@ -69,9 +69,28 @@ internal sealed class UsageStats
     private readonly LinkedList<UsageRecord> _recent = new();
     // 每个会话最近一次请求的前缀摘要，只在内存里，用来判断下一次请求的前缀是否被改写。
     private readonly Dictionary<string, (RequestShape? Shape, PrefixSnapshot? Prefix)> _lastShapes = new(StringComparer.Ordinal);
+    // 返回过缓存字段的上游模型（端点摘要加模型）。它们之后缺少缓存字段视为 0 命中；随统计文件保存，清空统计时保留。
+    private readonly HashSet<string> _cacheReporters = new(StringComparer.Ordinal);
     private bool _dirty;
 
     public UsageStats(string path) => _path = path;
+
+    /// <summary>
+    /// 本次请求计入统计的缓存命中 Token。有的上游只在命中时才返回缓存字段：返回过一次之后，缺少字段就按 0 命中计；
+    /// 从没返回过缓存字段的上游仍视为未知，不计入命中率。
+    /// </summary>
+    public int? ResolveCachedTokens(string upstreamModel, int? cached)
+    {
+        lock (_gate)
+        {
+            if (cached is not null)
+            {
+                if (_cacheReporters.Add(upstreamModel)) _dirty = true;
+                return cached;
+            }
+            return _cacheReporters.Contains(upstreamModel) ? 0 : null;
+        }
+    }
 
     /// <param name="compareKey">同一个 key 的相邻请求互相比较前缀；独立的请求（摘要、压缩）传 null。</param>
     public void Record(UsageRecord record, RequestShape? shape = null, string? compareKey = null, PrefixSnapshot? prefix = null)
@@ -193,6 +212,8 @@ internal sealed class UsageStats
                         ComparedCachedTokens = Long(item, "compared_cached_tokens")
                     };
                 }
+                foreach (var item in Items(doc.RootElement, "cache_reporters"))
+                    if (item.ValueKind == JsonValueKind.String && item.GetString() is { Length: > 0 } reporter) _cacheReporters.Add(reporter);
                 foreach (var item in Items(doc.RootElement, "recent"))
                 {
                     _recent.AddLast(new UsageRecord(
@@ -275,6 +296,9 @@ internal sealed class UsageStats
                 writer.WriteNumber("compared_cached_tokens", totals.ComparedCachedTokens);
                 writer.WriteEndObject();
             }
+            writer.WriteEndArray();
+            writer.WriteStartArray("cache_reporters");
+            foreach (var reporter in _cacheReporters) writer.WriteStringValue(reporter);
             writer.WriteEndArray();
             writer.WriteStartArray("recent");
             foreach (var record in _recent)
