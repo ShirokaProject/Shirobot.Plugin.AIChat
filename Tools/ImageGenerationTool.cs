@@ -8,14 +8,14 @@ internal sealed class ImageGenerationTool(Func<string, string?, string?, Cancell
 {
     private Task<string>? _result;
     public int MaxCallsPerTurn => 1;
-    public string SystemPrompt => "用户要求画图、生成图片或修改图片时调用 imagegen；本条消息有附图或引用图片时会把原图提交给编辑接口，请在 prompt 描述修改要求；无附图时默认生成新图；只有用户要求沿用/修改之前的图片，或历史图片与本次需求直接相关且确实需要保留其内容时，才按用户消息末尾列出的历史图片编号填写 reference_images。历史图片无关、不合适、用户只想画新图时，省略或填写空数组，普通生成；不要因为上下文有图片就自动选，也不要勉强找参考图。根据用户意图选择 size（横图 1536x1024、竖图 1024x1536、方图 1024x1024，或 auto）和 quality（auto/low/medium/high/xhigh/max）；没有要求时省略，沿用配置默认值。不要在闲聊或主动插话时生成。工具只提交后台任务，立即返回排队状态；不能声称此时已经生成成功，告诉用户完成后会单独发图。工具参数不能混入之前聊天的内容；生图会使用用户当前这条消息的原文。提交后简短回复即可，不要输出图片链接或 Base64。";
+    public string SystemPrompt => "用户要求画图、生成图片或修改图片时调用 imagegen；本条消息有附图或引用图片时会把原图提交给编辑接口，请在 prompt 描述修改要求；无附图时默认生成新图；只有用户要求沿用/修改之前的图片，或历史图片与本次需求直接相关且确实需要保留其内容时，才按用户消息末尾列出的历史图片编号填写 reference_images。历史图片无关、不合适、用户只想画新图时，省略或填写空数组，普通生成；不要因为上下文有图片就自动选，也不要勉强找参考图。根据用户意图选择 size（横图 1536x1024、竖图 1024x1536、方图 1024x1024，或 auto）和 quality（auto/low/medium/high/xhigh/max）；没有要求时省略，沿用配置默认值。不要在闲聊或主动插话时生成。工具只提交后台任务，立即返回排队状态；不能声称此时已经生成成功，告诉用户完成后会单独发图。由你在 prompt 中整理可独立理解的完整生图或修改描述，生图接口只收到该提示词和所选图片。以用户本次要求为准；涉及“我”“刚才那张”等指代时，只补充相关且有依据的上下文；不确定的外貌细节可询问用户，或明确按想象创作。不要带入无关聊天、系统人设、其他人的要求或工具执行指令。提交后简短回复即可，不要输出图片链接或 Base64。";
 
     /// <summary>可引用的历史图片编号。会随新图片变化，附在本条用户消息末尾，不放进 system prompt。</summary>
     public string HistoryCatalog => historyCatalog;
     public OpenAiTool Definition { get; } = new() { Function = new() {
         Name = "imagegen", Description = "Generate and send one image when the user requests an image. May take several minutes.",
         Parameters = new { type = "object", required = new[] { "prompt" }, additionalProperties = false,
-            properties = new { reference_images = new { type = "array", items = new { type = "integer", minimum = 1, maximum = 8 }, maxItems = 4, description = "Optional historical image IDs from the provided catalog. Use only when suitable and necessary for this request. Omit or pass [] for ordinary new image generation." }, prompt = new { type = "string", description = "Complete image description." },
+            properties = new { reference_images = new { type = "array", items = new { type = "integer", minimum = 1, maximum = 8 }, maxItems = 4, description = "Optional historical image IDs from the provided catalog. Use only when suitable and necessary for this request. Omit or pass [] for ordinary new image generation." }, prompt = new { type = "string", description = "Self-contained image generation or edit prompt based on the current request. Resolve relevant references using supported context; omit unrelated chat and instructions." },
                 size = new { type = "string", @enum = new[] { "auto", "1024x1024", "1536x1024", "1024x1536" }, description = "Choose landscape, portrait or square to match the request. Omit to use configured default." },
                 quality = new { type = "string", @enum = new[] { "auto", "low", "medium", "high", "xhigh", "max" }, description = "Quality requested by the user. Higher quality can take longer. Omit to use configured default." } } }
     } };

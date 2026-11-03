@@ -34,16 +34,26 @@ internal static class ImageGenerationChecks
                 try { ctx = await listener.GetContextAsync(); } catch { return; }
                 calls++;
                 if (forbidden) { ctx.Response.StatusCode = 403; ctx.Response.Close(); continue; }
-                Check(ctx.Request.Url!.AbsolutePath == "/v1/images/generations", "Wrong image endpoint.");
                 Check(ctx.Request.Headers["Authorization"] == "Bearer image-key", "Missing provider authorization.");
                 using var reader = new StreamReader(ctx.Request.InputStream);
-                using var json = JsonDocument.Parse(await reader.ReadToEndAsync());
-                Check(json.RootElement.GetProperty("model").GetString() == "gpt-image-2.5-sunburst" &&
-                    json.RootElement.GetProperty("n").GetInt32() == 1 && !json.RootElement.TryGetProperty("response_format", out _), "Image request mismatch.");
-                lastPrompt = json.RootElement.GetProperty("prompt").GetString();
-                if (holdImage) { imageStarted.TrySetResult(); await releaseImage.Task; }
-                lastSize = json.RootElement.GetProperty("size").GetString();
-                lastQuality = json.RootElement.GetProperty("quality").GetString();
+                var body = await reader.ReadToEndAsync();
+                if (ctx.Request.Url!.AbsolutePath == "/v1/images/edits")
+                {
+                    Check(ctx.Request.ContentType!.StartsWith("multipart/form-data") && body.Contains("image[]"), "Missing edit input.");
+                    Check(body.Contains("保留地鼠姿势，把毛发改成蓝色，背景不变"), "Model edit prompt was replaced by the user message.");
+                    lastPrompt = "保留地鼠姿势，把毛发改成蓝色，背景不变";
+                }
+                else
+                {
+                    Check(ctx.Request.Url.AbsolutePath == "/v1/images/generations", "Wrong image endpoint.");
+                    using var json = JsonDocument.Parse(body);
+                    Check(json.RootElement.GetProperty("model").GetString() == "gpt-image-2.5-sunburst" &&
+                        json.RootElement.GetProperty("n").GetInt32() == 1 && !json.RootElement.TryGetProperty("response_format", out _), "Image request mismatch.");
+                    lastPrompt = json.RootElement.GetProperty("prompt").GetString();
+                    if (holdImage) { imageStarted.TrySetResult(); await releaseImage.Task; }
+                    lastSize = json.RootElement.GetProperty("size").GetString();
+                    lastQuality = json.RootElement.GetProperty("quality").GetString();
+                }
                 var bytes = Encoding.UTF8.GetBytes("{\"data\":[{\"b64_json\":\"" + Convert.ToBase64String(png) + "\"}]}");
                 await ctx.Response.OutputStream.WriteAsync(bytes); ctx.Response.Close();
             }
@@ -135,19 +145,31 @@ internal static class ImageGenerationChecks
         typeof(AiChatPlugin).GetField("_fetcher", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, fetcher);
         typeof(AiChatPlugin).GetField("_cache", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, new ResourceCache(tempRoot, "cache", 1));
         var queue = typeof(AiChatPlugin).GetMethod("QueueImageGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        var request = message with { Segments = [new TextSegment("#ai 画一只白猫")] };
-        var cleanPrompt = AiChatPlugin.CurrentImagePrompt(request);
-        Check(cleanPrompt == "画一只白猫", "Image prompt must use only current user text.");
-        var queued = (string)queue.Invoke(plugin, [request, cleanPrompt, null, null, null, null])!;
+        var request = message with { Segments = [new TextSegment("#ai 帮我生成一个我的自画像")] };
+        const string modelPrompt = "一位热爱硬件与编程的年轻人，坐在摆有电路板和代码屏幕的书桌前，二次元插画";
+        using var chatTool = plugin.CreateImageGenerationTool(request, [], "当前没有可用历史图片。");
+        var queued = await chatTool.ExecuteAsync(JsonSerializer.Serialize(new { prompt = modelPrompt, size = "1536x1024", quality = "high" }));
         Check(queued.Contains("后台"), "Image queue must return immediately.");
         await imageStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        Check(!jobs.Single().IsCompleted && lastPrompt == cleanPrompt, "Job must stay independent while upstream is blocked, without history rewrite.");
-        Check(((string)queue.Invoke(plugin, [request, cleanPrompt, null, null, null, null])!).Contains("已有"), "Same message must not queue duplicate jobs.");
+        Check(!jobs.Single().IsCompleted && lastPrompt == modelPrompt,
+            "Chat image generation must forward the model prompt unchanged while running independently.");
+        Check(((string)queue.Invoke(plugin, [request, modelPrompt, null, null, null, null])!).Contains("已有"), "Same message must not queue duplicate jobs.");
         // Unrelated work can complete while the image job is still waiting.
         await Task.Run(() => Check(!jobs.Single().IsCompleted, "Background job unexpectedly completed."));
         releaseImage.TrySetResult();
         await Task.WhenAll(jobs).WaitAsync(TimeSpan.FromSeconds(5));
-        Check(calls == 5 && !File.Exists(paths.Last()), "Background job did not deliver exactly once and clean its file.");
+        Check(calls == 5 && !File.Exists(paths.Last()) && lastSize == "1536x1024" && lastQuality == "high",
+            "Background job did not deliver exactly once with model options and clean its file.");
+        holdImage = false;
+        var editRequest = request with { MessageId = "edit", Segments = [new TextSegment("怎么还是不蓝啊！")] };
+        using var editTool = plugin.CreateImageGenerationTool(editRequest, [new ImagePart(null, "image/png", png.Length, png)], "历史图片 1：地鼠");
+        Check((await editTool.ExecuteAsync("{\"prompt\":\"保留地鼠姿势，把毛发改成蓝色，背景不变\",\"reference_images\":[1]}")).Contains("后台"), "Edit must queue.");
+        await Task.WhenAll(jobs).WaitAsync(TimeSpan.FromSeconds(5));
+        Check(calls == 6 && lastPrompt == "保留地鼠姿势，把毛发改成蓝色，背景不变", "History editing lost the model prompt.");
+        var command = request with { MessageId = "command", Segments = [new TextSegment("#imagegen 画一只白猫")] };
+        await (Task)typeof(AiChatPlugin).GetMethod("HandleImageGenAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(plugin, [command])!;
+        await Task.WhenAll(jobs).WaitAsync(TimeSpan.FromSeconds(5));
+        Check(calls == 7 && lastPrompt == "画一只白猫", "Direct command must preserve the user's prompt without rewriting.");
         listener.Stop(); await serve;
         Directory.Delete(tempRoot, recursive: true);
         Console.WriteLine("PASS: image generation provider request, one-image delivery, reaction cleanup, text fallback, retry deduplication, cancellation and enabled switch");

@@ -1,5 +1,6 @@
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.Resources;
+using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Adapter;
@@ -26,21 +27,24 @@ public sealed partial class AiChatPlugin
 
     private const string ImageJobQueued = "生图任务已提交后台，完成后会单独发送图片。请勿声称已经生成成功；其他聊天可以继续。";
 
-    internal static string CurrentImagePrompt(MessageEvent message)
-    {
-        // Deliberately use the current user's own text, not the tool's history-influenced rewrite.
-        var text = message.GetPlainText().Trim();
-        foreach (var prefix in new[] { "#imagegen", "#ai" })
-            if (text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
-                (text.Length == prefix.Length || char.IsWhiteSpace(text[prefix.Length])))
-                return text[prefix.Length..].Trim();
-        return text;
-    }
+    internal ImageGenerationTool CreateImageGenerationTool(MessageEvent message, ImagePart[] historyImages,
+        string imageCatalog, ConversationKey? conversationKey = null)
+        => new((prompt, size, quality, token) =>
+        {
+            token.ThrowIfCancellationRequested();
+            return Task.FromResult(QueueImageGeneration(message, prompt, size, quality, conversationKey: conversationKey));
+        }, (ids, prompt, size, quality, token) =>
+        {
+            token.ThrowIfCancellationRequested();
+            if (ids.Any(id => id > historyImages.Length)) return Task.FromResult("历史图片编号不存在，请用户重新附图。");
+            return Task.FromResult(QueueImageGeneration(message, prompt, size, quality,
+                ids.Select(id => historyImages[id - 1]).ToArray(), conversationKey));
+        }, imageCatalog);
 
     private string QueueImageGeneration(MessageEvent message, string prompt, string? size, string? quality, IReadOnlyList<ImagePart>? references = null, ConversationKey? conversationKey = null)
     {
         if (!_config.ToolUse.ImageGen.Enabled) return "生图功能未启用。";
-        if (string.IsNullOrWhiteSpace(prompt) || prompt.Length > 32000) return "请在当前消息写清生图要求（最多 32000 字符）。";
+        if (string.IsNullOrWhiteSpace(prompt) || prompt.Length > 32000) return "生图提示词不能为空，且最多 32000 字符。";
         PendingAiRequest pending;
         try { pending = _imageRequests.Register(message); }
         catch (InvalidOperationException) { return "这条消息已有生图任务，请等待完成。"; }

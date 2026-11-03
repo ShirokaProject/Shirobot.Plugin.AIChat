@@ -1308,17 +1308,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                     "\n当前会话历史图片（1 为最近一张，只能引用这些编号）：\n" +
                     string.Join("\n", historyImages.Select((item, index) => $"{index + 1}: {item.Turn.Role}, {item.Turn.Timestamp}, " +
                         string.Join(" ", item.Turn.Parts.OfType<TextPart>().Select(text => text.Text)).Take(160).Aggregate("", (a, ch) => a + ch)));
-                Task<string> QueueImage(string? size, string? quality, ImagePart[]? references = null)
-                    => Task.FromResult(QueueImageGeneration(message, CurrentImagePrompt(message), size, quality, references, convo?.Key));
                 using var imageTool = _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
-                    ? new ImageGenerationTool((prompt, size, quality, token) =>
-                        { token.ThrowIfCancellationRequested(); return QueueImage(size, quality); },
-                        (ids, prompt, size, quality, token) =>
-                        {
-                            token.ThrowIfCancellationRequested();
-                            if (ids.Any(id => id > historyImages.Length)) return Task.FromResult("历史图片编号不存在，请用户重新附图。");
-                            return QueueImage(size, quality, ids.Select(id => historyImages[id - 1].Image).ToArray());
-                        }, imageCatalog) : null;
+                    ? CreateImageGenerationTool(message, historyImages.Select(item => item.Image).ToArray(), imageCatalog, convo?.Key) : null;
                 IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
                 // 主动插话不是用户的请求，不允许预约定时消息或生成图片。
