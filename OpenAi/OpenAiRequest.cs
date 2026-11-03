@@ -16,6 +16,10 @@ internal sealed class OpenAiChatRequest
     [JsonPropertyName("stream")]
     public bool Stream { get; set; }
 
+    /// <summary>流式请求附带 stream_options.include_usage；由 StreamingChatContent 写出。</summary>
+    [JsonIgnore]
+    public bool IncludeUsage { get; set; }
+
     [JsonPropertyName("temperature")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? Temperature { get; set; }

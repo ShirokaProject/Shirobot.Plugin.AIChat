@@ -130,16 +130,22 @@ internal static class McpChecks
             var ctx = DispatchProxy.Create<IBotContext, TestProxy>();
             ((TestProxy)(object)ctx).Call = (m, _) => m.Name == "IsAdmin" ? admin : throw new NotSupportedException(m.Name);
             typeof(PluginBase).GetProperty("Context", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(plugin, ctx);
-            var toolsFor = typeof(AiChatPlugin).GetMethod("McpToolsFor", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var mcpTools = typeof(AiChatPlugin).GetMethod("McpTools", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var refusal = typeof(AiChatPlugin).GetMethod("McpRefusal", BindingFlags.NonPublic | BindingFlags.Instance)!;
             var message = new MessageEvent { Platform = "qq", InstanceId = "i", SelfId = "bot", MessageId = "m", Channel = Channel.Group("g"), Sender = new User("u"), Segments = [] };
-            int Count(ProactiveRequest? proactive = null) => ((List<IChatTool>)toolsFor.Invoke(plugin, [message, proactive])!).Count;
-            Check(Count() == 0, "MCP tools must not be offered to ordinary users by default.");
+            int Count() => ((List<IChatTool>)mcpTools.Invoke(plugin, [])!).Count;
+            bool Allowed(ProactiveRequest? proactive = null) => refusal.Invoke(plugin, [message, proactive]) is null;
+            // 工具列表不随发言人变化（前缀缓存），是否允许调用在调用时判断。
+            Check(Count() == 3, "Enabled MCP tools must be listed for every speaker so the prompt prefix stays stable.");
+            Check(!Allowed(), "MCP tools must refuse ordinary users by default.");
+            var refused = RefusedChatTool.Wrap(((List<IChatTool>)mcpTools.Invoke(plugin, [])!)[0], (string?)refusal.Invoke(plugin, [message, null]))!;
+            Check((await refused.ExecuteAsync("{}")).Contains("管理员"), "A refused MCP call must explain why without running the tool.");
             admin = true;
-            Check(Count() == 3, "Admins must get MCP tools.");
-            Check(Count(new ProactiveRequest("i:g", "")) == 0, "Proactive replies must never get MCP tools.");
+            Check(Allowed(), "Admins must be allowed to call MCP tools.");
+            Check(!Allowed(new ProactiveRequest("i:g", "")), "Proactive replies must never call MCP tools.");
             admin = false;
             config.ToolUse.Mcp.AllowEveryone = true;
-            Check(Count() == 3, "allow_everyone must offer MCP tools to everyone.");
+            Check(Allowed(), "allow_everyone must allow MCP tools for everyone.");
             config.ToolUse.Enabled = false;
             Check(Count() == 0, "Disabling tool use must hide MCP tools.");
             Check(!new PluginConfig().ToolUse.Mcp.Enabled && !new PluginConfig().ToolUse.Mcp.AllowEveryone, "MCP must be off and admin-only by default.");

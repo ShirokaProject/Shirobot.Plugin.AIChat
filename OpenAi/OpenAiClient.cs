@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Usage;
 using ShiroBot.SDK.Abstractions;
 
 namespace ShiroBot.AiChatPlugin.OpenAi;
@@ -15,9 +16,12 @@ internal sealed class EmptyUpstreamResponseException : Exception
 /// <summary>
 /// 兼容 OpenAI chat.completions 协议的 HTTP 客户端。
 /// 按 base_url 复用 HttpClient（每个 endpoint 一个实例）。
+/// 每次收到上游的 usage 都记入 <paramref name="usage"/>：统计在发送侧做，工具轮次、压缩和摘要请求都会计入。
 /// </summary>
-internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisposable
+/// <param name="streamUsage">流式请求附带 stream_options.include_usage，让上游在最后返回用量。</param>
+internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageStats? usage = null, bool streamUsage = true) : IDisposable
 {
+    private readonly HashSet<string> _missingUsageWarned = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HttpClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ProviderEntry> _providers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _clientsLock = new();
@@ -57,9 +61,9 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         BotLog.Info($"[AiChat] 请求 {model.Name}: messages={request.Messages.Count}, body=streaming");
-        httpReq.Content = new StreamingChatContent(request);
+        httpReq.Content = new StreamingChatContent(Prepare(request));
 
-        return await SendAndParseAsync(http, httpReq, ct).ConfigureAwait(false);
+        return await SendAndParseAsync(http, httpReq, model, request, ct).ConfigureAwait(false);
     }
 
     public async Task<OpenAiResponseMessage> ChatWithToolsAsync(
@@ -74,8 +78,8 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         using var httpReq = new HttpRequestMessage(HttpMethod.Post, JoinUrl(baseUrl, "chat/completions"));
         httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        httpReq.Content = new StreamingChatContent(request);
-        return await SendAndParseMessageAsync(GetClient(baseUrl), httpReq, ct).ConfigureAwait(false);
+        httpReq.Content = new StreamingChatContent(Prepare(request));
+        return await SendAndParseMessageAsync(GetClient(baseUrl), httpReq, model, request, ct).ConfigureAwait(false);
     }
 
     public async Task<string> ChatIncrementalAsync(ModelEntry model, OpenAiChatRequest request,
@@ -95,8 +99,8 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         using var httpReq = new HttpRequestMessage(HttpMethod.Post, JoinUrl(baseUrl, "chat/completions"));
         httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-        httpReq.Content = new StreamingChatContent(request);
-        return await SendIncrementalMessageAsync(GetClient(baseUrl), httpReq, onContent, ct).ConfigureAwait(false);
+        httpReq.Content = new StreamingChatContent(Prepare(request));
+        return await SendIncrementalMessageAsync(GetClient(baseUrl), httpReq, model, request, onContent, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -123,15 +127,16 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         using var httpReq = new HttpRequestMessage(HttpMethod.Post, url);
         httpReq.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         httpReq.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        httpReq.Content = new StreamingChatContent(model.Name, messages, stream: onContent is not null,
+        var request = StreamingChatContent.CreateRequest(model.Name, messages, stream: onContent is not null,
             maxCompletionTokens: defaults.OutputTokenLimit());
+        httpReq.Content = new StreamingChatContent(Prepare(request));
 
         var imageCount = messages.Sum(m => m.Segments.Count(s => s.Kind == SegmentKind.Image));
         BotLog.Info($"[AiChat] 流式请求 {model.Name}: messages={messages.Count}, image 段={imageCount}");
 
         return onContent is null
-            ? await SendAndParseAsync(http, httpReq, ct).ConfigureAwait(false)
-            : await SendIncrementalAsync(http, httpReq, onContent, ct).ConfigureAwait(false);
+            ? await SendAndParseAsync(http, httpReq, model, request, ct).ConfigureAwait(false)
+            : await SendIncrementalAsync(http, httpReq, model, request, onContent, ct).ConfigureAwait(false);
     }
 
     private static string GetFinalIncrementalText(OpenAiResponseMessage response)
@@ -142,16 +147,16 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
             ? throw new EmptyUpstreamResponseException() : response.Content;
     }
 
-    private async Task<string> SendIncrementalAsync(HttpClient http, HttpRequestMessage request,
-        Func<string, Task> onContent, CancellationToken ct) =>
-        GetFinalIncrementalText(await SendIncrementalMessageAsync(http, request, onContent, ct).ConfigureAwait(false));
+    private async Task<string> SendIncrementalAsync(HttpClient http, HttpRequestMessage request, ModelEntry model,
+        OpenAiChatRequest chatRequest, Func<string, Task> onContent, CancellationToken ct) =>
+        GetFinalIncrementalText(await SendIncrementalMessageAsync(http, request, model, chatRequest, onContent, ct).ConfigureAwait(false));
 
     private async Task<OpenAiResponseMessage> SendIncrementalMessageAsync(HttpClient http, HttpRequestMessage request,
-        Func<string, Task> onContent, CancellationToken ct)
+        ModelEntry model, OpenAiChatRequest chatRequest, Func<string, Task> onContent, CancellationToken ct)
     {
         try
         {
-            return await ReadIncrementalAsync(http, request, onContent, ct).ConfigureAwait(false);
+            return await ReadIncrementalAsync(http, request, model, chatRequest, onContent, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
         {
@@ -160,7 +165,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
     }
 
     private async Task<OpenAiResponseMessage> ReadIncrementalAsync(HttpClient http, HttpRequestMessage request,
-        Func<string, Task> onContent, CancellationToken ct)
+        ModelEntry model, OpenAiChatRequest chatRequest, Func<string, Task> onContent, CancellationToken ct)
     {
         // ResponseHeadersRead 的 HttpClient 超时不覆盖响应体读取，显式限制整次生成。
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -183,6 +188,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
             var raw = firstLine + "\n" + await reader.ReadToEndAsync(timeout.Token).ConfigureAwait(false);
             var parsed = PluginJson.Deserialize<OpenAiChatResponse>(raw, _jsonOptions);
             if (parsed?.Error?.Message is { } error) throw new InvalidOperationException(error);
+            Report(model, chatRequest, ReadUsage(raw));
             var message = parsed?.Choices?.FirstOrDefault()?.Message ?? throw new EmptyUpstreamResponseException();
             if (!string.IsNullOrWhiteSpace(message.Content)) await onContent(message.Content).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(message.Content) && message.ToolCalls is not { Count: > 0 })
@@ -197,6 +203,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         var eventData = new StringBuilder();
         var finished = false;
         var done = false;
+        TokenUsage? usage = null;
         for (string? line = firstLine; line is not null && !done;
              line = done ? null : await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false))
         {
@@ -212,6 +219,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         }
         if (eventData.Length > 0 && !done) await ProcessEventAsync().ConfigureAwait(false);
         if (!finished) throw new HttpRequestException("上游流式响应在完成前中断。");
+        Report(model, chatRequest, usage);
         if (string.IsNullOrWhiteSpace(content.ToString()) && toolCalls.Count == 0)
             throw new EmptyUpstreamResponseException();
         if (toolCalls.Values.Any(call => string.IsNullOrWhiteSpace(call.Id) || string.IsNullOrWhiteSpace(call.Function?.Name)))
@@ -232,6 +240,9 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
             using var doc = JsonDocument.Parse(data);
             if (doc.RootElement.TryGetProperty("error", out _))
                 throw new InvalidOperationException(TryExtractErrorMessage(data) ?? "上游流式响应出错。");
+            // include_usage 时用量在最后一个 chunk（choices 为空）；也有上游在每个 chunk 里累计返回。
+            if (doc.RootElement.TryGetProperty("usage", out var usageElement) && TokenUsage.TryParse(usageElement) is { } parsedUsage)
+                usage = parsedUsage;
             if (!doc.RootElement.TryGetProperty("choices", out var choices)) return;
             foreach (var choice in choices.EnumerateArray())
             {
@@ -275,15 +286,17 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         }
     }
 
-    private async Task<string> SendAndParseAsync(HttpClient http, HttpRequestMessage httpReq, CancellationToken ct)
+    private async Task<string> SendAndParseAsync(HttpClient http, HttpRequestMessage httpReq, ModelEntry model,
+        OpenAiChatRequest request, CancellationToken ct)
     {
-        var message = await SendAndParseMessageAsync(http, httpReq, ct).ConfigureAwait(false);
+        var message = await SendAndParseMessageAsync(http, httpReq, model, request, ct).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(message.Content))
             throw new EmptyUpstreamResponseException();
         return message.Content;
     }
 
-    private async Task<OpenAiResponseMessage> SendAndParseMessageAsync(HttpClient http, HttpRequestMessage httpReq, CancellationToken ct)
+    private async Task<OpenAiResponseMessage> SendAndParseMessageAsync(HttpClient http, HttpRequestMessage httpReq,
+        ModelEntry model, OpenAiChatRequest request, CancellationToken ct)
     {
         using var resp = await http.SendAsync(httpReq, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
         var raw = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -302,6 +315,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
             var content = ParseSseStreamContent(raw);
             if (string.IsNullOrWhiteSpace(content))
                 throw new EmptyUpstreamResponseException();
+            Report(model, request, ReadUsage(raw));
             return new OpenAiResponseMessage { Role = "assistant", Content = content };
         }
 
@@ -320,9 +334,77 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy) : IDisp
         {
             throw new InvalidOperationException(errMsg);
         }
+        Report(model, request, ReadUsage(raw));
 
         return parsed?.Choices?.FirstOrDefault()?.Message
                ?? throw new EmptyUpstreamResponseException();
+    }
+
+    /// <summary>流式请求按配置附带 include_usage。</summary>
+    private OpenAiChatRequest Prepare(OpenAiChatRequest request)
+    {
+        request.IncludeUsage = streamUsage && request.Stream;
+        return request;
+    }
+
+    /// <summary>从普通 JSON 响应或整段 SSE 文本里读出 usage；SSE 取最后一个带 usage 的 chunk。</summary>
+    private static TokenUsage? ReadUsage(string raw)
+    {
+        var trimmed = raw.TrimStart();
+        if (!trimmed.StartsWith("data:", StringComparison.Ordinal)) return ParseUsage(trimmed);
+        TokenUsage? last = null;
+        foreach (var line in raw.Split('\n'))
+        {
+            var data = line.Trim();
+            if (!data.StartsWith("data:", StringComparison.Ordinal)) continue;
+            data = data[5..].Trim();
+            if (data.Length > 0 && data != "[DONE]" && ParseUsage(data) is { } usage) last = usage;
+        }
+        return last;
+    }
+
+    private static TokenUsage? ParseUsage(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("usage", out var usage)
+                ? TokenUsage.TryParse(usage) : null;
+        }
+        catch (JsonException) { return null; }
+    }
+
+    private void Report(ModelEntry model, OpenAiChatRequest request, TokenUsage? tokens)
+    {
+        if (usage is null) return;
+        var modelId = string.IsNullOrWhiteSpace(model.Provider) ? model.Name : $"{model.Provider}-{model.Name}";
+        if (tokens is not { } value)
+        {
+            lock (_missingUsageWarned)
+                if (!_missingUsageWarned.Add(modelId)) return;
+            BotLog.Warning($"[AiChat] {modelId} 没有返回 usage，这类请求不计入用量统计" +
+                (request.Stream && !streamUsage ? "（default.stream_usage 已关闭）" : "") + "。");
+            return;
+        }
+        try
+        {
+            var (source, purpose) = UsageScope.Tag;
+            var shape = RequestShape.Of(request);
+            // 对话和主动插话共用会话历史，应当能复用彼此的前缀；摘要、压缩等独立请求不比较。
+            var compareKey = purpose switch
+            {
+                "chat" or "proactive" => $"{source}\n{modelId}\nconversation",
+                "timer" => $"{source}\n{modelId}\ntimer",
+                _ => null
+            };
+            usage.Record(new UsageRecord(DateTimeOffset.Now, modelId, source, purpose, value.PromptTokens, value.CompletionTokens,
+                value.CachedTokens, request.Messages.Count, shape.Images, request.Tools?.Count ?? 0), shape, compareKey);
+        }
+        catch (Exception ex)
+        {
+            // 统计失败不影响回复。
+            BotLog.Warning($"[AiChat] 记录用量失败: {ex.Message}");
+        }
     }
 
     private static string? TryExtractErrorMessage(string body)

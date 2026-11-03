@@ -13,6 +13,7 @@ using ShiroBot.AiChatPlugin.Mcp;
 using ShiroBot.AiChatPlugin.Memory;
 using ShiroBot.AiChatPlugin.Proactive;
 using ShiroBot.AiChatPlugin.Timers;
+using ShiroBot.AiChatPlugin.Usage;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Core;
@@ -78,6 +79,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     private readonly PendingAiRequests _pendingRequests = new();
     private TimerScheduler _timerScheduler = null!;
     private MemoryNotebookStore _memory = null!;
+    private UsageStats _usage = null!;
     private Task? _memoryReview;
 
     private string PluginRoot => Path.GetDirectoryName(Context.Config.ConfigPath)
@@ -107,6 +109,9 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     protected override async Task LoadAsync()
     {
         ApplyConfigDerivatives(initial: true);
+        await _usage.LoadAsync().ConfigureAwait(false);
+        Context.Lifetime.SetInterval(TimeSpan.FromMinutes(1), _ => _usage.SaveAsync());
+        RegisterUsagePage();
 
         // 从配置了 fetch_models = true 的 provider 自动拉取模型列表
         await FetchAndMergeProviderModelsAsync().ConfigureAwait(false);
@@ -162,6 +167,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         if (_memoryReview is not null) await _memoryReview.ConfigureAwait(false);
         if (_timerScheduler is not null) await _timerScheduler.DisposeAsync().ConfigureAwait(false);
         _openAi?.Dispose();
+        if (_usage is not null) await _usage.SaveAsync().ConfigureAwait(false);
         _fetcher?.Dispose();
         _tools.Dispose();
         if (_mcp is not null) await _mcp.DisposeAsync().ConfigureAwait(false);
@@ -208,6 +214,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         max_concurrency = 4
         # 每次模型请求的最大输出 token 数（含工具调用轮次）；0 表示不限制
         max_output_tokens = 0
+        # 流式请求附带 stream_options.include_usage，用于统计 token 用量和缓存命中；上游不支持时改为 false
+        stream_usage = true
         # 默认对话模式: single(单次) / multi(用户独立多轮) / shared(群聊共享)
         default_chat_mode = "shared"
 
@@ -487,6 +495,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
             _conversations = new ConversationStore(pluginRoot, _config.History.Persist, _config.History.MaxTurns);
             _userSettings = new UserSettingsStore(pluginRoot);
             _memory = new MemoryNotebookStore(pluginRoot);
+            _usage = new UsageStats(Path.Combine(pluginRoot, "usage-stats.json"));
             _timerScheduler = new TimerScheduler(pluginRoot,
                 () => _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled, SendTimerAsync,
                 () => _config.ToolUse.TimerTool.MaxDeliveriesPerDay,
@@ -498,7 +507,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
 
         // 这些是无状态的，重建无副作用。
         _openAi?.Dispose();
-        _openAi = new OpenAiClient(_config.Default.TimeoutSeconds, _config.Network.HttpProxy);
+        _openAi = new OpenAiClient(_config.Default.TimeoutSeconds, _config.Network.HttpProxy, _usage, _config.Default.StreamUsage);
         _openAi.RegisterProviders(_config.Providers);
         _fetcher?.Dispose();
         _fetcher = new ResourceFetcher(
@@ -1005,6 +1014,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     private async Task<string> SummarizeFetchedPageAsync(string untrustedPage, CancellationToken ct)
     {
         var model = ResolveModel(_config.Default.Model) ?? throw new InvalidOperationException("未找到网页摘要使用的默认模型。");
+        using var usageScope = UsageScope.Purpose("page_summary");
         // 独立请求：不附加会话历史、用户自定义提示词或工具，网页内容不能调用任何能力。
         return await ExecuteTextWithFallbackAsync(model, requestModel => _openAi.ChatAsync(_config.Default, requestModel,
             new OpenAiChatRequest
@@ -1089,6 +1099,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
             {
                 try
                 {
+                    using var usageScope = UsageScope.Begin(UsageSource(job.ChannelType, job.ChannelId), "timer");
                     var useTools = _config.ToolUse.Enabled && _config.ToolUse.TimerTool.UseToolsOnDelivery && _tools.HasReadOnlyTools;
                     var systemPrompt = ApplyOwnerPrompt(_config.Default.DefaultPrompt.TrimEnd() +
                         (jobs.All(j => j.Cron is null) ? "\n你正在发送用户预约的定时提醒。" : "\n你正在发送用户预约的定时提醒，其中有重复提醒，内容要贴合当天的情况，不要提到这是重复任务。") +
@@ -1276,12 +1287,13 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
             try
             {
                 var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
-                // 主动插话不是用户的请求，不允许预约定时消息。
-                using var timer = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled
+                // 同一会话每次请求的工具列表和 system prompt 保持不变，上游的前缀缓存才能命中：
+                // 本次不允许使用的工具（主动插话、非管理员）仍然列出，调用时由 RefusedChatTool 拒绝。
+                using var timer = _config.ToolUse.Enabled && _config.ToolUse.TimerTool.Enabled
                     ? new TimerTool(_timerScheduler, _config.ToolUse.TimerTool, message) : null;
                 using var memoryTool = convo is not null && _config.ToolUse.Enabled && _config.ToolUse.Memory.Enabled
                     ? new MemoryTool(_memory, _config.ToolUse.Memory, key) : null;
-                var mcpTools = McpToolsFor(message, proactive);
+                var mcpTools = McpTools();
                 var replyStyle = _config.Behaviour.ReplyStyle();
                 var replyModes = replyStyle != "answer";
                 var forceChat = replyStyle == "chat";
@@ -1298,7 +1310,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                         string.Join(" ", item.Turn.Parts.OfType<TextPart>().Select(text => text.Text)).Take(160).Aggregate("", (a, ch) => a + ch)));
                 Task<string> QueueImage(string? size, string? quality, ImagePart[]? references = null)
                     => Task.FromResult(QueueImageGeneration(message, CurrentImagePrompt(message), size, quality, references, convo?.Key));
-                using var imageTool = proactive is null && _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
+                using var imageTool = _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
                     ? new ImageGenerationTool((prompt, size, quality, token) =>
                         { token.ThrowIfCancellationRequested(); return QueueImage(size, quality); },
                         (ids, prompt, size, quality, token) =>
@@ -1309,7 +1321,15 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                         }, imageCatalog) : null;
                 IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
-                IChatTool[] contextual = [.. builtIn, .. pluginTools];
+                // 主动插话不是用户的请求，不允许预约定时消息或生成图片。
+                var proactiveRefusal = proactive is null ? null : "主动插话时不能使用这个工具，请直接回复。";
+                var pluginRefusal = proactive is not null && !_config.ToolUse.PluginTools.AllowProactive ? proactiveRefusal : null;
+                IChatTool[] contextual =
+                [
+                    .. new[] { RefusedChatTool.Wrap(timer, proactiveRefusal), memoryTool, RefusedChatTool.Wrap(imageTool, proactiveRefusal) }.OfType<IChatTool>(),
+                    .. mcpTools.Select(tool => RefusedChatTool.Wrap(tool, McpRefusal(message, proactive))!),
+                    .. pluginTools.Select(tool => RefusedChatTool.Wrap(tool, pluginRefusal)!)
+                ];
                 var contextualTools = contextual.Length > 0 ? contextual : null;
                 // shared 模式用共享会话的公共 prompt，否则用个人设置
                 var systemPrompt = isSharedMode && convo?.SharedPrompt is not null
@@ -1336,18 +1356,9 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 if (mcpTools.Count > 0) systemPrompt += "\n" + McpChatTool.Prompt;
                 if (replyModes) systemPrompt += "\n" + (forceChat ? ParsedReply.ChatOnlyPrompt : ParsedReply.SystemPrompt);
                 systemPrompt = OfficialReplyDelivery.ApplyPromptPolicy(systemPrompt, _config.Behaviour.UseMarkdown);
-                // 历史摘要放在末尾，前面稳定的部分仍可命中上游前缀缓存。
+                // 历史摘要只在压缩时变化，压缩同时改写历史，放在 system prompt 末尾不会额外损失缓存。
                 if (!string.IsNullOrWhiteSpace(convo?.Summary))
                     systemPrompt += "\n\n[历史摘要：更早对话的整理摘要，可能不完整；与最近对话冲突时以最近对话为准]\n" + convo.Summary;
-                if (memoryTool is not null)
-                {
-                    try
-                    {
-                        var notes = await _memory.LoadAsync(key).ConfigureAwait(false);
-                        systemPrompt += "\n\n[记忆本]\n" + (notes.Count == 0 ? "（空）" : MemoryNotebookStore.Format(notes));
-                    }
-                    catch (Exception ex) { BotLog.Warning($"[AiChat] 本次请求不附带记忆本: {ex.Message}"); }
-                }
 
                 var userParts = isSharedMode && !message.IsDirect
                     ? AddSharedSpeakerPrefix(parts, message)
@@ -1365,8 +1376,23 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                         "[群聊最近消息：按时间顺序，用来理解大家在聊什么，不需要逐条回应]\n" + recent)] };
                     BotLog.Info($"[AiChat] 附带最近 {CountLines(recent)} 条群消息");
                 }
+                // 历史图片编号和记忆本经常变化，放在 system prompt 里会让整段历史都无法命中前缀缓存，
+                // 所以和上面的上下文一样只附在本条用户消息末尾。
+                if (imageTool is not null && proactive is null)
+                    requestUserTurn = requestUserTurn with { Parts = [.. requestUserTurn.Parts, new TextPart(imageTool.HistoryCatalog.TrimStart('\n'))] };
+                if (memoryTool is not null)
+                {
+                    try
+                    {
+                        var notes = await _memory.LoadAsync(key).ConfigureAwait(false);
+                        requestUserTurn = requestUserTurn with { Parts = [.. requestUserTurn.Parts, new TextPart(
+                            "[记忆本]\n" + (notes.Count == 0 ? "（空）" : MemoryNotebookStore.Format(notes)))] };
+                    }
+                    catch (Exception ex) { BotLog.Warning($"[AiChat] 本次请求不附带记忆本: {ex.Message}"); }
+                }
 
                 string assistantText;
+                using var usageScope = UsageScope.Begin(UsageSource(key), proactive is null ? "chat" : "proactive");
                 try
                 {
                     var hasImageInCurrent = parts.Any(p => p is ImagePart);
@@ -1878,14 +1904,22 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     }
 
     /// <summary>本次请求可用的 MCP 工具：主动插话不提供；默认只对所有者/管理员提供。</summary>
-    private List<IChatTool> McpToolsFor(MessageEvent message, ProactiveRequest? proactive)
+    /// <summary>
+    /// 启用的 MCP 工具。列表不随发言人变化，前缀缓存才能命中；本次是否允许调用由 <see cref="McpRefusal"/> 决定。
+    /// </summary>
+    private List<IChatTool> McpTools()
     {
         var config = _config.ToolUse.Mcp;
-        if (proactive is not null || _mcp is not { } hub || !_config.ToolUse.Enabled || !config.Enabled) return [];
-        if (!config.AllowEveryone && !Context.IsAdmin(message.Sender.Id)) return [];
+        if (_mcp is not { } hub || !_config.ToolUse.Enabled || !config.Enabled) return [];
         var maxCalls = Math.Clamp(config.MaxCallsPerTurn, 1, 20);
         return hub.Tools.Select(t => (IChatTool)new McpChatTool(hub, t.ToolName, t.Server, t.Tool, maxCalls)).ToList();
     }
+
+    /// <summary>本次请求不能调用 MCP 工具的原因：主动插话从不允许；没有开启 allow_everyone 时只有管理员可以调用。</summary>
+    private string? McpRefusal(MessageEvent message, ProactiveRequest? proactive) =>
+        proactive is not null ? "主动插话时不能使用 MCP 工具，请直接回复。"
+        : !_config.ToolUse.Mcp.AllowEveryone && !Context.IsAdmin(message.Sender.Id) ? "只有机器人所有者或管理员可以使用 MCP 工具，请告诉用户这一点。"
+        : null;
 
     private async Task HandleMcpAsync(MessageEvent message)
     {
@@ -1969,6 +2003,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     {
         var model = ResolveModel(_config.Default.Model) ?? throw new InvalidOperationException("默认模型未注册");
         var maxChars = Math.Clamp(_config.ToolUse.Memory.MaxEntryChars, 20, 1000);
+        using var usageScope = UsageScope.Begin("-", "memory_review");
         foreach (var path in _memory.Notebooks())
         {
             ct.ThrowIfCancellationRequested();
@@ -2059,6 +2094,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     private async Task TryCompactConversationAsync(ConversationState convo, ModelEntry model)
     {
         if (!NeedsCompaction(convo)) return;
+        using var usageScope = UsageScope.Begin(UsageSource(convo.Key), "compact");
         // user+assistant 配对；不按轮数限制时只看 token 预算。
         var maxItems = _config.History.MaxTurns > 0 ? _config.History.MaxTurns * 2 : int.MaxValue;
         var tokenBudget = Math.Max(1000, _config.History.MaxTokens);
@@ -2746,6 +2782,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     {
         if (!_config.PluginApi.Enabled) throw new InvalidOperationException("AI 聊天插件没有对其他插件开放模型。");
         if (request.Messages.Count == 0) throw new ArgumentException("至少需要一条消息。");
+        using var usageScope = UsageScope.Begin("-", "plugin_api");
 
         var models = PluginModels();
         ModelEntry model;
@@ -2803,7 +2840,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     private List<PluginChatTool> PluginToolsFor(MessageEvent message, ProactiveRequest? proactive, IEnumerable<IChatTool> builtIn)
     {
         var config = _config.ToolUse.PluginTools;
-        if (!_config.ToolUse.Enabled || !config.Enabled || proactive is not null && !config.AllowProactive) return [];
+        // 主动插话不允许插件工具时仍然列出，调用时拒绝，见 ProcessAiCoreAsync。
+        if (!_config.ToolUse.Enabled || !config.Enabled) return [];
         var reserved = new HashSet<string>(_tools.Names.Concat(builtIn.Select(tool => tool.Definition.Function.Name)), StringComparer.Ordinal);
         return PluginChatTool.Discover(Context, ToolContext(message, proactive), reserved, config.Disabled);
     }

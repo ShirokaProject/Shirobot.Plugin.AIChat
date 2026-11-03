@@ -61,7 +61,7 @@ internal static class ImageEditQuoteChecks
         using var tool = new ImageGenerationTool((p, size, quality, token) => { newCalls++; return Task.FromResult("new"); },
             (ids, p, size, quality, token) => { selected = ids; editCalls++; return Task.FromResult("edit queued"); },
             "\n历史图片 1：上一张生成图；2：用户此前上传的图片");
-        if (!tool.SystemPrompt.Contains("此前上传") ||
+        if (!tool.HistoryCatalog.Contains("此前上传") || tool.SystemPrompt.Contains("此前上传") ||
             !(await tool.ExecuteAsync("{\"prompt\":\"改背景\",\"reference_images\":[9]}")).Contains("Invalid"))
             throw new Exception("Historical reference catalog or range validation failed.");
         var edit = await tool.ExecuteAsync("{\"prompt\":\"改背景\",\"reference_images\":[2,1,2]}");

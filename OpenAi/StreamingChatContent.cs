@@ -26,11 +26,14 @@ internal sealed class StreamingChatContent : HttpContent
 
     public StreamingChatContent(string model, List<ChatMessageDescriptor> messages,
         bool stream = false, int? maxCompletionTokens = null)
-        : this(new OpenAiChatRequest
-        {
-            Model = model, Stream = stream, MaxCompletionTokens = maxCompletionTokens,
-            Messages = messages.Select(m => new OpenAiMessage { Role = m.Role, Content = m }).ToList()
-        }) { }
+        : this(CreateRequest(model, messages, stream, maxCompletionTokens)) { }
+
+    public static OpenAiChatRequest CreateRequest(string model, List<ChatMessageDescriptor> messages,
+        bool stream = false, int? maxCompletionTokens = null) => new()
+    {
+        Model = model, Stream = stream, MaxCompletionTokens = maxCompletionTokens,
+        Messages = messages.Select(m => new OpenAiMessage { Role = m.Role, Content = m }).ToList()
+    };
 
     protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
         => SerializeToStreamAsync(stream, context, CancellationToken.None);
@@ -42,6 +45,8 @@ internal sealed class StreamingChatContent : HttpContent
         await WriteAsync(stream, "{\"model\":", ct);
         await JsonSerializer.SerializeAsync(stream, request.Model, JsonOptions, ct);
         await WriteAsync(stream, request.Stream ? ",\"stream\":true" : ",\"stream\":false", ct);
+        if (request.Stream && request.IncludeUsage)
+            await WriteAsync(stream, ",\"stream_options\":{\"include_usage\":true}", ct);
         if (request.Temperature is {} temperature)
         {
             await WriteAsync(stream, ",\"temperature\":", ct);

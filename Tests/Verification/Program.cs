@@ -400,6 +400,8 @@ Console.WriteLine("PASS: route-only access config, admin clear guard before muta
 
 CollectibleSerializationChecks.Run();
 await MemoryStreamingChecks.RunAsync();
+await UsageChecks.RunAsync();
+await CacheStabilityChecks.RunAsync();
 await RichReplyChecks.RunAsync();
 await ReplyModeChecks.RunAsync();
 await MemoryNotebookChecks.RunAsync();

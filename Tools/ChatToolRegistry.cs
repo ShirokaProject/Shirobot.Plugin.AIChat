@@ -39,18 +39,18 @@ internal sealed class ChatToolRegistry : IDisposable
             if (!readOnlyOnly || tool is IReadOnlyChatTool) tools.Add(tool.Definition.Function.Name, tool);
         maxRounds = Math.Clamp(maxRounds, 1, 8);
         var calls = new Dictionary<string, int>(StringComparer.Ordinal);
+        var definitions = tools.Values.Select(tool => tool.Definition).ToList();
         var visiblePrefix = "";
         for (var round = 0; round <= maxRounds; round++)
         {
             ct.ThrowIfCancellationRequested();
-            var available = tools.Values.Where(tool =>
-                calls.GetValueOrDefault(tool.Definition.Function.Name) < tool.MaxCallsPerTurn)
-                .Select(tool => tool.Definition).ToList();
+            // 每轮都发送同样的工具定义：工具定义属于前缀，去掉用完次数的工具会让这一轮无法命中缓存。
+            // 超过次数的调用在下面拒绝。
             var request = new OpenAiChatRequest
             {
                 Model = model.Name,
                 Messages = messages,
-                Tools = round < maxRounds && available.Count > 0 ? available : null,
+                Tools = round < maxRounds && definitions.Count > 0 ? definitions : null,
                 Stream = false,
                 MaxCompletionTokens = maxOutputTokens
             };

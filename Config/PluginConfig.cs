@@ -69,6 +69,9 @@ public sealed class DefaultSection
     /// <summary>请求中的 max_completion_tokens；0 或负数时不发送。</summary>
     public int? OutputTokenLimit() => MaxOutputTokens > 0 ? MaxOutputTokens : null;
 
+    [ConfigField("流式请求附带 stream_options.include_usage，让上游返回 token 用量和缓存命中，用于用量统计；上游不支持该参数时关闭。", Label = "流式请求返回用量")]
+    public bool StreamUsage { get; set; } = true;
+
     /// <summary>默认对话模式：single / multi / shared。</summary>
     [ConfigField("single：单次；multi：用户独立多轮；shared：群聊共享。", Label = "默认对话模式", Options = new[] { "single", "multi", "shared" })]
     public string DefaultChatMode { get; set; } = "shared";
