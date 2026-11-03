@@ -13,7 +13,7 @@ public sealed partial class AiChatPlugin
 {
     private readonly SemaphoreSlim _imageGenerationGate = new(1, 1);
 
-    private readonly PendingAiRequests _imageRequests = new();
+    private readonly PendingAiRequests _imageRequests = new(rememberRecalls: true);
 
     private Task HandleImageGenAsync(MessageEvent message)
     {
@@ -48,6 +48,11 @@ public sealed partial class AiChatPlugin
         PendingAiRequest pending;
         try { pending = _imageRequests.Register(message); }
         catch (InvalidOperationException) { return "这条消息已有生图任务，请等待完成。"; }
+        if (pending.Token.IsCancellationRequested)
+        {
+            pending.Dispose();
+            return "原消息已撤回，生图任务已取消。";
+        }
         try
         {
             _ = Context.Lifetime.Run(async stopping =>
@@ -66,7 +71,8 @@ public sealed partial class AiChatPlugin
                         if (result != "图片已生成并发送。" && pending.TryBeginReply())
                             await ReplyAsync(message, !message.IsDirect, result).ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+                    catch (OperationCanceledException) when (stop.IsCancellationRequested)
+                    { BotLog.Info("[AiChat] 生图任务已取消，停止等待上游结果。"); }
                     catch (Exception ex)
                     {
                         BotLog.Warning($"[AiChat] 后台生图失败：{ex.GetType().Name}");

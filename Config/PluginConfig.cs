@@ -451,6 +451,9 @@ public sealed class OwnerPromptSection
 
 public sealed class ImageGenerationSection
 {
+    [ConfigField("撤回触发生图的原消息时，取消排队或正在请求的生图任务，并清理等待提示。需要适配器上报撤回事件。", Label = "撤回时取消生图")]
+    public bool CancelOnRecall { get; set; } = true;
+
     [ConfigField("同时控制生图工具和 #imagegen 命令。", Label = "启用生图")]
     public bool Enabled { get; set; }
     [ConfigField("填写已注册模型名或 provider-model。", Label = "生图模型")]

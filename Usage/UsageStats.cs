@@ -9,7 +9,8 @@ namespace ShiroBot.AiChatPlugin.Usage;
 internal sealed record UsageRecord(
     DateTimeOffset At, string Model, string Source, string Purpose,
     int PromptTokens, int CompletionTokens, int? CachedTokens,
-    int Messages, int Images, int Tools, int CommonMessages = 0, string Change = "");
+    int Messages, int Images, int Tools, int CommonMessages = 0, string Change = "",
+    bool UsageReported = true, long? LocalInputBytes = null, long? LocalReusableBytes = null);
 
 /// <summary>一组请求的合计。缓存命中率只按返回了缓存信息的请求计算。</summary>
 internal sealed class UsageTotals
@@ -21,6 +22,19 @@ internal sealed class UsageTotals
     /// <summary>返回了缓存信息的请求的输入 token 合计，是命中率的分母。</summary>
     public long CacheKnownPromptTokens { get; set; }
 
+    public long UsageRequests { get; set; }
+    public long LocalRequests { get; set; }
+    public long LocalInputBytes { get; set; }
+    public long LocalReusableBytes { get; set; }
+    public long ComparedLocalBytes { get; set; }
+    public long ComparedReusableBytes { get; set; }
+    public long ComparedPromptTokens { get; set; }
+    public long ComparedCachedTokens { get; set; }
+
+    public double? LocalRate => LocalInputBytes == 0 ? null : (double)LocalReusableBytes / LocalInputBytes;
+    public double? ComparedLocalRate => ComparedLocalBytes == 0 ? null : (double)ComparedReusableBytes / ComparedLocalBytes;
+    public double? ComparedCacheRate => ComparedPromptTokens == 0 ? null : (double)ComparedCachedTokens / ComparedPromptTokens;
+
     public double? CacheRate => CacheKnownPromptTokens == 0 ? null : (double)CachedTokens / CacheKnownPromptTokens;
 
     public void Add(UsageTotals other)
@@ -30,6 +44,14 @@ internal sealed class UsageTotals
         CompletionTokens += other.CompletionTokens;
         CachedTokens += other.CachedTokens;
         CacheKnownPromptTokens += other.CacheKnownPromptTokens;
+        UsageRequests += other.UsageRequests;
+        LocalRequests += other.LocalRequests;
+        LocalInputBytes += other.LocalInputBytes;
+        LocalReusableBytes += other.LocalReusableBytes;
+        ComparedLocalBytes += other.ComparedLocalBytes;
+        ComparedReusableBytes += other.ComparedReusableBytes;
+        ComparedPromptTokens += other.ComparedPromptTokens;
+        ComparedCachedTokens += other.ComparedCachedTokens;
     }
 }
 
@@ -46,25 +68,48 @@ internal sealed class UsageStats
     private readonly Dictionary<(string Day, string Model, string Source, string Purpose), UsageTotals> _buckets = new();
     private readonly LinkedList<UsageRecord> _recent = new();
     // 每个会话最近一次请求的前缀摘要，只在内存里，用来判断下一次请求的前缀是否被改写。
-    private readonly Dictionary<string, RequestShape> _lastShapes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (RequestShape? Shape, PrefixSnapshot? Prefix)> _lastShapes = new(StringComparer.Ordinal);
     private bool _dirty;
 
     public UsageStats(string path) => _path = path;
 
     /// <param name="compareKey">同一个 key 的相邻请求互相比较前缀；独立的请求（摘要、压缩）传 null。</param>
-    public void Record(UsageRecord record, RequestShape? shape = null, string? compareKey = null)
+    public void Record(UsageRecord record, RequestShape? shape = null, string? compareKey = null, PrefixSnapshot? prefix = null)
     {
         lock (_gate)
         {
+            var previous = compareKey is null ? default : _lastShapes.GetValueOrDefault(compareKey);
             if (shape is not null && compareKey is not null)
             {
-                var (common, change) = shape.CompareWith(_lastShapes.GetValueOrDefault(compareKey));
+                var (common, change) = shape.CompareWith(previous.Shape);
                 record = record with { CommonMessages = common, Change = change };
-                _lastShapes[compareKey] = shape;
+            }
+            if (prefix is not null)
+                record = record with { LocalInputBytes = prefix.Bytes, LocalReusableBytes = prefix.CommonBytes(previous.Prefix) };
+            if (compareKey is not null)
+            {
+                // 只保存最近 256 个比较范围的摘要，不保存正文；重启后重新建立基线。
+                _lastShapes.Remove(compareKey);
+                if (_lastShapes.Count >= 256) _lastShapes.Remove(_lastShapes.Keys.First());
+                _lastShapes[compareKey] = (shape, prefix);
             }
             var key = (Day(record.At), record.Model, record.Source, record.Purpose);
             if (!_buckets.TryGetValue(key, out var totals)) _buckets[key] = totals = new UsageTotals();
             totals.Requests++;
+            if (record.UsageReported) totals.UsageRequests++;
+            if (record.LocalInputBytes is { } input)
+            {
+                totals.LocalRequests++;
+                totals.LocalInputBytes += input;
+                totals.LocalReusableBytes += record.LocalReusableBytes ?? 0;
+                if (record.CachedTokens is { } comparableCached)
+                {
+                    totals.ComparedLocalBytes += input;
+                    totals.ComparedReusableBytes += record.LocalReusableBytes ?? 0;
+                    totals.ComparedPromptTokens += record.PromptTokens;
+                    totals.ComparedCachedTokens += comparableCached;
+                }
+            }
             totals.PromptTokens += record.PromptTokens;
             totals.CompletionTokens += record.CompletionTokens;
             if (record.CachedTokens is { } cached)
@@ -105,10 +150,11 @@ internal sealed class UsageStats
         return totals;
     }
 
-    public IReadOnlyList<UsageRecord> Recent(int count, string? source = null)
+    public IReadOnlyList<UsageRecord> Recent(int count, string? source = null, DateOnly? from = null)
     {
         lock (_gate)
-            return _recent.Where(record => source is null || record.Source == source).Take(count).ToArray();
+            return _recent.Where(record => (source is null || record.Source == source) &&
+                (from is null || DateOnly.FromDateTime(record.At.LocalDateTime) >= from)).Take(count).ToArray();
     }
 
     public void Reset()
@@ -136,7 +182,15 @@ internal sealed class UsageStats
                     _buckets[key] = new UsageTotals
                     {
                         Requests = Long(item, "requests"), PromptTokens = Long(item, "prompt"), CompletionTokens = Long(item, "completion"),
-                        CachedTokens = Long(item, "cached"), CacheKnownPromptTokens = Long(item, "cache_known_prompt")
+                        CachedTokens = Long(item, "cached"), CacheKnownPromptTokens = Long(item, "cache_known_prompt"),
+                        UsageRequests = item.TryGetProperty("usage_requests", out _) ? Long(item, "usage_requests") : Long(item, "requests"),
+                        LocalRequests = Long(item, "local_requests"),
+                        LocalInputBytes = Long(item, "local_input_bytes"),
+                        LocalReusableBytes = Long(item, "local_reusable_bytes"),
+                        ComparedLocalBytes = Long(item, "compared_local_bytes"),
+                        ComparedReusableBytes = Long(item, "compared_reusable_bytes"),
+                        ComparedPromptTokens = Long(item, "compared_prompt_tokens"),
+                        ComparedCachedTokens = Long(item, "compared_cached_tokens")
                     };
                 }
                 foreach (var item in Items(doc.RootElement, "recent"))
@@ -146,7 +200,9 @@ internal sealed class UsageStats
                         Str(item, "purpose"), (int)Long(item, "prompt"), (int)Long(item, "completion"),
                         item.TryGetProperty("cached", out var cached) && cached.ValueKind == JsonValueKind.Number ? cached.GetInt32() : null,
                         (int)Long(item, "messages"), (int)Long(item, "images"), (int)Long(item, "tools"),
-                        (int)Long(item, "common_messages"), Str(item, "change")));
+                        (int)Long(item, "common_messages"), Str(item, "change"),
+                        !item.TryGetProperty("usage_reported", out var reported) || reported.ValueKind != JsonValueKind.False,
+                        OptionalLong(item, "local_input_bytes"), OptionalLong(item, "local_reusable_bytes")));
                 }
                 Prune();
             }
@@ -195,7 +251,7 @@ internal sealed class UsageStats
         using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = false }))
         {
             writer.WriteStartObject();
-            writer.WriteNumber("version", 1);
+            writer.WriteNumber("version", 2);
             writer.WriteStartArray("buckets");
             foreach (var ((day, model, source, purpose), totals) in _buckets)
             {
@@ -209,6 +265,14 @@ internal sealed class UsageStats
                 writer.WriteNumber("completion", totals.CompletionTokens);
                 writer.WriteNumber("cached", totals.CachedTokens);
                 writer.WriteNumber("cache_known_prompt", totals.CacheKnownPromptTokens);
+                writer.WriteNumber("usage_requests", totals.UsageRequests);
+                writer.WriteNumber("local_requests", totals.LocalRequests);
+                writer.WriteNumber("local_input_bytes", totals.LocalInputBytes);
+                writer.WriteNumber("local_reusable_bytes", totals.LocalReusableBytes);
+                writer.WriteNumber("compared_local_bytes", totals.ComparedLocalBytes);
+                writer.WriteNumber("compared_reusable_bytes", totals.ComparedReusableBytes);
+                writer.WriteNumber("compared_prompt_tokens", totals.ComparedPromptTokens);
+                writer.WriteNumber("compared_cached_tokens", totals.ComparedCachedTokens);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
@@ -228,6 +292,9 @@ internal sealed class UsageStats
                 writer.WriteNumber("tools", record.Tools);
                 writer.WriteNumber("common_messages", record.CommonMessages);
                 writer.WriteString("change", record.Change);
+                writer.WriteBoolean("usage_reported", record.UsageReported);
+                if (record.LocalInputBytes is { } input) writer.WriteNumber("local_input_bytes", input);
+                if (record.LocalReusableBytes is { } reusable) writer.WriteNumber("local_reusable_bytes", reusable);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
@@ -243,6 +310,9 @@ internal sealed class UsageStats
 
     private static string Str(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
+
+    private static long? OptionalLong(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetInt64() : null;
 
     private static long Long(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetInt64() : 0;

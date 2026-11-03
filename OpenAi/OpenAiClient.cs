@@ -344,6 +344,8 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
     private OpenAiChatRequest Prepare(OpenAiChatRequest request)
     {
         request.IncludeUsage = streamUsage && request.Stream;
+        request.CapturePrefix = usage is not null;
+        request.SentPrefix = null;
         return request;
     }
 
@@ -378,27 +380,29 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
     {
         if (usage is null) return;
         var modelId = string.IsNullOrWhiteSpace(model.Provider) ? model.Name : $"{model.Provider}-{model.Name}";
-        if (tokens is not { } value)
+        if (tokens is null)
         {
             lock (_missingUsageWarned)
-                if (!_missingUsageWarned.Add(modelId)) return;
-            BotLog.Warning($"[AiChat] {modelId} 没有返回 usage，这类请求不计入用量统计" +
+                if (_missingUsageWarned.Add(modelId))
+                    BotLog.Warning($"[AiChat] {modelId} 没有返回 usage，仍记录请求和本地前缀复用；上游 Token 用量未知" +
                 (request.Stream && !streamUsage ? "（default.stream_usage 已关闭）" : "") + "。");
-            return;
         }
         try
         {
             var (source, purpose) = UsageScope.Tag;
             var shape = RequestShape.Of(request);
             // 对话和主动插话共用会话历史，应当能复用彼此的前缀；摘要、压缩等独立请求不比较。
+            var (baseUrl, apiKey) = ResolveEndpoint(model);
+            var endpoint = baseUrl + "\n" + apiKey;
+            var upstream = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(endpoint)));
             var compareKey = purpose switch
             {
-                "chat" or "proactive" => $"{source}\n{modelId}\nconversation",
-                "timer" => $"{source}\n{modelId}\ntimer",
+                "chat" or "proactive" => $"{upstream}\n{source}\n{modelId}\nconversation",
+                "timer" => $"{upstream}\n{source}\n{modelId}\ntimer",
                 _ => null
             };
-            usage.Record(new UsageRecord(DateTimeOffset.Now, modelId, source, purpose, value.PromptTokens, value.CompletionTokens,
-                value.CachedTokens, request.Messages.Count, shape.Images, request.Tools?.Count ?? 0), shape, compareKey);
+            usage.Record(new UsageRecord(DateTimeOffset.Now, modelId, source, purpose, tokens?.PromptTokens ?? 0, tokens?.CompletionTokens ?? 0,
+                tokens?.CachedTokens, request.Messages.Count, shape.Images, request.Tools?.Count ?? 0, UsageReported: tokens is not null), shape, compareKey, request.SentPrefix);
         }
         catch (Exception ex)
         {

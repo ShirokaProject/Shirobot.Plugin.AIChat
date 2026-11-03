@@ -25,9 +25,14 @@ internal sealed record RequestShape(int Images, string ToolsHash, string[] Chain
             }
         }
 
+        if (request.SentPrefix is { } sent && sent.Points.Length >= request.Messages.Count + 2)
+            return new RequestShape(images, sent.Points[0].Hash,
+                sent.Points.Skip(1).Take(request.Messages.Count).Select(point => point.Hash).ToArray());
+
         var tools = new StringBuilder();
         foreach (var tool in request.Tools ?? [])
-            tools.Append(tool.Function.Name).Append('\0').Append(tool.Function.Description).Append('\u0001');
+            tools.Append(PluginJson.Serialize(new { tool.Type, tool.Function.Name, tool.Function.Description,
+                Parameters = PluginJson.ToJsonValue(tool.Function.Parameters) })).Append('\u0001');
         return new RequestShape(images, tools.Length == 0 ? "" : Short(SHA256.HashData(Encoding.UTF8.GetBytes(tools.ToString()))), chain);
     }
 

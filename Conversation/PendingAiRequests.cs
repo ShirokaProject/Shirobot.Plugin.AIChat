@@ -4,11 +4,12 @@ using ShiroBot.SDK.Models;
 namespace ShiroBot.AiChatPlugin.Conversation;
 
 /// <summary>按原消息跟踪请求；适配器实例和会话参与匹配，避免误取消其他账号或群的请求。</summary>
-internal sealed class PendingAiRequests
+internal sealed class PendingAiRequests(bool rememberRecalls = false)
 {
     private readonly ConcurrentDictionary<RequestKey, PendingAiRequest> _requests = new();
     private readonly Lock _gate = new();
     private bool _stopping;
+    private readonly Dictionary<RequestKey, DateTimeOffset> _recalled = new();
     public int Count => _requests.Count;
 
     public async Task StopAsync()
@@ -27,7 +28,12 @@ internal sealed class PendingAiRequests
         request = new PendingAiRequest(() => _requests.TryRemove(new KeyValuePair<RequestKey, PendingAiRequest>(key, request!)));
         lock (_gate)
         {
-            if (!_stopping && _requests.TryAdd(key, request)) return request;
+            if (!_stopping && _requests.TryAdd(key, request))
+            {
+                if (rememberRecalls && _recalled.TryGetValue(key, out var recalledAt) && recalledAt > DateTimeOffset.UtcNow.AddHours(-1))
+                    _ = request.CancelBeforeReplyAsync();
+                return request;
+            }
         }
         request.Dispose();
         if (_stopping) throw new OperationCanceledException("Plugin is unloading.");
@@ -38,6 +44,17 @@ internal sealed class PendingAiRequests
     {
         var key = new RequestKey(message.InstanceId, message.Platform, message.Channel.Type,
             message.Channel.Id, message.MessageId);
+        if (rememberRecalls)
+        {
+            lock (_gate)
+            {
+                foreach (var expired in _recalled.Where(pair => pair.Value <= DateTimeOffset.UtcNow.AddHours(-1)).Select(pair => pair.Key).ToArray())
+                    _recalled.Remove(expired);
+                _recalled.Remove(key);
+                if (_recalled.Count >= 1024) _recalled.Remove(_recalled.Keys.First());
+                _recalled[key] = DateTimeOffset.UtcNow;
+            }
+        }
         return _requests.TryGetValue(key, out var request)
             ? request.CancelBeforeReplyAsync() : Task.CompletedTask;
     }

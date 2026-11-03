@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using ShiroBot.AiChatPlugin.Usage;
 
 namespace ShiroBot.AiChatPlugin.OpenAi;
 
@@ -7,6 +8,12 @@ namespace ShiroBot.AiChatPlugin.OpenAi;
 /// </summary>
 internal sealed class OpenAiChatRequest
 {
+    [JsonIgnore]
+    public bool CapturePrefix { get; set; }
+
+    [JsonIgnore]
+    public PrefixSnapshot? SentPrefix { get; set; }
+
     [JsonPropertyName("model")]
     public string Model { get; set; } = "";
 

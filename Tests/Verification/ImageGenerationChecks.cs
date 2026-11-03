@@ -55,7 +55,9 @@ internal static class ImageGenerationChecks
                     lastQuality = json.RootElement.GetProperty("quality").GetString();
                 }
                 var bytes = Encoding.UTF8.GetBytes("{\"data\":[{\"b64_json\":\"" + Convert.ToBase64String(png) + "\"}]}");
-                await ctx.Response.OutputStream.WriteAsync(bytes); ctx.Response.Close();
+                try { await ctx.Response.OutputStream.WriteAsync(bytes); ctx.Response.Close(); }
+                catch (Exception ex) when (ex is HttpListenerException or IOException or ObjectDisposedException)
+                { try { ctx.Response.Abort(); } catch (ObjectDisposedException) { } }
             }
         });
         var config = new PluginConfig(); config.ToolUse.ImageGen.Enabled = true;
@@ -170,6 +172,51 @@ internal static class ImageGenerationChecks
         await (Task)typeof(AiChatPlugin).GetMethod("HandleImageGenAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(plugin, [command])!;
         await Task.WhenAll(jobs).WaitAsync(TimeSpan.FromSeconds(5));
         Check(calls == 7 && lastPrompt == "画一只白猫", "Direct command must preserve the user's prompt without rewriting.");
+        Check(config.ToolUse.ImageGen.CancelOnRecall && !config.Behaviour.CancelOnRecall,
+            "Image recall cancellation must default on independently of ordinary chat recall.");
+        holdImage = true;
+        imageStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        releaseImage = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var recalledRequest = request with { MessageId = "recall-running", Segments = [new TextSegment("画一张海报")] };
+        var deletedEvent = new MessageDeletedEvent { Platform = recalledRequest.Platform, InstanceId = recalledRequest.InstanceId,
+            Channel = recalledRequest.Channel, MessageId = recalledRequest.MessageId };
+        var onRecall = typeof(AiChatPlugin).GetMethod("HandleMessageDeletedAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var beforeImages = paths.Count; var beforeDeletes = deleted.Count;
+        queue.Invoke(plugin, [recalledRequest, "海报", null, null, null, null]);
+        await imageStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var running = jobs.Last();
+        await (Task)onRecall.Invoke(plugin, [deletedEvent with { InstanceId = "unrelated" }])!;
+        Check(!running.IsCompleted, "Unrelated recall must not stop an image request.");
+        await (Task)onRecall.Invoke(plugin, [deletedEvent])!;
+        await running.WaitAsync(TimeSpan.FromSeconds(3));
+        Check(paths.Count == beforeImages && deleted.Count == beforeDeletes + 1,
+            "Recall must cancel the in-flight HTTP wait before upstream responds, send no image and retract progress.");
+        releaseImage.TrySetResult(); holdImage = false;
+        var callsAfterCancellation = calls;
+
+        var imageGate = (SemaphoreSlim)typeof(AiChatPlugin).GetField("_imageGenerationGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(plugin)!;
+        await imageGate.WaitAsync();
+        try
+        {
+            var waiting = recalledRequest with { MessageId = "recall-queued" };
+            queue.Invoke(plugin, [waiting, "排队图", null, null, null, null]);
+            var job = jobs.Last();
+            config.ToolUse.ImageGen.CancelOnRecall = false;
+            await (Task)onRecall.Invoke(plugin, [deletedEvent with { MessageId = waiting.MessageId }])!;
+            Check(!job.IsCompleted, "Image recall switch off must preserve the queued job.");
+            config.ToolUse.ImageGen.CancelOnRecall = true;
+            await (Task)onRecall.Invoke(plugin, [deletedEvent with { MessageId = waiting.MessageId }])!;
+            await job.WaitAsync(TimeSpan.FromSeconds(3));
+            Check(calls == callsAfterCancellation, "A recalled queued job must never call the provider.");
+        }
+        finally { imageGate.Release(); }
+        var late = recalledRequest with { MessageId = "recall-before-tool" };
+        await (Task)onRecall.Invoke(plugin, [deletedEvent with { MessageId = late.MessageId }])!;
+        var beforeJobs = jobs.Count;
+        using var lateTool = plugin.CreateImageGenerationTool(late, [], "");
+        Check((await lateTool.ExecuteAsync("{\"prompt\":\"海报\"}")).Contains("撤回") && jobs.Count == beforeJobs && calls == callsAfterCancellation,
+            "A tool result arriving after recall must not queue a new image job.");
+        Console.WriteLine("PASS: image recall cancels running HTTP and queued work, cleans progress, isolates instances and prevents late tool submission");
         listener.Stop(); await serve;
         Directory.Delete(tempRoot, recursive: true);
         Console.WriteLine("PASS: image generation provider request, one-image delivery, reaction cleanup, text fallback, retry deduplication, cancellation and enabled switch");

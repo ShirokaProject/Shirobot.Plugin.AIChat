@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using ShiroBot.AiChatPlugin.Usage;
 
 namespace ShiroBot.AiChatPlugin.OpenAi;
 
@@ -57,6 +58,8 @@ internal sealed class StreamingChatContent : HttpContent
             await WriteAsync(stream, ",\"max_completion_tokens\":", ct);
             await JsonSerializer.SerializeAsync(stream, tokens, JsonOptions, ct);
         }
+        using var prefix = request.CapturePrefix ? new PrefixCaptureStream(stream) : null;
+        if (prefix is not null) stream = prefix;
         if (request.Tools is {} tools)
         {
             await WriteAsync(stream, ",\"tools\":", ct);
@@ -71,6 +74,7 @@ internal sealed class StreamingChatContent : HttpContent
             }).ToList();
             await JsonSerializer.SerializeAsync(stream, schemas, JsonOptions, ct);
         }
+        prefix?.Checkpoint();
         await WriteAsync(stream, ",\"messages\":[", ct);
         for (int i = 0; i < request.Messages.Count; i++)
         {
@@ -99,8 +103,11 @@ internal sealed class StreamingChatContent : HttpContent
                 await JsonSerializer.SerializeAsync(stream, calls, JsonOptions, ct);
             }
             await WriteAsync(stream, "}", ct);
+            prefix?.Checkpoint();
         }
         await WriteAsync(stream, "]}", ct);
+        prefix?.Checkpoint();
+        request.SentPrefix = prefix?.Snapshot();
     }
 
     protected override void Dispose(bool disposing)

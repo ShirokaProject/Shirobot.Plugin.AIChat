@@ -1099,7 +1099,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
             {
                 try
                 {
-                    using var usageScope = UsageScope.Begin(UsageSource(job.ChannelType, job.ChannelId), "timer");
+                    using var usageScope = UsageScope.Begin(UsageSource(job.InstanceId, job.ChannelType, job.ChannelId), "timer");
                     var useTools = _config.ToolUse.Enabled && _config.ToolUse.TimerTool.UseToolsOnDelivery && _tools.HasReadOnlyTools;
                     var systemPrompt = ApplyOwnerPrompt(_config.Default.DefaultPrompt.TrimEnd() +
                         (jobs.All(j => j.Cron is null) ? "\n你正在发送用户预约的定时提醒。" : "\n你正在发送用户预约的定时提醒，其中有重复提醒，内容要贴合当天的情况，不要提到这是重复任务。") +
@@ -1143,9 +1143,9 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     private Task HandleMessageDeletedAsync(MessageDeletedEvent message)
     {
         if (message.Channel.Type == ChannelType.Group) ForgetRecalledGroupMessage(message);
-        return _config.Behaviour.CancelOnRecall
-            ? Task.WhenAll(_pendingRequests.CancelBeforeReplyAsync(message), _imageRequests.CancelBeforeReplyAsync(message))
-            : Task.CompletedTask;
+        return Task.WhenAll(
+            _config.Behaviour.CancelOnRecall ? _pendingRequests.CancelBeforeReplyAsync(message) : Task.CompletedTask,
+            _config.ToolUse.ImageGen.CancelOnRecall ? _imageRequests.CancelBeforeReplyAsync(message) : Task.CompletedTask);
     }
 
     private async Task ProcessAiAsync(MessageEvent message, ConversationKey key,

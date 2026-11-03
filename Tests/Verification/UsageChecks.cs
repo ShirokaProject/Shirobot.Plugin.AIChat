@@ -146,5 +146,127 @@ internal static class UsageChecks
         Check(Shape("system", ["a"], "u2", "a2", "u3", "a3", "u4").CompareWith(longer).Change == "第 1 条起变化",
             "Dropping the oldest history must be reported as a rewritten prefix.");
         Console.WriteLine("PASS: PrefixChangesAreClassified");
+        await LocalPrefixesAsync();
     }
+    private static async Task LocalPrefixesAsync()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "aichat-local-prefix-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var today = DateOnly.FromDateTime(DateTime.Now);
+            var stats = new UsageStats(Path.Combine(root, "stats.json"));
+            var withUsage = false;
+            var upstream = new Upstream(_ => Json(withUsage
+                ? """{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1000,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0}}}"""
+                : """{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"""));
+            using var client = Client(upstream, stats);
+            const string secretText = "Private prompt must never be persisted";
+            OpenAiChatRequest Request(bool append = false, string schema = "string") => new()
+            {
+                Model = "test", Messages = append
+                    ? Messages(("system", secretText), ("user", "first"), ("assistant", "ok"), ("user", "next"))
+                    : Messages(("system", secretText), ("user", "first")),
+                Tools = [new OpenAiTool { Function = new OpenAiToolFunction
+                {
+                    Name = "lookup", Description = "lookup",
+                    Parameters = new { type = "object", properties = new { query = new { type = schema } } }
+                } }]
+            };
+            async Task Send(OpenAiChatRequest request, string source = "one / 群 1", ModelEntry? model = null)
+            {
+                using var scope = UsageScope.Begin(source, "chat");
+                await client.ChatAsync(new DefaultSection(), model ?? Model, request);
+            }
+            var first = Request(); await Send(first);
+            Check(stats.Recent(1).Single() is { UsageReported: false, LocalInputBytes: > 0, LocalReusableBytes: 0, CachedTokens: null },
+                "Missing usage must still record a local first-request baseline, with upstream fields unknown.");
+            var next = Request(append: true); await Send(next);
+            var row = stats.Recent(1).Single();
+            Check(row.LocalReusableBytes == next.SentPrefix!.CommonBytes(first.SentPrefix) && row.LocalReusableBytes > 0 && row.LocalReusableBytes < row.LocalInputBytes,
+                "Appended history must reuse the actual shared serialized prefix, including tools.");
+            withUsage = true;
+            var identical = Request(append: true); identical.Temperature = 0.2; identical.MaxCompletionTokens = 42;
+            await Send(identical);
+            row = stats.Recent(1).Single();
+            Check(row.LocalReusableBytes == row.LocalInputBytes && row.CachedTokens == 0 && row.UsageReported,
+                "Unchanged prompt bytes must be locally reusable even if upstream reports zero cache hits; sampling controls are excluded.");
+            var total = stats.Total(today);
+            Check(total.Requests == 3 && total.UsageRequests == 1 && total.LocalRequests == 3 && total.PromptTokens == 1000 && total.CacheRate == 0 &&
+                total.ComparedLocalRate == 1 && total.ComparedCacheRate == 0 && total.LocalRate > 0 && total.LocalRate < 1,
+                "Upstream and local metrics must use their own covered denominators and comparable cohort.");
+            withUsage = false;
+            await Send(Request(append: true, schema: "integer"));
+            Check(stats.Recent(1).Single() is { LocalReusableBytes: 0, Change: "工具定义变化" },
+                "Changing only a tool parameter schema must invalidate the prefix.");
+            await Send(Request(append: true, schema: "integer"), "two / 群 1");
+            Check(stats.Recent(1).Single().LocalReusableBytes == 0, "Instances must not share local prefix baselines.");
+            await Send(Request(append: true, schema: "integer"), model: new ModelEntry { Name = "test", BaseUrl = Model.BaseUrl, ApiKey = "other-key" });
+            Check(stats.Recent(1).Single().LocalReusableBytes == 0, "Different upstream credentials must not share local prefix baselines.");
+
+            // 同一路径中的图片改变，或同长度的内联图片改变，都必须使该条消息开始的前缀失效。
+            var imageFile = Path.Combine(root, "image.b64");
+            await File.WriteAllTextAsync(imageFile, "data:image/png;base64,AAAA");
+            OpenAiChatRequest ImageRequest(bool inline, byte value = 1) => new()
+            {
+                Model = "test", Messages = [new OpenAiMessage { Role = "system", Content = "image-test" },
+                    new OpenAiMessage { Role = "user", Content = new ChatMessageDescriptor { Role = "user", Segments =
+                        [inline ? new ContentSegment { Kind = SegmentKind.Image, InlineBytes = [value, 2, 3], Mime = "image/png" }
+                            : new ContentSegment { Kind = SegmentKind.Image, B64FilePath = imageFile }] } }]
+            };
+            var image1 = ImageRequest(false); await Send(image1, "images");
+            await File.WriteAllTextAsync(imageFile, "data:image/png;base64,BBBB");
+            var image2 = ImageRequest(false); await Send(image2, "images");
+            Check(stats.Recent(1).Single().LocalReusableBytes == image2.SentPrefix!.Points[1].Bytes,
+                "Changing image bytes at the same path must only reuse the preceding system prefix.");
+            var inline1 = ImageRequest(true); await Send(inline1, "inline");
+            var inline2 = ImageRequest(true, 4); await Send(inline2, "inline");
+            Check(stats.Recent(1).Single().LocalReusableBytes == inline2.SentPrefix!.Points[1].Bytes,
+                "Different inline images of equal length must not be counted as identical.");
+            var wire = upstream.LastBody;
+            using (var doc = JsonDocument.Parse(wire))
+                Check(!doc.RootElement.TryGetProperty("CapturePrefix", out _) && !doc.RootElement.TryGetProperty("SentPrefix", out _),
+                    "Local diagnostics must not alter the upstream request schema.");
+            await stats.SaveAsync();
+            var persisted = await File.ReadAllTextAsync(Path.Combine(root, "stats.json"));
+            Check(!persisted.Contains(secretText) && !persisted.Contains(imageFile), "Statistics must not persist prompt text or image paths.");
+            var loaded = new UsageStats(Path.Combine(root, "stats.json")); await loaded.LoadAsync();
+            Check(loaded.Total(today).LocalInputBytes == stats.Total(today).LocalInputBytes &&
+                loaded.Total(today).UsageRequests == stats.Total(today).UsageRequests && loaded.Total(today).ComparedLocalRate == 1 &&
+                loaded.Recent(1).Single().LocalReusableBytes == stats.Recent(1).Single().LocalReusableBytes,
+                "Local aggregates, comparison cohorts and request rows must survive reload.");
+            using (var freshClient = Client(new Upstream(_ => Json("""{"choices":[{"message":{"role":"assistant","content":"ok"}}]}""")), loaded))
+            using (UsageScope.Begin("inline", "chat"))
+                await freshClient.ChatAsync(new DefaultSection(), Model, inline2);
+            Check(loaded.Recent(1).Single().LocalReusableBytes == 0, "Reload must start with a fresh local baseline.");
+            stats.Reset(); await Send(Request());
+            Check(stats.Total(today).Requests == 1 && stats.Recent(1).Single().LocalReusableBytes == 0, "Reset must clear local baselines too.");
+
+            var sseStats = new UsageStats(Path.Combine(root, "sse.json"));
+            using (var sseClient = Client(new Upstream(_ => Sse("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")), sseStats, streamUsage: false))
+            using (UsageScope.Begin("stream-scope", "chat"))
+            {
+                for (var i = 0; i < 2; i++)
+                    await sseClient.ChatIncrementalAsync(Model, Request(), _ => Task.CompletedTask);
+                Check(sseStats.Total(today).Requests == 2 && sseStats.Total(today).UsageRequests == 0 && sseStats.Recent(1).Single() is
+                    { UsageReported: false, LocalInputBytes: > 0 } && sseStats.Recent(1).Single().LocalInputBytes == sseStats.Recent(1).Single().LocalReusableBytes,
+                    "SSE without usage, even with stream_usage disabled, must record local reuse independently.");
+            }
+            using (UsageScope.Begin("independent", "compact"))
+            {
+                await client.ChatAsync(new DefaultSection(), Model, Request());
+                await client.ChatAsync(new DefaultSection(), Model, Request());
+                Check(stats.Recent(1).Single().LocalReusableBytes == 0, "Independent summaries must not borrow a conversation baseline.");
+            }
+
+            var legacyPath = Path.Combine(root, "legacy.json");
+            await File.WriteAllTextAsync(legacyPath, "{\"version\":1,\"buckets\":[{\"day\":\"" + today.ToString("yyyy-MM-dd") + "\",\"requests\":2,\"prompt\":100}],\"recent\":[]}");
+            var legacy = new UsageStats(legacyPath); await legacy.LoadAsync();
+            Check(legacy.Total(today).UsageRequests == 2 && legacy.Total(today).LocalRate is null,
+                "Legacy totals must remain usable without inventing historical local data.");
+            Console.WriteLine("PASS: local wire-prefix reuse, missing usage, tool/image mutations, scope isolation, weighted comparison, persistence and reset");
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
 }
