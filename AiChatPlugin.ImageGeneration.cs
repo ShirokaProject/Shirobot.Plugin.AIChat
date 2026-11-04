@@ -11,6 +11,33 @@ namespace ShiroBot.AiChatPlugin;
 
 public sealed partial class AiChatPlugin
 {
+    internal static async Task<IReadOnlyList<Contracts.ChatToolImage>> ResolvePluginImagesAsync(
+        System.Text.Json.Nodes.JsonObject args, ImagePart[] images, int currentCount, CancellationToken ct)
+    {
+        var ids = args["image_ids"] is System.Text.Json.Nodes.JsonArray selected && selected.Count > 0
+            ? selected.Select(node => node?.GetValue<int>() ?? 0).Distinct().ToArray()
+            : Enumerable.Range(1, Math.Min(currentCount, images.Length)).ToArray();
+        if (ids.Length > 4 || ids.Any(id => id < 1 || id > images.Length))
+            throw new ArgumentException("图片编号无效；请选择本轮提供的 1–4 张图片。");
+        var result = new List<Contracts.ChatToolImage>();
+        foreach (var id in ids)
+        {
+            ct.ThrowIfCancellationRequested();
+            var image = images[id - 1];
+            string data;
+            if (image.Bytes > 5_000_000) throw new ArgumentException("图片超过保存工具的 5 MB 限制。");
+            if (image.InlineBytes is { } bytes) data = Convert.ToBase64String(bytes);
+            else if (GetB64FilePath(image.CachePath) is { } path && new FileInfo(path).Length <= 6_700_000)
+            {
+                var url = await File.ReadAllTextAsync(path, ct).ConfigureAwait(false);
+                data = url[(url.IndexOf(',') + 1)..];
+            }
+            else throw new ArgumentException("图片缓存已失效，请重新发送图片。");
+            result.Add(new(id, image.Mime, data));
+        }
+        return result;
+    }
+
     private readonly SemaphoreSlim _imageGenerationGate = new(1, 1);
 
     private readonly PendingAiRequests _imageRequests = new(rememberRecalls: true);

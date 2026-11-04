@@ -16,6 +16,7 @@ internal sealed partial class PluginChatTool : IChatTool
     private readonly IBotContext _context;
     private readonly PluginServiceEntry<ChatToolCall, ChatToolResult, ChatToolInfo> _entry;
     private readonly ChatToolContext _chat;
+    internal Func<JsonObject, CancellationToken, Task<IReadOnlyList<ChatToolImage>>>? ResolveImages { get; set; }
 
     private PluginChatTool(IBotContext context, PluginServiceEntry<ChatToolCall, ChatToolResult, ChatToolInfo> entry,
         ChatToolInfo info, ChatToolContext chat)
@@ -23,7 +24,7 @@ internal sealed partial class PluginChatTool : IChatTool
         _context = context;
         _entry = entry;
         _chat = chat;
-        SystemPrompt = info.Prompt ?? "";
+        _systemPrompt = info.Prompt ?? "";
         MaxCallsPerTurn = Math.Clamp(info.MaxCallsPerTurn, 1, 5);
         var description = info.Description.Length > 1000 ? info.Description[..1000] + "…" : info.Description;
         Definition = new OpenAiTool
@@ -40,7 +41,9 @@ internal sealed partial class PluginChatTool : IChatTool
     }
 
     public OpenAiTool Definition { get; }
-    public string SystemPrompt { get; }
+    private readonly string _systemPrompt;
+    internal string ImageCatalog { get; set; } = "";
+    public string SystemPrompt => _systemPrompt + ImageCatalog;
     public int MaxCallsPerTurn { get; }
 
     /// <summary>本轮工具调用要求在回复后执行的动作，按调用顺序。</summary>
@@ -78,7 +81,11 @@ internal sealed partial class PluginChatTool : IChatTool
         ChatToolResult? result;
         try
         {
-            result = await _entry.TryCallAsync(_context, new ChatToolCall(args, _chat), ct).ConfigureAwait(false);
+            result = await _entry.TryCallAsync(_context, new ChatToolCall(args, ResolveImages is null ? _chat : _chat with { Images = await ResolveImages(args, ct).ConfigureAwait(false) }), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is ArgumentException or System.IO.IOException or InvalidOperationException or FormatException)
+        {
+            return "图片选择或缓存读取失败，未保存，请重新附图或选择有效编号。";
         }
         catch (PluginServiceException ex)
         {

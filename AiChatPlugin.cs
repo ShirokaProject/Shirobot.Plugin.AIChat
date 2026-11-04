@@ -21,7 +21,7 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.3")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.4")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -32,7 +32,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.4.3",
+    Version = "1.4.4",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -1202,6 +1202,26 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
             parts.Add(new TextPart("[交互方式: 用户正在@你，触发用的@已从原始内容移除。除明确标注的引用/转发内容外，本条其余内容是当前用户对你说的话；引用中的作者不等于当前用户，不要把你的名称当作第三方。]"));
         }
 
+        // A common mobile flow sends the image first and the save request in a second message.
+        // Explicit quotes remain authoritative; never substitute another image when a quote fails.
+        if (proactive is null && !parts.OfType<ImagePart>().Any() && message.GetQuote() is null &&
+            IsImageSaveRequest(message.GetPlainText()))
+        {
+            try
+            {
+                var recent = await Context.Message.GetHistoryMessagesAsync(message.Channel, message.MessageId, 6, ct).ConfigureAwait(false);
+                if (RecentSaveImage(message, recent) is { } source)
+                {
+                    var collected = await new ResourceCollector(Context, _fetcher, _cache, _config.Resources)
+                        .CollectAsync(source, ct).ConfigureAwait(false);
+                    parts.Add(new TextPart($"[以下图片来自当前用户刚刚发送的消息 #{source.MessageId}，本次请求指向这张图片。]"));
+                    parts.AddRange(collected.OfType<ImagePart>());
+                }
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            { BotLog.Warning($"[AiChat] 无法读取前一条图片：{ex.GetType().Name}"); }
+        }
+
         // 诊断：把这次提取到的资源种类和数量打日志，便于排查"图片被吞"的问题。
         var imageSources = parts.OfType<ImagePart>().ToArray();
         var imgCount = imageSources.Length;
@@ -1312,6 +1332,15 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                     ? CreateImageGenerationTool(message, historyImages.Select(item => item.Image).ToArray(), imageCatalog, convo?.Key) : null;
                 IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool }.OfType<IChatTool>(), .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
+                var toolImages = parts.OfType<ImagePart>().Concat(historyImages.Select(item => item.Image)).Distinct().Take(8).ToArray();
+                foreach (var tool in pluginTools)
+                {
+                    if ((tool.Definition.Function.Parameters as System.Text.Json.Nodes.JsonObject)?["properties"]?["image_ids"] is null) continue;
+                    tool.ImageCatalog = "\n可保存图片编号（只选用户要保存的图片，不要把收图请求当作标签）：" +
+                        string.Join("、", toolImages.Select((_, i) => $"{i + 1}")) +
+                        $"。前 {Math.Min(parts.OfType<ImagePart>().Count(), toolImages.Length)} 张来自本条或引用消息，其余是当前会话最近的历史图片。image_ids 留空时只使用本条或引用图片。";
+                    tool.ResolveImages = (args, token) => ResolvePluginImagesAsync(args, toolImages, parts.OfType<ImagePart>().Count(), token);
+                }
                 // 主动插话不是用户的请求，不允许预约定时消息或生成图片。
                 var proactiveRefusal = proactive is null ? null : "主动插话时不能使用这个工具，请直接回复。";
                 var pluginRefusal = proactive is not null && !_config.ToolUse.PluginTools.AllowProactive ? proactiveRefusal : null;
@@ -2838,6 +2867,18 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     }
 
     /// <summary>传给插件工具的会话信息，提供方据此选择内容或自行发送消息。</summary>
+    internal static bool IsImageSaveRequest(string text) =>
+        (text.Contains("保存") || text.Contains("收藏") || text.Contains("收")) &&
+        (text.Contains("图片") || text.Contains("表情") || text.Contains("这张图"));
+
+    internal static MessageEvent? RecentSaveImage(MessageEvent request, IEnumerable<MessageEvent> history) => history
+        .Where(item => item.Platform == request.Platform && item.InstanceId == request.InstanceId &&
+            item.Channel.Id == request.Channel.Id && item.Channel.Type == request.Channel.Type && item.Sender.Id == request.Sender.Id &&
+            item.MessageId != request.MessageId && item.Timestamp != default && request.Timestamp != default &&
+            item.Timestamp <= request.Timestamp && request.Timestamp - item.Timestamp <= TimeSpan.FromMinutes(2))
+        .OrderByDescending(item => item.Timestamp)
+        .FirstOrDefault(item => item.Segments.Any(segment => segment is ImageSegment or RawSegment { Payload: QIncomingImage or QIncomingMarketFace }));
+
     private static ChatToolContext ToolContext(MessageEvent message, ProactiveRequest? proactive) => new(
         message.Platform, message.InstanceId, message.Channel.Type.ToString(), message.Channel.Id,
         message.MessageId, message.Sender.Id, !message.IsDirect, proactive is not null);

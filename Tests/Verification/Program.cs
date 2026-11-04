@@ -450,6 +450,35 @@ await IdentityScopeChecks.RunAsync();
         "Plugin tools must pass the model's arguments and the conversation context.");
     Check(tools[0].FollowUps is [{ Name: "send_meme" } followUp] && (string?)followUp.Arguments?["id"] == "m1",
         "Plugin tools must keep after-reply actions.");
+    var saveRequest = new MessageEvent { Platform = "qq", InstanceId = "test", MessageId = "save-request",
+        Channel = Channel.Group("g1"), Sender = new User("u1"), Timestamp = DateTimeOffset.UtcNow, Segments = [] };
+    var priorImage = saveRequest with { MessageId = "image", Timestamp = saveRequest.Timestamp.AddSeconds(-10),
+        Segments = [new ImageSegment("https://example.invalid/image.png")] };
+    Check(AiChatPlugin.RecentSaveImage(saveRequest, [priorImage]) == priorImage,
+        "Separate save request resolves the same sender's recent image.");
+    Check(AiChatPlugin.RecentSaveImage(saveRequest, [priorImage with { Sender = new User("other") },
+        priorImage with { InstanceId = "other" }, priorImage with { Channel = Channel.Group("other") },
+        priorImage with { Timestamp = saveRequest.Timestamp.AddMinutes(-3) }]) is null,
+        "Recent save images exclude other senders, instances, channels and expired context.");
+    var imageBytes = new byte[] { 1, 2, 3 };
+    var imageArgs = new JsonObject { ["image_ids"] = new JsonArray(2) };
+    var snapshots = await AiChatPlugin.ResolvePluginImagesAsync(imageArgs,
+        [new ImagePart(null, "image/png", 1, [9]), new ImagePart(null, "image/png", 3, imageBytes)], 1, default);
+    Check(snapshots.Count == 1 && snapshots[0].Id == 2 && Convert.FromBase64String(snapshots[0].Base64).SequenceEqual(imageBytes),
+        "Plugin tools select exact historical image bytes instead of refetching a URL.");
+    var current = await AiChatPlugin.ResolvePluginImagesAsync(new JsonObject(),
+        [new ImagePart(null, "image/png", 1, [9]), new ImagePart(null, "image/png", 3, imageBytes)], 1, default);
+    Check(current.Count == 1 && current[0].Id == 1, "Default plugin images include current/quoted attachments only.");
+    try
+    {
+        await AiChatPlugin.ResolvePluginImagesAsync(new JsonObject { ["image_ids"] = new JsonArray(99) }, [], 0, default);
+        throw new Exception("Invalid historical image IDs were accepted.");
+    }
+    catch (ArgumentException) { }
+    tools[0].ResolveImages = (_, _) => Task.FromResult(snapshots);
+    await tools[0].ExecuteAsync("{}");
+    Check(services.LastCall?.Context.Images is [{ Id: 2, Base64: "AQID" }],
+        "Image snapshots survive the real plugin tool JSON boundary.");
     services.Handlers.Clear();
     Check((await tools[0].ExecuteAsync("{}")).Contains("not available", StringComparison.Ordinal),
         "A provider that went away must turn into a text reply.");

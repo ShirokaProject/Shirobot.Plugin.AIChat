@@ -41,7 +41,11 @@ public sealed record ChatToolContext(
     string? MessageId,
     string? SenderId,
     bool IsGroup,
-    bool Proactive);
+    bool Proactive,
+    IReadOnlyList<ChatToolImage>? Images = null);
+
+/// <summary>本轮工具选中的图片快照；仅在插件调用时传递，不把字节或本地路径交给模型。</summary>
+public sealed record ChatToolImage(int Id, string Mime, string Base64);
 
 /// <summary>工具结果：<paramref name="Content"/> 交给模型；<paramref name="AfterReply"/> 要求 AIChat 在文字回复发出后调用某个服务。</summary>
 public sealed record ChatToolResult(string Content, ChatAfterReply? AfterReply = null);
