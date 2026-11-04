@@ -43,7 +43,7 @@ internal sealed partial class PluginChatTool : IChatTool
     public OpenAiTool Definition { get; }
     private readonly string _systemPrompt;
     internal string ImageCatalog { get; set; } = "";
-    public string SystemPrompt => _systemPrompt + ImageCatalog;
+    public string SystemPrompt => _systemPrompt;
     public int MaxCallsPerTurn { get; }
 
     /// <summary>本轮工具调用要求在回复后执行的动作，按调用顺序。</summary>

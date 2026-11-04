@@ -125,7 +125,10 @@ public sealed class HistorySection
 
     /// <summary>在后续请求中重新发送图片的最近用户轮次数。0 表示只保留文字摘要。</summary>
     [ConfigField("后续请求重新发送图片的最近用户轮数；0 仅保留文字摘要。", Label = "图片记忆轮数", Min = 0)]
-    public int ImageMemoryTurns { get; set; } = 1;
+    public int ImageMemoryTurns { get; set; } = 0;
+
+    [ConfigField("每次请求最多携带多少张图片，优先本条和引用图片，再取最近历史图片；图片统一置于请求末尾。", Label = "每次请求图片上限", Min = 1, Max = 16)]
+    public int MaxImagesPerRequest { get; set; } = 4;
 
     [ConfigField("群聊中被 @ 或用 #ai 时，附上群里最近多少条消息，帮助理解大家在聊什么；只附在本次请求里，不写入历史。优先通过适配器的历史消息接口获取，不支持时使用插件运行期间记录的普通消息。0 表示不附带。", Label = "群聊上下文消息数", Min = 0, Max = 100)]
     public int GroupContextMessages { get; set; }

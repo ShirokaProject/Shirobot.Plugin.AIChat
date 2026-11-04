@@ -401,6 +401,30 @@ Console.WriteLine("PASS: route-only access config, admin clear guard before muta
 CollectibleSerializationChecks.Run();
 await MemoryStreamingChecks.RunAsync();
 await UsageChecks.RunAsync();
+{
+    var imagePolicyPlugin = new AiChatPlugin();
+    var imagePolicyConfig = new PluginConfig();
+    Set(imagePolicyPlugin, "_config", imagePolicyConfig);
+    var image = new ImagePart(null, "image/png", 3, [1, 2, 3]);
+    var history = Enumerable.Range(0, 12).Select(i => new ChatTurn("user", [new TextPart($"消息{i}"), image], i)).ToList();
+    var current = new ChatTurn("user", [new TextPart("当前"), image], 99);
+    var first = imagePolicyPlugin.BuildVisionMessages("stable", history, current, true);
+    Check(first.Take(history.Count + 2).All(message => !message.HasImage) && first[^1].HasImage,
+        "History images must be absent from the stable text prefix.");
+    Check(first.SelectMany(message => message.Segments).Count(segment => segment.Kind == SegmentKind.Image) == 1,
+        "By default only current/quoted images are resent.");
+    imagePolicyConfig.History.ImageMemoryTurns = 12;
+    imagePolicyConfig.History.MaxImagesPerRequest = 2;
+    var expanded = imagePolicyPlugin.BuildVisionMessages("stable", history, current, true);
+    Check(expanded.SelectMany(message => message.Segments).Count(segment => segment.Kind == SegmentKind.Image) == 2,
+        "Image memory must obey the request cap.");
+    for (var i = 0; i < first.Count - 1; i++)
+        Check(JsonSerializer.Serialize(first[i]) == JsonSerializer.Serialize(expanded[i]),
+            "Changing or expiring selected images must not change the preceding request bytes.");
+    Check(!imagePolicyPlugin.BuildVisionMessages("stable", history, current, false).Any(message => message.HasImage),
+        "Non-vision fallback must never receive image payloads.");
+    Console.WriteLine("PASS: image eviction, bounded tail payload and stable text prefix");
+}
 await CacheStabilityChecks.RunAsync();
 await RichReplyChecks.RunAsync();
 await ReplyModeChecks.RunAsync();

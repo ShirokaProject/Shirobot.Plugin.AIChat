@@ -21,7 +21,7 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.4")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.5")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -32,7 +32,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.4.4",
+    Version = "1.4.5",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -1400,6 +1400,9 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 // 所以和上面的上下文一样只附在本条用户消息末尾。
                 if (imageTool is not null && proactive is null)
                     requestUserTurn = requestUserTurn with { Parts = [.. requestUserTurn.Parts, new TextPart(imageTool.HistoryCatalog.TrimStart('\n'))] };
+                var pluginImageCatalog = string.Join("\n", pluginTools.Select(tool => tool.ImageCatalog).Where(text => text.Length > 0).Distinct());
+                if (pluginImageCatalog.Length > 0)
+                    requestUserTurn = requestUserTurn with { Parts = [.. requestUserTurn.Parts, new TextPart(pluginImageCatalog)] };
                 if (memoryTool is not null)
                 {
                     try
@@ -2547,40 +2550,43 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     }
 
     private List<OpenAiMessage> BuildOpenAiMessages(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn, bool supportsVision = true)
-    {
-        var msgs = new List<OpenAiMessage>(history.Count + 2)
-        {
-            new() { Role = "system", Content = systemPrompt }
-        };
+        => BuildVisionMessages(systemPrompt, history, currentUserTurn, supportsVision)
+            .Select(message => new OpenAiMessage { Role = message.Role, Content = message }).ToList();
 
-        for (var i = 0; i < history.Count; i++)
-        {
-            msgs.Add(TurnToMessage(ShrinkOldFiles(history, i), includeImages: supportsVision && ShouldIncludeHistoryImages(history, i)));
-        }
-        msgs.Add(TurnToMessage(currentUserTurn, includeImages: supportsVision));
-        return msgs;
-    }
-
-    /// <summary>
-    /// 构建流式请求用的消息描述列表。图片只记录 .b64 文件路径，不读取内容到内存。
-    /// </summary>
     private List<ChatMessageDescriptor> BuildMessageDescriptors(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn)
-    {
-        var descriptors = new List<ChatMessageDescriptor>(history.Count + 2)
-        {
-            new()
-            {
-                Role = "system",
-                Segments = [new ContentSegment { Kind = SegmentKind.Text, Text = systemPrompt }]
-            }
-        };
+        => BuildVisionMessages(systemPrompt, history, currentUserTurn, true);
 
-        for (var i = 0; i < history.Count; i++)
+    // Historical text is serialized identically whether an image expires or is selected again.
+    // Only the trailing vision payload changes; cache files remain available for explicit image tools.
+    internal List<ChatMessageDescriptor> BuildVisionMessages(string systemPrompt, List<ChatTurn> history, ChatTurn current, bool supportsVision)
+    {
+        var messages = new List<ChatMessageDescriptor>
         {
-            descriptors.Add(TurnToDescriptor(ShrinkOldFiles(history, i), includeImages: ShouldIncludeHistoryImages(history, i)));
+            new() { Role = "system", Segments = [new() { Kind = SegmentKind.Text, Text = systemPrompt }] }
+        };
+        for (var i = 0; i < history.Count; i++) messages.Add(TurnToDescriptor(ShrinkOldFiles(history, i), false));
+        messages.Add(TurnToDescriptor(current, false));
+        if (!supportsVision) return messages;
+
+        var selected = new List<ChatPart>();
+        var limit = Math.Clamp(_config.History.MaxImagesPerRequest, 1, 16);
+        var count = 0;
+        void AddImages(ChatTurn turn, string label)
+        {
+            foreach (var image in turn.Parts.OfType<ImagePart>())
+            {
+                if (count >= limit) break;
+                selected.Add(new TextPart(label));
+                selected.Add(image);
+                count++;
+            }
         }
-        descriptors.Add(TurnToDescriptor(currentUserTurn, includeImages: true));
-        return descriptors;
+        AddImages(current, "[本条用户消息或引用中的图片]");
+        for (var i = history.Count - 1; i >= 0 && count < limit; i--)
+            if (ShouldIncludeHistoryImages(history, i)) AddImages(history[i], $"[历史图片，消息时间 {history[i].Timestamp}，仅作参考]");
+        if (count > 0) messages.Add(TurnToDescriptor(new ChatTurn("user", selected, current.Timestamp), true));
+        BotLog.Info($"[AiChat] 本轮携带图片 {count} 张，上限 {limit}，历史图片记忆轮数 {_config.History.ImageMemoryTurns}");
+        return messages;
     }
 
     /// <summary>最近 2 个用户轮次之前的文件只保留开头摘录，避免同一份文件在每轮请求里重复发送。</summary>
@@ -2642,7 +2648,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 case ImagePart ip:
                     if (!includeImages)
                     {
-                        segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = "[图片已省略，历史上下文不再附带图片内容。]" });
+                        segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = "[图片；需要发送的内容附在本次请求末尾。]" });
                         break;
                     }
 

@@ -39,11 +39,14 @@ internal static class MemoryStreamingChecks
             var path = Path.Combine(root, "image.b64");
             await File.WriteAllTextAsync(path, expected, new UTF8Encoding(false));
             var plugin = new AiChatPlugin();
+            var settings = new ShiroBot.AiChatPlugin.Config.PluginConfig();
+            settings.History.ImageMemoryTurns = 1;
+            typeof(AiChatPlugin).GetField("_config", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, settings);
             var history = new List<ChatTurn> { new("user", [new ImagePart(Path.Combine(root, "image.jpg"), "image/jpeg", bytes.Length)], 1) };
             var current = new ChatTurn("user", [new TextPart("follow up: \"quoted\"\n中文")], 2);
             var messages = (List<OpenAiMessage>)typeof(AiChatPlugin).GetMethod("BuildOpenAiMessages", BindingFlags.Instance | BindingFlags.NonPublic)!
                 .Invoke(plugin, new object[] { "system", history, current, true })!;
-            Check(messages[1].Content is ChatMessageDescriptor { HasImage: true }, "Historical images must remain file descriptors.");
+            Check(messages[1].Content is ChatMessageDescriptor { HasImage: false } && messages[^1].Content is ChatMessageDescriptor { HasImage: true }, "Historical images must remain file descriptors at the request tail.");
             var request = new OpenAiChatRequest { Model = "test", Messages = messages, Stream = true, Temperature = .5, MaxCompletionTokens = 123,
                 Tools = [new OpenAiTool { Function = new OpenAiToolFunction { Name = "test_tool", Description = "test", Parameters = new { type = "object" } } }] };
             request.Messages.Add(new OpenAiMessage { Role = "assistant", Content = "checking", ReasoningContent = "reason",
@@ -55,11 +58,11 @@ internal static class MemoryStreamingChecks
                 await content.CopyToAsync(buffer);
                 using var json = JsonDocument.Parse(buffer.ToArray());
                 var r = json.RootElement;
-                Check(r.GetProperty("messages")[1].GetProperty("content")[0].GetProperty("image_url").GetProperty("url").GetString() == expected,
+                Check(r.GetProperty("messages")[3].GetProperty("content")[1].GetProperty("image_url").GetProperty("url").GetString() == expected,
                     "Historical image payload must be byte-equivalent.");
                 Check(r.GetProperty("tools")[0].GetProperty("function").GetProperty("name").GetString() == "test_tool"
-                    && r.GetProperty("messages")[4].GetProperty("tool_call_id").GetString() == "call1"
-                    && r.GetProperty("messages")[3].GetProperty("reasoning_content").GetString() == "reason"
+                    && r.GetProperty("messages")[5].GetProperty("tool_call_id").GetString() == "call1"
+                    && r.GetProperty("messages")[4].GetProperty("reasoning_content").GetString() == "reason"
                     && r.GetProperty("temperature").GetDouble() == .5 && r.GetProperty("max_completion_tokens").GetInt32() == 123
                     && r.GetProperty("stream").GetBoolean(), "Tools, reasoning and request options must survive streaming.");
             }
