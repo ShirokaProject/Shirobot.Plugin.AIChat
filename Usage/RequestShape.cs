@@ -65,7 +65,7 @@ internal sealed record RequestShape(int Images, string ToolsHash, string[] Chain
                     if (segment.Kind == SegmentKind.Image)
                     {
                         images++;
-                        builder.Append("[image:").Append(segment.B64FilePath ?? segment.InlineBytes?.Length.ToString()).Append(']');
+                        builder.Append("[image:").Append(segment.ImageFilePath ?? segment.B64FilePath ?? segment.InlineBytes?.Length.ToString()).Append(']');
                     }
                     else builder.Append(segment.Text);
                 }

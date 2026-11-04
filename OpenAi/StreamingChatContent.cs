@@ -149,6 +149,27 @@ internal sealed class StreamingChatContent : HttpContent
                         FileShare.Read, 4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
                     await file.CopyToAsync(stream, 16384, ct);
                 }
+                else if (segment.ImageFilePath is {} imagePath)
+                {
+                    await WriteAsync(stream, $"data:{segment.Mime};base64,", ct);
+                    await using var image = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        16384, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    var input = ArrayPool<byte>.Shared.Rent(12 * 1024);
+                    var output = ArrayPool<byte>.Shared.Rent(16 * 1024);
+                    try
+                    {
+                        long total = 0;
+                        int read;
+                        while ((read = await image.ReadAtLeastAsync(input.AsMemory(0, 12 * 1024), 12 * 1024, throwOnEndOfStream: false, cancellationToken: ct)) > 0)
+                        {
+                            total += read;
+                            if (total > 20_000_000) throw new InvalidDataException("Plugin image exceeds 20 MB.");
+                            System.Buffers.Text.Base64.EncodeToUtf8(input.AsSpan(0, read), output, out _, out int written);
+                            await stream.WriteAsync(output.AsMemory(0, written), ct);
+                        }
+                    }
+                    finally { ArrayPool<byte>.Shared.Return(input); ArrayPool<byte>.Shared.Return(output); }
+                }
                 else if (segment.InlineBytes is {} bytes)
                 {
                     await WriteAsync(stream, $"data:{segment.Mime};base64,", ct);

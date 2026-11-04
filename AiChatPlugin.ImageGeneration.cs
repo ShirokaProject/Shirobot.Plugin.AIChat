@@ -153,12 +153,24 @@ public sealed partial class AiChatPlugin
             clear = await ShowImageGenerationProgressAsync(message, ct).ConfigureAwait(false);
             var image = await ImageGenerationClient.GenerateAsync(url, key ?? "", model.Name, prompt, config,
                 _config.Network.HttpProxy, ct, inputs).ConfigureAwait(false);
+            inputs.Clear();
             ct.ThrowIfCancellationRequested();
             if (!pending.TryBeginReply()) throw new OperationCanceledException(ct);
             var directory = Context.CreateTempDirectory(TimeSpan.FromHours(1));
             var outputMime = MimeGuesser.SniffImageMime(image) ?? "image/png";
             var outputPath = Path.Combine(directory.Path, "generated" + MimeGuesser.ExtensionForMime(outputMime));
             await File.WriteAllBytesAsync(outputPath, image, ct).ConfigureAwait(false);
+            var imageLength = image.Length;
+            string? cachedImage = null;
+            if (conversationKey is not null)
+            {
+                try { cachedImage = await _cache.StoreAsync(image, MimeGuesser.ExtensionForMime(outputMime), outputMime).ConfigureAwait(false); }
+                catch (Exception ex) { BotLog.Warning($"[AiChat] 缓存生成图片失败：{ex.GetType().Name}"); }
+            }
+            // Uploading through Milky can wait on the network. Only the file and
+            // cache reference are needed from here, not the full generated image.
+            image = [];
+            images = null;
             try
             {
                 var sent = await Context.Message.SendMessageAsync(message.Channel,
@@ -172,14 +184,13 @@ public sealed partial class AiChatPlugin
                 {
                     try
                     {
-                        var cached = await _cache.StoreAsync(image, MimeGuesser.ExtensionForMime(outputMime), outputMime).ConfigureAwait(false);
-                        if (cached is not null)
+                        if (cachedImage is not null)
                         {
                             var state = await _conversations.AcquireAsync(historyKey, ct).ConfigureAwait(false);
                             try
                             {
                                 state.Turns.Add(new ChatTurn("assistant", [new TextPart("[生成图片：" + prompt + "]"),
-                                    new ImagePart(cached, outputMime, image.Length)], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                                    new ImagePart(cachedImage, outputMime, imageLength)], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
                                 await _conversations.RewriteAsync(state).ConfigureAwait(false);
                             }
                             finally { _conversations.Release(historyKey); }

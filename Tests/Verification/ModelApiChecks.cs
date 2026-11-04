@@ -54,7 +54,7 @@ internal static class ModelApiChecks
         Set(plugin, "_globalConcurrency", new SemaphoreSlim(2));
 
         var list = (ChatModelList)Invoke(plugin, "ListPluginModels");
-        Check(list.DefaultModel == "text" && list.Models.Select(m => (m.Name, m.SupportsVision)).SequenceEqual([("text", false), ("vision", true)]),
+        Check(list.SupportsImageFiles && list.DefaultModel == "text" && list.Models.Select(m => (m.Name, m.SupportsVision)).SequenceEqual([("text", false), ("vision", true)]),
             "Plugins must see only the allowed models with their vision support.");
 
         async Task<ChatModelResponse> CompleteAsync(ChatModelRequest request) =>
@@ -72,6 +72,22 @@ internal static class ModelApiChecks
         var content = lastBody?["messages"]?[0]?["content"]?.AsArray();
         Check(vision.Model == "vision" && (string?)content?[1]?["image_url"]?["url"] == "data:image/png;base64," + image,
             "A vision request must switch to a vision model and send the image.");
+
+        var imagePath = Path.Combine(Path.GetTempPath(), "plugin-image-" + Guid.NewGuid().ToString("N") + ".png");
+        try
+        {
+            var png = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=");
+            await File.WriteAllBytesAsync(imagePath, png);
+            await CompleteAsync(new ChatModelRequest([new ChatModelMessage("user", "file", [new ChatModelImage("image/png", FilePath:imagePath)])], NeedsVision:true));
+            Check((string?)lastBody?["messages"]?[0]?["content"]?[1]?["image_url"]?["url"] == "data:image/png;base64," + Convert.ToBase64String(png),
+                "Raw plugin image files must reach the model with identical bytes.");
+            await File.WriteAllTextAsync(imagePath, "not an image");
+            try { await CompleteAsync(new ChatModelRequest([new ChatModelMessage("user", "bad", [new ChatModelImage("image/png", FilePath:imagePath)])], NeedsVision:true)); Check(false,"Accepted a non-image file"); }
+            catch(ArgumentException) { }
+            try { await CompleteAsync(new ChatModelRequest([new ChatModelMessage("user", "bad", [new ChatModelImage("image/png", FilePath:"relative.png")])], NeedsVision:true)); Check(false,"Accepted a relative file"); }
+            catch(ArgumentException) { }
+        }
+        finally { File.Delete(imagePath); }
 
         foreach (var (request, reason) in new[]
                  {

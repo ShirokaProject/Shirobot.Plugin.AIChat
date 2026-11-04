@@ -42,10 +42,3 @@ dotnet run --project Tests/ContractConsumer -c Release -- bin/Release/net10.0/pu
 ## 许可证
 
 [GPL-3.0-only](LICENSE)
-
-## 历史图片
-
-默认 `history.image_memory_turns = 0`，只发送本条和引用消息的图片。
-`history.max_images_per_request = 4` 限制每次携带的图片数量，优先本条，再取最近历史图。
-历史图片引用仍可用于明确选图或编辑；视觉内容统一放在请求尾部，淘汰图片时不改动前面的历史文字或 system prompt，以保留可复用的缓存前缀。
-已有配置若设置了图片记忆轮数，需自行改为 `0` 才会停止自动携带历史图片。

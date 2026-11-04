@@ -2800,7 +2800,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         if (!_config.PluginApi.Enabled) return new ChatModelList("", []);
         var models = PluginModels();
         return new ChatModelList(PluginDefaultModel(models) is { } model ? GetModelDisplayId(model) : "",
-            models.Select(model => new ChatModelInfo(GetModelDisplayId(model), model.DisplayName, model.SupportsVision)).ToList());
+            models.Select(model => new ChatModelInfo(GetModelDisplayId(model), model.DisplayName, model.SupportsVision)).ToList(), SupportsImageFiles: true);
     }
 
     /// <summary>其他插件借用模型：按 [plugin_api] 选模型，和聊天共用并发上限、重试和备用模型。</summary>
@@ -2835,10 +2835,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 return new OpenAiMessage { Role = role, Content = message.Text };
             var segments = new List<ContentSegment>();
             if (message.Text.Length > 0) segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = message.Text });
-            segments.AddRange(images.Select(image => new ContentSegment
-            {
-                Kind = SegmentKind.Image, Mime = image.Mime, InlineBytes = Convert.FromBase64String(image.Base64)
-            }));
+            segments.AddRange(images.Select(image => CreatePluginImageSegment(image)));
             return new OpenAiMessage { Role = role, Content = new ChatMessageDescriptor { Role = role, Segments = segments } };
         }).ToList();
 
@@ -2861,6 +2858,28 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         {
             _globalConcurrency.Release();
         }
+    }
+
+    private static ContentSegment CreatePluginImageSegment(ChatModelImage image)
+    {
+        if (image.Mime is not ("image/png" or "image/jpeg" or "image/gif" or "image/webp"))
+            throw new ArgumentException("插件图片格式必须是 PNG、JPEG、GIF 或 WebP。");
+        if (image.FilePath is { Length: > 0 } path)
+        {
+            if (!Path.IsPathFullyQualified(path) || !File.Exists(path)) throw new ArgumentException("插件图片文件不存在或不是绝对路径。");
+            var info = new FileInfo(path);
+            if (info.Length is <= 0 or > 20_000_000) throw new ArgumentException("插件图片为空或超过 20 MB。");
+            using (var file = File.OpenRead(path))
+            {
+                Span<byte> header = stackalloc byte[16];
+                int read = file.ReadAtLeast(header, header.Length, throwOnEndOfStream: false);
+                if (MimeGuesser.SniffImageMime(header[..read]) != image.Mime)
+                    throw new ArgumentException("插件图片内容与声明的格式不符。");
+            }
+            return new ContentSegment { Kind = SegmentKind.Image, Mime = image.Mime, ImageFilePath = path };
+        }
+        if (image.Base64.Length > 26_666_668) throw new ArgumentException("插件图片超过 20 MB。");
+        return new ContentSegment { Kind = SegmentKind.Image, Mime = image.Mime, InlineBytes = Convert.FromBase64String(image.Base64) };
     }
 
     private List<PluginChatTool> PluginToolsFor(MessageEvent message, ProactiveRequest? proactive, IEnumerable<IChatTool> builtIn)

@@ -36,15 +36,18 @@ public sealed record ChatModelRequest(
 public sealed record ChatModelMessage(string Role, string Text = "", IReadOnlyList<ChatModelImage>? Images = null);
 
 /// <param name="Mime">图片类型，例如 image/png。</param>
-/// <param name="Base64">图片内容的 Base64。</param>
-public sealed record ChatModelImage(string Mime, string Base64);
+/// <param name="Base64">图片内容的 Base64；使用 FilePath 时可留空。</param>
+/// <param name="FilePath">本机图片的绝对路径，文件大小不超过 20 MB。调用方须保持文件存在直到调用结束；仅在 SupportsImageFiles 为 true 时使用。</param>
+public sealed record ChatModelImage(string Mime, string Base64 = "", string? FilePath = null);
 
 /// <param name="Text">模型的文本回复。</param>
 /// <param name="Model">实际使用的模型。</param>
 public sealed record ChatModelResponse(string Text, string Model);
 
 /// <param name="DefaultModel">不指定模型时使用的模型。</param>
-public sealed record ChatModelList(string DefaultModel, IReadOnlyList<ChatModelInfo> Models);
+/// <param name="Models">可用的模型。</param>
+/// <param name="SupportsImageFiles">是否支持通过本机文件传递图片；旧版服务默认为 false。</param>
+public sealed record ChatModelList(string DefaultModel, IReadOnlyList<ChatModelInfo> Models, bool SupportsImageFiles = false);
 
 /// <param name="Name">调用时填写的模型名称。</param>
 public sealed record ChatModelInfo(string Name, string? DisplayName, bool SupportsVision);

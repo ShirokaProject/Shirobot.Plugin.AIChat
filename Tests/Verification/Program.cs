@@ -440,6 +440,7 @@ await FetchTimerChecks.RunAsync();
 await ToolLogChecks.RunAsync();
 await ModelApiChecks.RunAsync();
 await ImageGenerationChecks.RunAsync();
+await ImageResponseMemoryChecks.RunAsync();
 await ImageEditQuoteChecks.RunAsync();
 await IdentityScopeChecks.RunAsync();
 

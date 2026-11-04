@@ -37,5 +37,7 @@ internal sealed class ContentSegment
 
     /// <summary>Cache-write fallback. Encoded in bounded chunks while sending.</summary>
     public byte[]? InlineBytes { get; init; }
+    /// <summary>Raw image supplied by a local plugin; encoded in bounded chunks.</summary>
+    public string? ImageFilePath { get; init; }
     public string? Mime { get; init; }
 }
