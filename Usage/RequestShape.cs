@@ -15,6 +15,18 @@ internal sealed record RequestShape(int Images, string ToolsHash, string[] Chain
     {
         var images = 0;
         var chain = new string[request.Messages.Count];
+        if (request.SentPrefix is { } sent && sent.Points.Length >= request.Messages.Count + 2)
+        {
+            for (var i = 0; i < request.Messages.Count; i++)
+            {
+                chain[i] = sent.Points[i + 1].Hash;
+                if (request.Messages[i].Content is ChatMessageDescriptor descriptor)
+                    foreach (var segment in descriptor.Segments)
+                        if (segment.Kind == SegmentKind.Image) images++;
+            }
+            return new RequestShape(images, sent.Points[0].Hash, chain);
+        }
+
         using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
         {
             for (var i = 0; i < request.Messages.Count; i++)
@@ -24,10 +36,6 @@ internal sealed record RequestShape(int Images, string ToolsHash, string[] Chain
                 chain[i] = Short(hash.GetCurrentHash());
             }
         }
-
-        if (request.SentPrefix is { } sent && sent.Points.Length >= request.Messages.Count + 2)
-            return new RequestShape(images, sent.Points[0].Hash,
-                sent.Points.Skip(1).Take(request.Messages.Count).Select(point => point.Hash).ToArray());
 
         var tools = new StringBuilder();
         foreach (var tool in request.Tools ?? [])

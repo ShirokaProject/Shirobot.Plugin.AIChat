@@ -1306,6 +1306,10 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
             var holdsGlobal = true;
             try
             {
+                // Catch existing full histories before sending another huge chat
+                // request. A failed attempt is not repeated again in this turn.
+                var attemptedCompaction = convo is not null && NeedsCompaction(convo);
+                if (attemptedCompaction) await TryCompactConversationAsync(convo!, model).ConfigureAwait(false);
                 var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
                 // 同一会话每次请求的工具列表和 system prompt 保持不变，上游的前缀缓存才能命中：
                 // 本次不允许使用的工具（主动插话、非管理员）仍然列出，调用时由 RefusedChatTool 拒绝。
@@ -1556,15 +1560,14 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                         "assistant",
                         [new TextPart(assistantText)],
                         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                    await _conversations.AppendTurnsAsync(convo, userTurn, assistantTurn).ConfigureAwait(false);
-
-                    // Context compact：当轮次接近上限时自动压缩前半部分为摘要
-                    if (NeedsCompaction(convo))
+                    // Compact the full appended history before the storage cap.
+                    await _conversations.AppendTurnsAsync(convo, userTurn, assistantTurn, attemptedCompaction ? null : async () =>
                     {
+                        if (!NeedsCompaction(convo)) return false;
                         await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
                         holdsGlobal = true;
-                        await TryCompactConversationAsync(convo, model).ConfigureAwait(false);
-                    }
+                        return await TryCompactConversationAsync(convo, model).ConfigureAwait(false);
+                    }).ConfigureAwait(false);
                 }
 
             }
@@ -2111,20 +2114,20 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     /// 历史摘要每次在旧摘要基础上增量更新，不会对摘要反复再摘要。
     /// </summary>
     private bool NeedsCompaction(ConversationState convo) =>
-        _config.History.MaxTurns > 0 && convo.Turns.Count >= (int)(_config.History.MaxTurns * 2 * 0.8) ||
-        convo.Turns.Sum(EstimateTurnTokens) > Math.Max(1000, _config.History.MaxTokens) * 3 / 4;
+        convo.Turns.Count >= ConversationStore.MaxItemsFor(_config.History.MaxTurns) * 4L / 5 ||
+        convo.Turns.Sum(turn => (long)EstimateTurnTokens(turn)) > Math.Max(1000, _config.History.MaxTokens) * 3L / 4;
 
-    private async Task TryCompactConversationAsync(ConversationState convo, ModelEntry model)
+    private async Task<bool> TryCompactConversationAsync(ConversationState convo, ModelEntry model)
     {
-        if (!NeedsCompaction(convo)) return;
+        if (!NeedsCompaction(convo)) return false;
         using var usageScope = UsageScope.Begin(UsageSource(convo.Key), "compact");
         // user+assistant 配对；不按轮数限制时只看 token 预算。
-        var maxItems = _config.History.MaxTurns > 0 ? _config.History.MaxTurns * 2 : int.MaxValue;
+        var maxItems = ConversationStore.MaxItemsFor(_config.History.MaxTurns);
         var tokenBudget = Math.Max(1000, _config.History.MaxTokens);
 
         // 从最新往前保留不超过一半轮数、一半 token 预算的原文，至少保留最近一对。
         var keep = 0;
-        var keptTokens = 0;
+        long keptTokens = 0;
         while (keep + 2 <= convo.Turns.Count)
         {
             var pairTokens = EstimateTurnTokens(convo.Turns[^(keep + 1)]) + EstimateTurnTokens(convo.Turns[^(keep + 2)]);
@@ -2134,7 +2137,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         }
         var compactCount = convo.Turns.Count - keep;
         if (compactCount % 2 != 0) compactCount--;
-        if (compactCount < 2) return;
+        if (compactCount < 2) return false;
 
         var transcript = new StringBuilder();
         foreach (var turn in convo.Turns.Take(compactCount))
@@ -2171,19 +2174,25 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 MaxCompletionTokens = _config.Default.OutputTokenLimit() is { } limit ? Math.Min(limit, 2048) : 2048
             };
 
-            var summary = (await _openAi.ChatAsync(_config.Default, model, summaryRequest).ConfigureAwait(false)).Trim();
+            var summary = (await _openAi.ChatAsync(_config.Default, model, summaryRequest, _backgroundStop.Token).ConfigureAwait(false)).Trim();
             if (summary.Length == 0) throw new InvalidOperationException("摘要为空");
 
+            // Persist first; if writing fails keep the original in-memory history
+            // so AppendTurnsAsync can save the current pair and apply its fallback.
+            var rewritten = new ConversationState(convo.Key) { Summary = summary };
+            rewritten.Turns.AddRange(convo.Turns.Skip(compactCount));
+            await _conversations.RewriteAsync(rewritten, throwOnFailure: true).ConfigureAwait(false);
             convo.Turns.RemoveRange(0, compactCount);
             convo.Summary = summary;
-            await _conversations.RewriteAsync(convo).ConfigureAwait(false);
 
             BotLog.Info($"[AiChat] Context compact 完成: {compactCount} turns 并入历史摘要, 剩余 {convo.Turns.Count} turns, 摘要 {summary.Length} 字:\n{ForLog(summary)}");
+            return true;
         }
         catch (Exception ex)
         {
             // compact 失败不影响正常对话，超出轮数上限后由存储层截断最早的历史。
             BotLog.Warning($"[AiChat] Context compact 失败，保留原历史: {ex.Message}");
+            return false;
         }
     }
 

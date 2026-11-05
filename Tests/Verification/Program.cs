@@ -148,7 +148,12 @@ Check(!config.History.CompactPrompt.Contains("长期记忆") && DefaultSection.D
     Set(limits, "_config", limitConfig);
     var many = new ConversationState(new ConversationKey("i", ChatScene.Group, "g", "u"));
     for (var i = 0; i < 200; i++) many.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart("嗯")], i));
-    Check(!(bool)Invoke(limits, "NeedsCompaction", many), "Unlimited turns must only compact by token budget.");
+    Check(!(bool)Invoke(limits, "NeedsCompaction", many), "Short unlimited histories must not compact before token or safety pressure.");
+    limitConfig.History.MaxTokens = 2_560_000;
+    while (many.Turns.Count < 1599) many.Turns.Add(new ChatTurn(many.Turns.Count % 2 == 0 ? "user" : "assistant", [new TextPart("嗯")], many.Turns.Count));
+    Check(!(bool)Invoke(limits, "NeedsCompaction", many), "Safety compaction must not trigger below 80 percent of the cap.");
+    many.Turns.Add(new ChatTurn("assistant", [new TextPart("嗯")], 1599));
+    Check((bool)Invoke(limits, "NeedsCompaction", many), "Unlimited histories must compact before the storage safety cap even with a very large token budget.");
     limitConfig.History.MaxTurns = 20;
     Check((bool)Invoke(limits, "NeedsCompaction", many), "A turn limit must still trigger compaction.");
     // 旧版本默认提示词升级成当前默认值，自定义内容保持不变。
@@ -294,6 +299,91 @@ using (var client = Client(handler))
     Directory.Delete(root, true);
 }
 Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, request token budget, persistence, clear and legacy migration");
+
+// The full oldest pair must reach compaction before storage trimming, including
+// an oversized history from an earlier version. Failure must preserve recent turns.
+{
+    var root = Path.Combine(Path.GetTempPath(), "aichat-compact-cap-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+        var capConfig = new PluginConfig();
+        capConfig.History.MaxTurns = 0;
+        capConfig.History.MaxTokens = 2_560_000;
+        var capPlugin = new AiChatPlugin();
+        Set(capPlugin, "_config", capConfig);
+        var capStore = new ConversationStore(root, true, 0);
+        Set(capPlugin, "_conversations", capStore);
+        var capKey = new ConversationKey("cap", ChatScene.Group, "test", "u");
+        var capState = new ConversationState(capKey) { Summary = "existing summary" };
+        for (int i = 0; i < 2002; i++) capState.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart("original " + i)], i));
+        await capStore.RewriteAsync(capState);
+        capState = await capStore.AcquireAsync(capKey);
+        Check(capState.Turns.Count == 2002 && capState.Turns[0].Parts.OfType<TextPart>().Single().Text == "original 0",
+            "Loading an oversized legacy history must not discard its oldest messages before compaction.");
+        var summaryHandler = new StubHandler(_ => Completion("merged summary"));
+        using (var capClient = Client(summaryHandler))
+        {
+            Set(capPlugin, "_openAi", capClient);
+            var stateForCompact = capState;
+            await capStore.AppendTurnsAsync(capState, new ChatTurn("user", [new TextPart("latest user")], 2002),
+                new ChatTurn("assistant", [new TextPart("latest answer")], 2003),
+                () => (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", stateForCompact, primary));
+            var input = summaryHandler.Requests.Single().GetProperty("messages")[1].GetProperty("content").GetString()!;
+            Check(input.Contains("original 0") && input.Contains("original 1003") && !input.Contains("latest user"),
+                "Compact must see the oldest transcript and keep the newest pair out of the summary request.");
+            Check(capState.Summary == "merged summary" && capState.Turns.Count == 1000 &&
+                capState.Turns[^1].Parts.OfType<TextPart>().Single().Text == "latest answer", "Safety compact must keep a bounded recent half and the current answer.");
+        }
+        capStore.Release(capKey);
+        var reloaded = await capStore.AcquireAsync(capKey);
+        Check(reloaded.Summary == "merged summary" && reloaded.Turns.Count == 1000 &&
+            reloaded.Turns.Count(t => t.Parts.OfType<TextPart>().Any(p => p.Text == "latest answer")) == 1,
+            "A compacted append must persist the summary and latest pair exactly once.");
+        capStore.Release(capKey);
+
+        var failed = new ConversationState(new ConversationKey("cap", ChatScene.Group, "failed", "u")) { Summary = "old summary" };
+        for (int i = 0; i < 2000; i++) failed.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart("failed " + i)], i));
+        var failureHandler = new StubHandler(_ => Completion("unused"))
+            { Respond = _ => throw new HttpRequestException("fixture unavailable") };
+        using (var failureClient = Client(failureHandler))
+        {
+            Set(capPlugin, "_openAi", failureClient);
+            await capStore.AppendTurnsAsync(failed, new ChatTurn("user", [new TextPart("kept user")], 2000),
+                new ChatTurn("assistant", [new TextPart("kept answer")], 2001),
+                () => (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", failed, primary));
+        }
+        Check(failed.Summary == "old summary" && failed.Turns.Count == 2000 && failed.Turns[^1].Parts.OfType<TextPart>().Single().Text == "kept answer",
+            "Failed summaries must retain the previous summary, latest pair and bounded storage.");
+
+        var canceled = new ConversationState(new ConversationKey("cap", ChatScene.Group, "canceled", "u"));
+        try
+        {
+            await capStore.AppendTurnsAsync(canceled, new ChatTurn("user", [new TextPart("delivered user")], 1),
+                new ChatTurn("assistant", [new TextPart("delivered answer")], 2),
+                () => Task.FromException<bool>(new OperationCanceledException()));
+            throw new Exception("Compaction cancellation was swallowed");
+        }
+        catch (OperationCanceledException) { }
+        var persistedCanceled = await capStore.AcquireAsync(canceled.Key);
+        Check(persistedCanceled.Turns.Count == 2, "A canceled pre-trim callback must still save an already delivered pair.");
+        capStore.Release(canceled.Key);
+
+        var failingPath = Path.Combine(root, "data", "conversations", failed.Key.ToFileSafeString() + ".jsonl");
+        var originalFile = File.ReadAllBytes(failingPath);
+        Directory.CreateDirectory(failingPath + ".tmp");
+        var snapshot = failed.Turns.ToArray();
+        using (var writingClient = Client(new StubHandler(_ => Completion("must not replace old summary"))))
+        {
+            Set(capPlugin, "_openAi", writingClient);
+            Check(!await (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", failed, primary), "Write failure must report unsuccessful compaction.");
+        }
+        Check(failed.Summary == "old summary" && failed.Turns.SequenceEqual(snapshot) && originalFile.AsSpan().SequenceEqual(File.ReadAllBytes(failingPath)),
+            "A summary write failure must leave both original history and summary intact.");
+    }
+    finally { Directory.Delete(root, recursive: true); }
+    Console.WriteLine("PASS: safety-cap compaction precedes trimming; full legacy transcripts, persisted pairs, summary failure, cancellation and write failure");
+}
 
 var messageContext = DispatchProxy.Create<IMessageContext, TestProxy>();
 var context = DispatchProxy.Create<IBotContext, TestProxy>();

@@ -20,6 +20,8 @@ internal sealed class ConversationStore
     private readonly bool _persist;
     private readonly int _maxTurns;
     internal const int UnlimitedTurnsCap = 1000;
+    internal static int MaxItemsFor(int maxTurns) => (int)Math.Min(int.MaxValue,
+        (long)(maxTurns <= 0 ? UnlimitedTurnsCap : Math.Max(2, maxTurns)) * 2);
     private readonly JsonSerializerOptions _jsonOptions;
 
     public ConversationStore(string pluginRootDir, bool persist, int maxTurns)
@@ -73,23 +75,28 @@ internal sealed class ConversationStore
     /// 追加一对 user+assistant turn 到磁盘，并执行 trim。
     /// 调用方必须已通过 AcquireAsync 持有锁。
     /// </summary>
-    public async Task AppendTurnsAsync(ConversationState state, ChatTurn userTurn, ChatTurn assistantTurn)
+    public async Task AppendTurnsAsync(ConversationState state, ChatTurn userTurn, ChatTurn assistantTurn,
+        Func<Task<bool>>? compactBeforeTrim = null)
     {
         state.Turns.Add(StripTransientPayloads(userTurn));
         state.Turns.Add(assistantTurn);
 
-        var trimmed = TrimAndReturnRemoved(state);
-
-        if (_persist)
+        // Give the summarizer the complete transcript, including the oldest pair,
+        // before the storage safety cap can discard anything.
+        bool compacted = false;
+        try
         {
-            if (trimmed)
+            compacted = compactBeforeTrim is not null && await compactBeforeTrim().ConfigureAwait(false);
+        }
+        finally
+        {
+            var trimmed = TrimAndReturnRemoved(state);
+            if (_persist)
             {
-                // trim 发生了，需要重写整个文件
-                await RewriteAsync(state).ConfigureAwait(false);
-            }
-            else
-            {
-                await AppendToDiskAsync(state.Key, StripTransientPayloads(userTurn), assistantTurn).ConfigureAwait(false);
+                if (trimmed)
+                    await RewriteAsync(state).ConfigureAwait(false);
+                else if (!compacted)
+                    await AppendToDiskAsync(state.Key, StripTransientPayloads(userTurn), assistantTurn).ConfigureAwait(false);
             }
         }
     }
@@ -138,7 +145,7 @@ internal sealed class ConversationStore
     /// <summary>
     /// 在 context compact 后，用当前内存中的 turns 完整重写会话文件。
     /// </summary>
-    public async Task RewriteAsync(ConversationState state)
+    public async Task RewriteAsync(ConversationState state, bool throwOnFailure = false)
     {
         if (!_persist) return;
 
@@ -172,7 +179,7 @@ internal sealed class ConversationStore
             else
                 File.Move(tempPath, path);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!throwOnFailure)
         {
             BotLog.Warning($"[AiChat] 重写会话文件失败 {path}: {ex.Message}");
         }
@@ -208,7 +215,7 @@ internal sealed class ConversationStore
     /// </summary>
     private bool TrimAndReturnRemoved(ConversationState state)
     {
-        var maxItems = _maxTurns * 2;
+        var maxItems = MaxItemsFor(_maxTurns);
         if (state.Turns.Count <= maxItems) return false;
 
         var remove = state.Turns.Count - maxItems;
@@ -223,7 +230,7 @@ internal sealed class ConversationStore
 
         try
         {
-            var lines = File.ReadAllLines(path, Encoding.UTF8);
+            var lines = File.ReadLines(path, Encoding.UTF8);
             foreach (var line in lines)
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
@@ -251,13 +258,8 @@ internal sealed class ConversationStore
                 state.Turns.RemoveAt(0);
             }
 
-            // 加载后立即 trim
-            var maxItems = _maxTurns * 2;
-            if (state.Turns.Count > maxItems)
-            {
-                var remove = state.Turns.Count - maxItems;
-                state.Turns.RemoveRange(0, remove);
-            }
+            // Leave oversized legacy histories intact for pre-request compaction.
+            // AppendTurnsAsync still enforces the cap if summarization fails.
         }
         catch (Exception ex)
         {

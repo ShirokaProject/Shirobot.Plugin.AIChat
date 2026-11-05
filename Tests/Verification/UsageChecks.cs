@@ -174,7 +174,42 @@ internal static class UsageChecks
         Check(Shape("system", ["a"], "u2", "a2", "u3", "a3", "u4").CompareWith(longer).Change == "第 1 条起变化",
             "Dropping the oldest history must be reported as a rewritten prefix.");
         Console.WriteLine("PASS: PrefixChangesAreClassified");
+        await SentPrefixAllocationAsync();
         await LocalPrefixesAsync();
+    }
+
+    private static async Task SentPrefixAllocationAsync()
+    {
+        // A complete sent prefix already covers every byte; inspecting usage must
+        // not copy and encode the conversation a second time.
+        var request = new OpenAiChatRequest { Model = "test", CapturePrefix = true,
+            Messages = Enumerable.Range(0, 1000).Select(i => new OpenAiMessage
+            {
+                Role = i % 2 == 0 ? "user" : "assistant", Content = new string('中', 1024)
+            }).ToList() };
+        request.Messages.Add(new OpenAiMessage { Role = "user", Content = new ChatMessageDescriptor
+        {
+            Role = "user", Segments = [new ContentSegment { Kind = SegmentKind.Image, InlineBytes = [1, 2, 3], Mime = "image/png" }]
+        } });
+        using (var content = new StreamingChatContent(request)) await content.CopyToAsync(Stream.Null);
+        _ = RequestShape.Of(request);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var shape = RequestShape.Of(request);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Check(shape.Images == 1 && shape.ToolsHash == request.SentPrefix!.Points[0].Hash &&
+            shape.Chain.SequenceEqual(request.SentPrefix.Points.Skip(1).Take(request.Messages.Count).Select(p => p.Hash)),
+            "Usage must preserve the actual sent prefix and count images.");
+        Console.WriteLine($"RequestShape sent-prefix allocations: {allocated:N0} B for {request.Messages.Count} messages");
+        Check(allocated < 128 * 1024, "Inspecting a complete sent prefix must not allocate proportional to history text.");
+        // Missing or capped capture still needs the existing fallback.
+        request.SentPrefix = null;
+        var fallback = RequestShape.Of(request);
+        request.SentPrefix = new PrefixSnapshot(0, [new PrefixPoint(0, "incomplete")]);
+        var capped = RequestShape.Of(request);
+        Check(fallback.Images == 1 && capped.Images == 1 && fallback.Chain.Length == request.Messages.Count &&
+            capped.Chain.SequenceEqual(fallback.Chain) && capped.ToolsHash == fallback.ToolsHash,
+            "Absent or incomplete captures must retain the fallback fingerprints.");
+        Console.WriteLine("PASS: SentPrefixUsageAvoidsHistoryCopiesAndPreservesFallback");
     }
     private static async Task LocalPrefixesAsync()
     {

@@ -108,7 +108,7 @@ public sealed class HistorySection
     /// <summary>
     /// 单会话保留的最大轮次（user+assistant 各算一轮）。
     /// </summary>
-    [ConfigField("保留的对话轮数，每轮包含用户消息和 AI 回复；接近上限时自动压缩成历史摘要。0 表示不按轮数限制，只按“上下文 Token 软上限”压缩。", Label = "最大历史轮数", Min = 0)]
+    [ConfigField("保留的对话轮数，每轮包含用户消息和 AI 回复；接近上限时自动压缩成历史摘要。0 表示按 Token 预算压缩，同时会在存储安全上限前提前压缩。", Label = "最大历史轮数", Min = 0)]
     public int MaxTurns { get; set; }
 
     /// <summary>
