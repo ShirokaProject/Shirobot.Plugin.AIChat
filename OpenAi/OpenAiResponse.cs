@@ -28,8 +28,15 @@ internal sealed class OpenAiChoice
     [JsonPropertyName("message")]
     public OpenAiResponseMessage? Message { get; set; }
 
+    private string? _finishReason;
+    [JsonIgnore]
+    public bool HasFinishReason { get; private set; }
     [JsonPropertyName("finish_reason")]
-    public string? FinishReason { get; set; }
+    public string? FinishReason
+    {
+        get => _finishReason;
+        set { _finishReason = value; HasFinishReason = true; }
+    }
 }
 
 internal sealed class OpenAiResponseMessage

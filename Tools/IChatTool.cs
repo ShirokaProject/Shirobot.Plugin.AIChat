@@ -6,7 +6,10 @@ internal interface IChatTool : IDisposable
 {
     OpenAiTool Definition { get; }
     string SystemPrompt { get; }
+    // Legacy metadata only; scheduling uses the unified global round limit.
     int MaxCallsPerTurn { get; }
+    // Pure scheduler hint; opt in only if this call can overlap arbitrary other parallel calls.
+    bool IsConcurrencySafe(string arguments) => false;
     Task<string> ExecuteAsync(string arguments, CancellationToken ct = default);
 }
 

@@ -43,6 +43,66 @@ static string Completion(string text) => JsonSerializer.Serialize(new
     choices = new[] { new { message = new { role = "assistant", content = text } } }
 });
 
+if (args.Contains("--upstream-completion-offline")) { await UpstreamCompletionChecks.RunAsync(); await RichReplyChecks.RunAsync(); await UsageChecks.RunAsync(); return; }
+
+if (args.Contains("--reply-modes-offline")) { await ReplyModeChecks.RunAsync(); return; }
+
+if (args.Contains("--reference-image-offline")) { await ReferenceImageChecks.RunAsync(); return; }
+
+if (args.Contains("--image-retry-offline")) { await ImageRetryChecks.RunAsync(); return; }
+
+if (args.Contains("--image-command-offline")) { await ImageCommandChecks.RunAsync(); return; }
+
+if (args.Contains("--downloads-offline")) { await DownloadedFilesChecks.RunAsync(); return; }
+
+if (args.Contains("--http-methods-offline")) { await HttpMethodsChecks.RunAsync(); await FetchTimerChecks.RunAsync(); return; }
+
+if (args.Contains("--group-context-offline"))
+{
+    var groupPlugin = new AiChatPlugin();
+    var masterConfig = new PluginConfig();
+    Set(groupPlugin, "_config", masterConfig);
+    var groupContext = DispatchProxy.Create<IBotContext, TestProxy>();
+    ((TestProxy)(object)groupContext).Call = (method, values) => method.Name == "IsOwner"
+        ? values![0] is UserReference user && user.InstanceId == "qq-main" && user.UserId == "123"
+        : throw new NotSupportedException(method.Name);
+    typeof(PluginBase).GetProperty("Context", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(groupPlugin, groupContext);
+    var sender = new User("123") { Name = "Alice" };
+    var groupMessage = new MessageEvent { Platform = "qq", InstanceId = "qq-main", SelfId = "bot", MessageId = "m7",
+        Channel = Channel.Group("g"), Sender = sender, Member = new Member(sender) { Role = MemberRole.Owner },
+        Timestamp = new DateTimeOffset(2026, 11, 9, 12, 0, 0, TimeSpan.Zero), Segments = [new TextSegment("hello")] };
+    string Format(MessageEvent value) => (string)Invoke(groupPlugin, "FormatGroupLine", value, "Bot");
+    var line = Format(groupMessage);
+    Check(line.StartsWith("[消息 m7] [Master] [群主] ") && line.EndsWith("Alice(123): hello"), "Owner and QQ group owner tags must precede the timestamp, with groupMessage and user IDs.");
+    Check(Format(groupMessage with { InstanceId = "other", Member = new Member(sender) { Role = MemberRole.Admin } }).StartsWith("[消息 m7] [群管理员] "), "Master matching must be scoped by adapter instance.");
+    Check(!Format(groupMessage with { Platform = "discord", InstanceId = "other" }).Contains("[群主]"), "Other platforms must not use QQ role tags.");
+    Check(!Format(groupMessage with { InstanceId = null }).Contains("[Master]"), "Missing adapter identity must not grant Master.");
+    Check(AiChatPlugin.DisplayUserId("12345678901234567890") == "123456789012345", "Long displayed user IDs must be capped at 15 characters.");
+    var longId = "abcdefghijklmnopqr";
+    masterConfig.OwnerPrompt.MasterIds = ["discord-main/" + longId];
+    var longMessage = groupMessage with { Platform = "discord", InstanceId = "discord-main", Sender = new User(longId), Member = null };
+    Check(Format(longMessage).Contains("[Master]") && !Format(longMessage).Contains(longId), "Master must compare full IDs while only displaying the shortened ID.");
+    Check(!Format(longMessage with { InstanceId = "other" }).Contains("[Master]"), "Configured scoped Master must not match another instance.");
+    Check(!Format(longMessage with { Sender = new User("abcdefghijklmnoOTHER") }).Contains("[Master]"), "Matching displayed prefixes must not grant Master.");
+    masterConfig.OwnerPrompt.MasterIds = [longId];
+    Check(Format(longMessage).Contains("[Master]"), "A plain configured Master ID must match exactly.");
+    var recorded = new ShiroBot.AiChatPlugin.Proactive.ProactiveTrigger();
+    recorded.Record("g", "Alice(123)", "hello", 5, groupMessage.Timestamp, "m7", "[Master] [群主] ");
+    Check(recorded.Recent("g", 5) == line, "Memory fallback must preserve the same identity and groupMessage ID format.");
+
+    var first = new ChatTurn("user", [new TextPart(GroupContext.Header + "[10:00] Alice: hello\n[10:01] Bob: yes")], 1) { MessageId = "m1" };
+    Check(GroupContext.NewLines("[10:01] Bob: yes\n[10:02] Alice: next\n[10:02] Alice: next", [first]) == "[10:02] Alice: next", "Overlapping context must be deduplicated.");
+    var restored = PluginJson.Deserialize<ChatTurn>(PluginJson.Serialize(first))!;
+    Check(restored.MessageId == "m1" && GroupContext.NewLines("[10:00] Alice: hello", [restored]) == "", "Deduplication must survive persistence.");
+    Check(GroupContext.NewLines("[10:03] Bob: yes", [first]) == "[10:03] Bob: yes", "Repeated text at a new time must remain distinct.");
+    Console.WriteLine("PASS: overlapping context, duplicate lines, persisted context and distinct repeated messages");
+    return;
+}
+
+if (args.Contains("--skills-concurrency-offline")) { await SkillsConcurrencyChecks.RunAsync(); return; }
+
+if (args.Contains("--image-api-offline")) { await ImageApiOfflineChecks.RunAsync(); return; }
+
 // Verify the same initialization/application contract used by Dashboard and the host watcher.
 {
     var root = Path.Combine(Path.GetTempPath(), "aichat-config-" + Guid.NewGuid().ToString("N"));
@@ -121,6 +181,10 @@ var template = (string)typeof(AiChatPlugin).GetField("DefaultConfigTemplate", Bi
 var config = TomlSerializer.Deserialize<PluginConfig>(template, options)!;
 Check(config.ToolUse.Tavily is { Enabled: true } && config.History.CompactPrompt == HistorySection.DefaultCompactPrompt,
     "Default template must deserialize nested tool config and compact prompt.");
+Check(config.ToolUse.ImageGen.PromptInstructions == "" &&
+    TomlSerializer.Deserialize<PluginConfig>("[tool_use.image_gen]\nprompt_instructions = '用中文自然语言描述主体、构图和光影'", options)!
+        .ToolUse.ImageGen.PromptInstructions == "用中文自然语言描述主体、构图和光影",
+    "Image prompt instructions must default to empty and deserialize from their own tool configuration.");
 Check(typeof(PluginConfig).GetProperty("Tavily") is null, "Root config must not expose the removed legacy Tavily section.");
 var toolsConfig = new PluginConfig();
 toolsConfig.ToolUse.HttpFetch.Enabled = false;
@@ -465,11 +529,12 @@ Console.WriteLine("PASS: private auto reply switch, ordinary text and image trig
 Check(config.Permissions.ClearAdminOnly && typeof(PermissionsSection).GetProperty("AllowUsers") is null && typeof(PermissionsSection).GetProperty("DenyUsers") is null,
     "Only administrative restrictions remain; clear defaults to admin-only.");
 config.OwnerPrompt.Enabled = false;
-Check((string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt") == "base prompt", "Owner prompt must default off.");
+var identityBase = (string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt");
+Check(identityBase.StartsWith("base prompt\n[身份标记规则"), "Identity metadata rules must always be present.");
 config.OwnerPrompt.Enabled = true;
 config.OwnerPrompt.Template = "主人是 789，QQ 123456，机器人使用 ShiroBot。{自定义文字}\n第二行";
 var identity = (string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt");
-Check(identity == "base prompt\n" + config.OwnerPrompt.Template, "Owner text must be appended verbatim, including braces and newlines.");
+Check(identity == identityBase + "\n" + config.OwnerPrompt.Template, "Owner text must be appended verbatim, including braces and newlines.");
 var admin = false;
 ((TestProxy)(object)context).Call = (method, _) => method.Name switch { "IsAdmin" => admin, "get_Message" => messageContext, "get_InstanceId" => "test", _ => throw new NotSupportedException() };
 Check(!await (Task<bool>)Invoke(plugin, "CanClearAsync", direct) && !await (Task<bool>)Invoke(plugin, "CanClearAsync", message),
@@ -491,6 +556,7 @@ Console.WriteLine("PASS: route-only access config, admin clear guard before muta
 CollectibleSerializationChecks.Run();
 await MemoryStreamingChecks.RunAsync();
 await UsageChecks.RunAsync();
+await DisabledToolCommandChecks.RunAsync();
 {
     var imagePolicyPlugin = new AiChatPlugin();
     var imagePolicyConfig = new PluginConfig();
@@ -523,6 +589,7 @@ await TimerRepeatChecks.RunAsync();
 await TimerLimitChecks.RunAsync();
 await TimerUpdateChecks.RunAsync();
 ProactiveChecks.Run();
+await ProactiveJudgeChecks.RunAsync();
 await ProactiveChecks.RunHistoryAsync();
 await McpChecks.RunAsync();
 await RecallChecks.RunAsync();

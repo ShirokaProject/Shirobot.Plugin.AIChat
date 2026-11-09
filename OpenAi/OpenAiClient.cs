@@ -8,6 +8,10 @@ using ShiroBot.SDK.Abstractions;
 
 namespace ShiroBot.AiChatPlugin.OpenAi;
 
+internal sealed class IncompleteUpstreamResponseException(string reason) : HttpRequestException(reason);
+internal sealed class ToolRoundResponseFailedException(Exception inner)
+    : Exception("上游回复多次中断，已执行的工具任务不会重新提交。", inner);
+
 internal sealed class EmptyUpstreamResponseException : Exception
 {
     public EmptyUpstreamResponseException() : base("响应内容为空") { }
@@ -162,6 +166,10 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
         {
             throw new TaskCanceledException("上游流式请求超时。", ex);
         }
+        catch (IOException) when (!ct.IsCancellationRequested)
+        { throw new IncompleteUpstreamResponseException("上游流式连接读取中断。"); }
+        catch (JsonException) when (!ct.IsCancellationRequested)
+        { throw new IncompleteUpstreamResponseException("上游响应JSON不完整或无效。"); }
     }
 
     private async Task<OpenAiResponseMessage> ReadIncrementalAsync(HttpClient http, HttpRequestMessage request,
@@ -189,23 +197,32 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
             var parsed = PluginJson.Deserialize<OpenAiChatResponse>(raw, _jsonOptions);
             if (parsed?.Error?.Message is { } error) throw new InvalidOperationException(error);
             Report(model, chatRequest, ReadUsage(raw));
-            var message = parsed?.Choices?.FirstOrDefault()?.Message ?? throw new EmptyUpstreamResponseException();
+            var choice = parsed?.Choices?.FirstOrDefault() ?? throw new EmptyUpstreamResponseException();
+            ValidateCompletion(choice.FinishReason, choice.Message?.ToolCalls, requireReason: choice.HasFinishReason);
+            BotLog.Info($"[AiChat] 上游JSON结束 finish_reason={choice.FinishReason ?? "omitted"} text_chars={choice.Message?.Content?.Length ?? 0}");
+            var message = choice.Message ?? throw new EmptyUpstreamResponseException();
             if (!string.IsNullOrWhiteSpace(message.Content)) await onContent(message.Content).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(message.Content) && message.ToolCalls is not { Count: > 0 })
                 throw new EmptyUpstreamResponseException();
             return message;
         }
 
+        return await ReadSseMessageAsync(reader, firstLine, model, chatRequest, onContent, timeout.Token).ConfigureAwait(false);
+    }
+
+    private async Task<OpenAiResponseMessage> ReadSseMessageAsync(TextReader reader, string? firstLine,
+        ModelEntry model, OpenAiChatRequest chatRequest, Func<string, Task> onContent, CancellationToken ct)
+    {
         var content = new StringBuilder();
         var reasoningContent = new StringBuilder();
         var hasReasoningContent = false;
         var toolCalls = new SortedDictionary<int, OpenAiToolCall>();
         var eventData = new StringBuilder();
-        var finished = false;
+        string? finishReason = null;
         var done = false;
         UsageReading? usage = null;
         for (string? line = firstLine; line is not null && !done;
-             line = done ? null : await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false))
+             line = done ? null : await reader.ReadLineAsync(ct).ConfigureAwait(false))
         {
             if (line.Length == 0)
             {
@@ -218,7 +235,9 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
             }
         }
         if (eventData.Length > 0 && !done) await ProcessEventAsync().ConfigureAwait(false);
-        if (!finished) throw new HttpRequestException("上游流式响应在完成前中断。");
+        if (finishReason is null) throw new IncompleteUpstreamResponseException("上游流式响应缺少正常结束原因，连接提前结束。");
+        ValidateCompletion(finishReason, toolCalls.Values.ToList());
+        BotLog.Info($"[AiChat] 上游SSE正常结束 finish_reason={finishReason} text_chars={content.Length} tool_calls={toolCalls.Count}");
         Report(model, chatRequest, usage);
         if (string.IsNullOrWhiteSpace(content.ToString()) && toolCalls.Count == 0)
             throw new EmptyUpstreamResponseException();
@@ -236,8 +255,11 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
             if (eventData.Length == 0) return;
             var data = eventData.ToString();
             eventData.Clear();
-            if (data.Trim() == "[DONE]") { done = finished = true; return; }
-            using var doc = JsonDocument.Parse(data);
+            if (data.Trim() == "[DONE]") { done = true; return; }
+            JsonDocument document;
+            try { document = JsonDocument.Parse(data); }
+            catch (JsonException ex) { throw new IncompleteUpstreamResponseException("上游SSE数据不完整或损坏：" + ex.GetType().Name); }
+            using var doc = document;
             if (doc.RootElement.TryGetProperty("error", out _))
                 throw new InvalidOperationException(TryExtractErrorMessage(data) ?? "上游流式响应出错。");
             // include_usage 时用量在最后一个 chunk（choices 为空）；也有上游在每个 chunk 里累计返回。
@@ -248,7 +270,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
             {
                 if (choice.TryGetProperty("index", out var index) && index.GetInt32() != 0) continue;
                 if (choice.TryGetProperty("finish_reason", out var reason) && reason.ValueKind == JsonValueKind.String)
-                    finished = true;
+                    finishReason = reason.GetString();
                 if (!choice.TryGetProperty("delta", out var delta)) continue;
                 if (delta.TryGetProperty("reasoning_content", out var reasoning) && reasoning.ValueKind == JsonValueKind.String)
                 {
@@ -309,14 +331,13 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
             throw new InvalidOperationException(msg ?? $"上游返回 HTTP {(int)resp.StatusCode}");
         }
 
-        // 检测 SSE 流式响应（某些 provider 忽略 stream:false，强制返回 streaming）
-        if (raw.TrimStart().StartsWith("data:", StringComparison.Ordinal))
+        // Some gateways ignore stream:false. Never accept their partial SSE as a final answer.
+        var start = raw.TrimStart();
+        if (resp.Content.Headers.ContentType?.MediaType == "text/event-stream" || start.StartsWith("data:", StringComparison.Ordinal) || start.StartsWith(':') || start.StartsWith("event:", StringComparison.Ordinal))
         {
-            var content = ParseSseStreamContent(raw);
-            if (string.IsNullOrWhiteSpace(content))
-                throw new EmptyUpstreamResponseException();
-            Report(model, request, ReadUsage(raw));
-            return new OpenAiResponseMessage { Role = "assistant", Content = content };
+            using var reader = new StringReader(raw);
+            return await ReadSseMessageAsync(reader, await reader.ReadLineAsync(ct).ConfigureAwait(false), model, request,
+                _ => Task.CompletedTask, ct).ConfigureAwait(false);
         }
 
         OpenAiChatResponse? parsed;
@@ -326,8 +347,8 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
         }
         catch (JsonException ex)
         {
-            BotLog.Warning($"[AiChat] 解析响应失败: {ex.Message} body={raw}");
-            throw new InvalidOperationException("响应解析失败");
+            BotLog.Warning($"[AiChat] 上游JSON响应不完整或损坏: {ex.GetType().Name}");
+            throw new IncompleteUpstreamResponseException("上游JSON响应不完整或损坏。");
         }
 
         if (parsed?.Error?.Message is { } errMsg)
@@ -336,8 +357,10 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
         }
         Report(model, request, ReadUsage(raw));
 
-        return parsed?.Choices?.FirstOrDefault()?.Message
-               ?? throw new EmptyUpstreamResponseException();
+        var choice = parsed?.Choices?.FirstOrDefault() ?? throw new EmptyUpstreamResponseException();
+        ValidateCompletion(choice.FinishReason, choice.Message?.ToolCalls, requireReason: choice.HasFinishReason);
+        BotLog.Info($"[AiChat] 上游JSON结束 finish_reason={choice.FinishReason ?? "omitted"} text_chars={choice.Message?.Content?.Length ?? 0}");
+        return choice.Message ?? throw new EmptyUpstreamResponseException();
     }
 
     /// <summary>流式请求按配置附带 include_usage。</summary>
@@ -454,47 +477,23 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
         return null;
     }
 
-    /// <summary>
-    /// 解析 SSE 流式响应，拼接所有 chunk 的 delta.content 为完整文本。
-    /// 兼容某些 provider 忽略 stream:false 强制返回 streaming 的情况。
-    /// </summary>
-    private static string ParseSseStreamContent(string raw)
+    private static void ValidateCompletion(string? reason, IReadOnlyCollection<OpenAiToolCall>? calls, bool requireReason = true)
     {
-        var sb = new StringBuilder();
-        foreach (var line in raw.Split('\n'))
+        // Legacy JSON-only gateways may omit finish_reason; explicit truncation never succeeds.
+        if (reason is null && requireReason) throw new IncompleteUpstreamResponseException("上游响应缺少结束原因。");
+        if (reason == "length") throw new IncompleteUpstreamResponseException("上游生成达到输出长度上限，回复被截断；可提高最大输出token配置。");
+        if (reason == "content_filter") throw new InvalidOperationException("上游内容过滤终止了回复，未发送不完整正文。");
+        if (reason is not (null or "stop" or "tool_calls" or "function_call"))
+            throw new IncompleteUpstreamResponseException("上游以异常结束原因终止回复。");
+        if (reason is "tool_calls" or "function_call" && calls is not { Count: > 0 })
+            throw new IncompleteUpstreamResponseException("上游工具调用响应未完成。");
+        foreach (var call in calls ?? [])
         {
-            var trimmed = line.Trim();
-            if (!trimmed.StartsWith("data:", StringComparison.Ordinal))
-                continue;
-
-            var json = trimmed["data:".Length..].Trim();
-            if (string.IsNullOrEmpty(json) || json == "[DONE]")
-                continue;
-
-            try
-            {
-                using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.TryGetProperty("choices", out var choices) &&
-                    choices.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var choice in choices.EnumerateArray())
-                    {
-                        if (choice.TryGetProperty("delta", out var delta) &&
-                            delta.TryGetProperty("content", out var content) &&
-                            content.ValueKind == JsonValueKind.String)
-                        {
-                            sb.Append(content.GetString());
-                        }
-                    }
-                }
-            }
-            catch (JsonException)
-            {
-                // 跳过无法解析的行
-            }
+            if (string.IsNullOrWhiteSpace(call.Id) || string.IsNullOrWhiteSpace(call.Function?.Name))
+                throw new IncompleteUpstreamResponseException("上游工具调用缺少ID或名称。");
+            try { using var args = JsonDocument.Parse(call.Function.Arguments); }
+            catch (JsonException) { throw new IncompleteUpstreamResponseException("上游工具参数JSON不完整或无效，未执行工具。"); }
         }
-
-        return sb.ToString();
     }
 
     private HttpClient GetClient(string baseUrl)

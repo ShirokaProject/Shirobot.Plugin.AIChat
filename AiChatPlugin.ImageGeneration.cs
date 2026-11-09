@@ -44,33 +44,48 @@ public sealed partial class AiChatPlugin
 
     private Task HandleImageGenAsync(MessageEvent message)
     {
+        if (!_config.ToolUse.Enabled || !_config.ToolUse.ImageGen.Enabled) return Task.CompletedTask;
         var text = message.GetPlainText().Trim();
         if (text.Length > 9 && !char.IsWhiteSpace(text[9])) return Task.CompletedTask;
         var prompt = text.Length > 9 ? text[9..].Trim() : "";
-        if (prompt.Length == 0) return ReplyAsync(message, !message.IsDirect, "用法：#imagegen 提示词");
-        var result = QueueImageGeneration(message, prompt, null, null);
-        return result == ImageJobQueued ? Task.CompletedTask : ReplyAsync(message, !message.IsDirect, result);
+        if (prompt.Length == 0) return ReplyAsync(message, !message.IsDirect, ImageGenerationCommand.HelpFor(_config.ToolUse.ImageGen.EnableGif));
+        (string Prompt, ImageGenerationOptions Options) parsed;
+        try { parsed = ImageGenerationCommand.Parse(prompt, _config.ToolUse.ImageGen); }
+        catch (Exception ex) when (ex is ArgumentException or ImageGenerationException)
+        { return ReplyAsync(message, !message.IsDirect, ex.Message + "\n" + ImageGenerationCommand.HelpFor(_config.ToolUse.ImageGen.EnableGif)); }
+        var result = QueueImageGeneration(message, parsed.Prompt, parsed.Options);
+        return string.IsNullOrEmpty(result) || result == ImageJobQueued ? Task.CompletedTask : ReplyAsync(message, !message.IsDirect, result);
     }
 
     private const string ImageJobQueued = "生图任务已提交后台，完成后会单独发送图片。请勿声称已经生成成功；其他聊天可以继续。";
 
     internal ImageGenerationTool CreateImageGenerationTool(MessageEvent message, ImagePart[] historyImages,
-        string imageCatalog, ConversationKey? conversationKey = null)
-        => new((prompt, size, quality, token) =>
+        string imageCatalog, ConversationKey? conversationKey = null, DownloadedFiles? downloads = null)
+        => new((prompt, options, token) =>
         {
             token.ThrowIfCancellationRequested();
-            return Task.FromResult(QueueImageGeneration(message, prompt, size, quality, conversationKey: conversationKey));
-        }, (ids, prompt, size, quality, token) =>
+            return Task.FromResult(QueueImageGeneration(message, prompt, options, conversationKey: conversationKey));
+        }, (ids, prompt, options, token) =>
         {
             token.ThrowIfCancellationRequested();
             if (ids.Any(id => id > historyImages.Length)) return Task.FromResult("历史图片编号不存在，请用户重新附图。");
-            return Task.FromResult(QueueImageGeneration(message, prompt, size, quality,
+            return Task.FromResult(QueueImageGeneration(message, prompt, options,
                 ids.Select(id => historyImages[id - 1]).ToArray(), conversationKey));
-        }, imageCatalog);
+        }, imageCatalog, _config.ToolUse.ImageGen.PromptInstructions, downloads is null ? null : async (ids, prompt, options, token) =>
+        {
+            try
+            {
+                var references = await downloads.ImagesAsync(ids, token).ConfigureAwait(false);
+                return QueueImageGeneration(message, prompt, options, references, conversationKey);
+            }
+            catch (ArgumentException ex) { return ex.Message; }
+        }, enableGif: _config.ToolUse.ImageGen.EnableGif);
 
-    private string QueueImageGeneration(MessageEvent message, string prompt, string? size, string? quality, IReadOnlyList<ImagePart>? references = null, ConversationKey? conversationKey = null)
+    private string QueueImageGeneration(MessageEvent message, string prompt, ImageGenerationOptions options, IReadOnlyList<ImagePart>? references = null, ConversationKey? conversationKey = null)
     {
-        if (!_config.ToolUse.ImageGen.Enabled) return "生图功能未启用。";
+        if (!_config.ToolUse.Enabled || !_config.ToolUse.ImageGen.Enabled) return "";
+        try { ImageGenerationClient.ValidateOptions(options.Resolve(_config.ToolUse.ImageGen)); }
+        catch (ImageGenerationException ex) { return ex.Message; }
         if (string.IsNullOrWhiteSpace(prompt) || prompt.Length > 32000) return "生图提示词不能为空，且最多 32000 字符。";
         PendingAiRequest pending;
         try { pending = _imageRequests.Register(message); }
@@ -93,9 +108,9 @@ public sealed partial class AiChatPlugin
                         // Downloads are part of the background job, not the chat turn or adapter dispatch.
                         var parts = await new ResourceCollector(Context, _fetcher, _cache, _config.Resources)
                             .CollectAsync(message, stop.Token).ConfigureAwait(false);
-                        var result = await GenerateAndSendImageAsync(message, prompt, pending, stop.Token, size, quality,
+                        var result = await GenerateAndSendImageAsync(message, prompt, pending, stop.Token, options,
                             [.. parts.OfType<ImagePart>(), .. references ?? []], conversationKey).ConfigureAwait(false);
-                        if (result != "图片已生成并发送。" && pending.TryBeginReply())
+                        if (!string.IsNullOrEmpty(result) && result != "图片已生成并发送。" && pending.TryBeginReply())
                             await ReplyAsync(message, !message.IsDirect, result).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (stop.IsCancellationRequested)
@@ -113,12 +128,11 @@ public sealed partial class AiChatPlugin
         return ImageJobQueued;
     }
 
-    private async Task<string> GenerateAndSendImageAsync(MessageEvent message, string prompt, PendingAiRequest pending, CancellationToken ct, string? size = null, string? quality = null, IReadOnlyList<ImagePart>? images = null, ConversationKey? conversationKey = null)
+    private async Task<string> GenerateAndSendImageAsync(MessageEvent message, string prompt, PendingAiRequest pending, CancellationToken ct, ImageGenerationOptions? options = null, IReadOnlyList<ImagePart>? images = null, ConversationKey? conversationKey = null)
     {
         var defaults = _config.ToolUse.ImageGen;
-        var config = new Config.ImageGenerationSection { Enabled = defaults.Enabled, Model = defaults.Model,
-            TimeoutSeconds = defaults.TimeoutSeconds, Size = size ?? defaults.Size, Quality = quality ?? defaults.Quality };
-        if (!config.Enabled) return "生图功能未启用。";
+        var config = (options ?? new()).Resolve(defaults);
+        if (!_config.ToolUse.Enabled || !config.Enabled) return "";
         if (prompt.Length > 32000) return "生图提示词不能超过 32000 字符。";
         var model = ResolveModel(config.Model);
         if (model is null) return "请先配置已注册的生图模型。";
@@ -146,9 +160,8 @@ public sealed partial class AiChatPlugin
                 }
                 else return "参考图片已失效，请重新附图。";
                 if (bytes.Length > 20_000_000) return "参考图片过大。";
-                var mime = MimeGuesser.SniffImageMime(bytes);
-                if (mime is not ("image/png" or "image/jpeg" or "image/webp")) return "编辑参考图支持 PNG、JPEG、WebP，请转换格式后重试。";
-                inputs.Add(new ImageGenerationInput(bytes, mime));
+                try { inputs.Add(ReferenceImage.Normalize(bytes)); }
+                catch (ArgumentException ex) { return ex.Message; }
             }
             clear = await ShowImageGenerationProgressAsync(message, ct).ConfigureAwait(false);
             var image = await ImageGenerationClient.GenerateAsync(url, key ?? "", model.Name, prompt, config,

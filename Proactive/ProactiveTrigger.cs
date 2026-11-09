@@ -53,11 +53,12 @@ internal sealed class ProactiveTrigger
     internal const string KeywordPrompt =
         "[交互方式: 没有人 @ 你，但新消息里这条出现了你的名字或称呼。上面是群里之前的聊天记录和你上次看过之后的新消息。" +
         "先判断这条消息是不是在对你说话：直接叫你（如“XX 在不在”“XX 你觉得呢”）、向你提问、让你做事或明显在等你回应，才开口，" +
+        "新消息直接针对你本人或你刚才的发言进行调侃、质疑或吐槽时，即使用第三人称叫你的名字，也可以像群友一样自然接一句。" +
         "开口时像群友一样简短随意，新消息里其他人说的也可以顺带回应。" +
-        "如果只是在一段话里顺带提到你、在跟别人聊起你、引用或转述你说过的话、或者名字只是碰巧出现，都不算在对你说话，只输出 " + SkipTag + "，不要输出别的内容。" +
+        "如果只是顺带提到你、在中性地谈论过去的事情、引用或转述而没有当前互动意图、或者名字只是碰巧出现，就不必回应，只输出 " + SkipTag + "，不要输出别的内容。" +
         "拿不准时保持沉默。]";
 
-    private sealed record Line(DateTimeOffset At, string Name, string Text, string? MessageId = null);
+    private sealed record Line(DateTimeOffset At, string Name, string Text, string? MessageId = null, string IdentityTags = "");
 
     private sealed class GroupState
     {
@@ -74,13 +75,13 @@ internal sealed class ProactiveTrigger
         config.Enabled && config.Groups.Any(g => g.Trim() == groupId);
 
     /// <summary>记录一条群消息；返回本条之前的最近消息记录（不含本条）。</summary>
-    public string Record(string groupKey, string name, string text, int keep, DateTimeOffset at, string? messageId = null)
+    public string Record(string groupKey, string name, string text, int keep, DateTimeOffset at, string? messageId = null, string identityTags = "")
     {
         lock (_groups)
         {
             var state = GetState(groupKey);
             var transcript = Format(state.Recent);
-            state.Recent.Add(new Line(at, name, Shorten(text, 300), messageId));
+            state.Recent.Add(new Line(at, name, Shorten(text, 300), messageId, identityTags));
             state.MessagesSince++;
             var max = Math.Clamp(keep, 1, 100);
             if (state.Recent.Count > max) state.Recent.RemoveRange(0, state.Recent.Count - max);
@@ -192,7 +193,8 @@ internal sealed class ProactiveTrigger
         (transcript.Length == 0 ? "" : "[群聊之前的消息，按时间顺序，仅供参考]\n" + transcript + "\n") +
         (fresh.Length == 0 ? "" : "[你上次看过之后的新消息]\n" + fresh + "\n") + prompt;
 
-    internal static string FormatLine(DateTimeOffset at, string name, string text) =>
+    internal static string FormatLine(DateTimeOffset at, string name, string text, string identityTags = "", string? messageId = null) =>
+        (string.IsNullOrEmpty(messageId) ? "" : "[消息 " + messageId + "] ") + identityTags +
         (at == default ? "" : at.ToLocalTime().ToString("HH:mm") + " ") + name + ": " + Shorten(text, 300);
 
     private GroupState GetState(string groupKey)
@@ -204,7 +206,7 @@ internal sealed class ProactiveTrigger
     private static string Format(IEnumerable<Line> lines)
     {
         var sb = new StringBuilder();
-        foreach (var line in lines) sb.AppendLine(FormatLine(line.At, line.Name, line.Text));
+        foreach (var line in lines) sb.AppendLine(FormatLine(line.At, line.Name, line.Text, line.IdentityTags, line.MessageId));
         return sb.ToString().TrimEnd();
     }
 

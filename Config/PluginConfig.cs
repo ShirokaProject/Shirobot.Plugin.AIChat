@@ -27,6 +27,8 @@ public sealed class PluginConfig
     public PermissionsSection Permissions { get; set; } = new();
     [ConfigField("全局工具开关及各工具的独立配置。", Label = "工具调用")]
     public ToolUseSection ToolUse { get; set; } = new();
+    [ConfigField("按条添加可复用的任务说明；AI 先看名称和用途，需要时调用 skill 加载步骤。", Label = "自定义技能")]
+    public CustomSkillSection Skills { get; set; } = new();
     [ConfigField("让其他插件借用这里配置的模型，例如 MemePlugin 的 AI 标注；需要宿主 1.0.3。", Label = "对其他插件开放模型")]
     public PluginApiSection PluginApi { get; set; } = new();
     [ConfigField("模型和搜索请求共用的代理设置；安全网页抓取使用公网直连。", Label = "网络设置")]
@@ -130,7 +132,7 @@ public sealed class HistorySection
     [ConfigField("每次请求最多携带多少张图片，优先本条和引用图片，再取最近历史图片；图片统一置于请求末尾。", Label = "每次请求图片上限", Min = 1, Max = 16)]
     public int MaxImagesPerRequest { get; set; } = 4;
 
-    [ConfigField("群聊中被 @ 或用 #ai 时，附上群里最近多少条消息，帮助理解大家在聊什么；只附在本次请求里，不写入历史。优先通过适配器的历史消息接口获取，不支持时使用插件运行期间记录的普通消息。0 表示不附带。", Label = "群聊上下文消息数", Min = 0, Max = 100)]
+    [ConfigField("群聊中被 @ 或用 #ai 时，附上群里最近多少条消息，帮助理解大家在聊什么；新增上下文随成功对话保存，后续自动去重。优先通过适配器的历史消息接口获取，不支持时使用插件运行期间记录的普通消息。0 表示不附带。", Label = "群聊上下文消息数", Min = 0, Max = 100)]
     public int GroupContextMessages { get; set; }
 }
 
@@ -235,7 +237,7 @@ public sealed class BehaviourSection
 
 public sealed class ProactiveSection
 {
-    [ConfigField("开启后，白名单群里没有 @ 机器人的普通消息在冷却和频率限制允许时交给模型，由模型判断是否插话，不合适就保持沉默。每次判断都会调用一次模型。", Label = "启用群聊主动回复")]
+    [ConfigField("开启后，白名单群的普通消息先用少量近期文字判断是否接话，不带完整历史、图片或工具；判断沉默就结束，决定接话后再加载完整上下文生成回复。每次判断调用一次模型，接话时另外调用回复模型。", Label = "启用群聊主动回复")]
     public bool Enabled { get; set; }
     [ConfigField("允许主动回复的群号；留空表示不在任何群主动回复。", Label = "主动回复群白名单")]
     public string[] Groups { get; set; } = [];
@@ -249,8 +251,10 @@ public sealed class ProactiveSection
     public int CooldownSeconds { get; set; } = 10;
     [ConfigField("主动插话前，自上次判断以来群里至少要有这么多条其他消息，避免冷清时自说自话。", Label = "主动插话最少间隔消息数", Min = 0, Max = 1000)]
     public int MinMessagesBetween { get; set; } = 1;
-    [ConfigField("交给模型参考的群聊最近消息条数，优先通过适配器的历史消息接口获取。", Label = "参考最近消息数", Min = 1, Max = 100)]
+    [ConfigField("决定接话后，生成正式回复时参考的群聊最近消息条数，优先通过适配器的历史消息接口获取。", Label = "回复参考最近消息数", Min = 1, Max = 100)]
     public int ContextMessages { get; set; } = 20;
+    [ConfigField("判断是否接话时只看这些近期文字消息和本批新消息，不加载完整会话、图片或工具；输入还有总长度限制。", Label = "判断参考最近消息数", Min = 1, Max = 20)]
+    public int JudgeContextMessages { get; set; } = 6;
     [ConfigField("群里来消息后先等一个随机的安静窗口（最短秒数），期间有新消息就重新计时，安静下来后把这段时间的新消息一起判断一次，避免连续发消息时每条都请求模型。", Label = "安静窗口最短（秒）", Min = 0, Max = 120)]
     public int QuietMinSeconds { get; set; } = 3;
     [ConfigField("安静窗口的最长秒数，每次在最短和最长之间随机取值。", Label = "安静窗口最长（秒）", Min = 0, Max = 120)]
@@ -274,16 +278,18 @@ public sealed class PermissionsSection
 
 public sealed class ToolUseSection
 {
-    [ConfigField("OpenAI 兼容生图接口，支持 AI 工具和 #imagegen。", Label = "图片生成")]
-    public ImageGenerationSection ImageGen { get; set; } = new();
     [ConfigField("关闭后不向模型发送任何工具定义及工具提示词。", Label = "启用工具调用")]
     public bool Enabled { get; set; } = true;
     /// <summary>每次请求最多允许的工具调用轮数（1-8），之后要求模型给出最终回答。</summary>
-    [ConfigField("所有工具共用的调用轮数。先读首页再读详情页需要多轮；与各工具的次数上限共同生效，达到后要求模型输出最终回答。", Label = "工具调用轮数上限", Min = 1, Max = 8)]
+    [ConfigField("所有工具共用的调用轮数。先读首页再读详情页需要多轮；同一轮可调用多个工具；所有工具统一受此轮数限制，达到后要求模型输出最终回答。", Label = "工具调用轮数上限", Min = 1, Max = 8)]
     public int MaxRounds { get; set; } = 3;
+    [ConfigField("同一轮可安全并发的工具调用上限；搜索、网页读取、技能加载可以重叠，修改状态的工具按顺序执行。设为 1 时串行。", Label = "工具并发数", Min = 1, Max = 16)]
+    public int MaxParallelCalls { get; set; } = 4;
+    [ConfigField("OpenAI 兼容生图接口，支持 AI 工具和 #imagegen。", Label = "图片生成")]
+    public ImageGenerationSection ImageGen { get; set; } = new();
     [ConfigField("独立配置 Tavily 搜索工具。", Label = "Tavily 网络搜索")]
     public TavilySection Tavily { get; set; } = new();
-    [ConfigField("读取网页和文本直链。", Label = "HTTP 页面读取")]
+    [ConfigField("读取网页和文本直链。", Label = "HTTP 请求")]
     public HttpFetchSection HttpFetch { get; set; } = new();
     [ConfigField("预约消息，到点使用默认模型生成回复并 @ 用户。", Label = "定时消息工具")]
     public TimerToolSection TimerTool { get; set; } = new();
@@ -325,8 +331,6 @@ public sealed class McpSection
     public bool Enabled { get; set; }
     [ConfigField("⚠️ 关闭时只有机器人所有者或管理员发起的对话才会向模型提供 MCP 工具；开启后任何能和机器人对话的人都能让模型调用，风险很高。主动插话和定时推送始终不提供 MCP 工具。", Label = "所有人可用")]
     public bool AllowEveryone { get; set; }
-    [ConfigField("每次 AI 回复中单个 MCP 工具最多调用的次数，仍受全局工具轮数限制。", Label = "单工具调用次数上限", Min = 1, Max = 20)]
-    public int MaxCallsPerTurn { get; set; } = 3;
     [ConfigField("连接、列出工具和单次调用的超时时间。", Label = "超时（秒）", Min = 5, Max = 600)]
     public int TimeoutSeconds { get; set; } = 60;
     [ConfigField("单次工具结果交给模型的最大字符数，超出部分截断。", Label = "结果最大字符数", Min = 500, Max = 100000)]
@@ -364,8 +368,6 @@ public sealed class TavilySection
     /// <summary>留空时不注册网络搜索工具，也不向模型透露该能力。</summary>
     [ConfigField("留空时不注册搜索工具。", Label = "Tavily API 密钥", Type = "password")]
     public string ApiKey { get; set; } = "";
-    [ConfigField("每次 AI 回复最多允许的 Tavily 搜索次数，仍受全局工具轮数限制。", Label = "每次回复搜索次数上限", Min = 1, Max = 10)]
-    public int MaxCallsPerTurn { get; set; } = 3;
 
     [ConfigField("单次搜索返回的最大结果数。", Label = "搜索结果数量", Min = 1, Max = 5)]
     public int MaxResults { get; set; } = 5;
@@ -384,10 +386,10 @@ public sealed class NetworkSection
 
 public sealed class HttpFetchSection
 {
-    [ConfigField("允许模型读取 HTTP/HTTPS 网页或文本直链；不会执行页面脚本。", Label = "启用 HTTP 页面读取")]
+    [ConfigField("file模式的单个文件下载上限；临时文件由宿主一小时后清理。", Label = "最大文件下载字节数", Min = 1024, Max = 50000000)]
+    public int MaxFileBytes { get; set; } = 20_000_000;
+    [ConfigField("允许模型通过GET、HEAD、POST、PUT、PATCH、DELETE、OPTIONS访问公网接口和网页，支持请求头及请求体；不会执行页面脚本。", Label = "启用 HTTP 请求")]
     public bool Enabled { get; set; } = true;
-    [ConfigField("每次 AI 回复最多允许调用 http_fetch 的次数。若要根据首页结果继续抓取详情页，还需提高工具调用分组顶部的全局轮数上限。", Label = "每次回复抓取次数上限", Min = 1, Max = 10)]
-    public int MaxCallsPerTurn { get; set; } = 3;
     [ConfigField("单次读取超时秒数。", Label = "读取超时秒数", Min = 5, Max = 120)]
     public int TimeoutSeconds { get; set; } = 20;
     [ConfigField("限制下载体积，超过限制时返回工具错误。", Label = "最大下载字节数", Min = 1024, Max = 2097152)]
@@ -446,6 +448,9 @@ public sealed class MemoryToolSection
 
 public sealed class OwnerPromptSection
 {
+    [ConfigField("用于聊天认主，按完整真实用户 ID 精确匹配，不授予管理权限。每项可填用户 ID，或填 实例ID/用户ID 限定适配器实例；留空则仅使用宿主主人配置。", Label = "Master 用户 ID")]
+    public List<string> MasterIds { get; set; } = [];
+
     [ConfigField("开启后将下方文本追加到聊天及定时推送提示词中，不影响实际管理权限。", Label = "启用主人提示词")]
     public bool Enabled { get; set; }
     [ConfigField("直接填写主人介绍、QQ 号、机器人框架等文字，开启后原样追加；留空不追加。", Label = "主人提示词", Type = "text")]
@@ -461,10 +466,46 @@ public sealed class ImageGenerationSection
     public bool Enabled { get; set; }
     [ConfigField("填写已注册模型名或 provider-model。", Label = "生图模型")]
     public string Model { get; set; } = "gpt-image-2.5-sunburst";
+    [ConfigField("聊天模型调用生图工具时，按这些规则整理 prompt，例如语言、自然语言或标签格式、默认画风、构图和光影；用户本次明确要求优先。留空沿用内置规则。只指导提示词编写，不直接拼接到生图接口；#imagegen 命令仍原样提交。", Label = "生图提示词编写规则", Type = "text")]
+    public string PromptInstructions { get; set; } = "";
     [ConfigField("生图独立超时，不沿用聊天超时。", Label = "生图超时（秒）", Min = 30, Max = 1800)]
     public int TimeoutSeconds { get; set; } = 600;
     [ConfigField("发送给 images/generations 的 size。", Label = "图片尺寸")]
     public string Size { get; set; } = "1024x1024";
+    [ConfigField("auto、opaque 或 transparent；透明背景需使用 png 或 webp。", Label = "图片背景")]
+    public string Background { get; set; } = "auto";
+    [ConfigField("png、jpeg、webp 或 gif（需要模型支持动画）。", Label = "图片输出格式")]
+    public string OutputFormat { get; set; } = "png";
+    [ConfigField("仅控制生成GIF输出，不限制GIF参考图输入。当前服务商未开放GIF输出，默认关闭。", Label = "启用 GIF 输出（实验）")]
+    public bool EnableGif { get; set; }
+    [ConfigField("GIF 帧数，2–16。仅 GIF 生效。", Label = "GIF 帧数", Min = 2, Max = 16)]
+    public int FrameCount { get; set; } = 9;
+    [ConfigField("GIF 每帧时长，20–2000毫秒。仅 GIF 生效。", Label = "GIF 每帧时长", Min = 20, Max = 2000)]
+    public int FrameDurationMs { get; set; } = 200;
+
+    [ConfigField("仅 jpeg/webp 生效，0–100。", Label = "图片压缩质量", Min = 0, Max = 100)]
+    public int OutputCompression { get; set; } = 100;
     [ConfigField("auto、low、medium、high 等，按服务商支持填写。", Label = "图片质量")]
     public string Quality { get; set; } = "auto";
+}
+
+
+public sealed class CustomSkillSection
+{
+    [ConfigField("关闭时不提供技能目录和 skill 工具。", Label = "启用自定义技能")]
+    public bool Enabled { get; set; } = true;
+    [ConfigField("最多200条；每条填写唯一名称、适用场景和具体操作步骤。保存后下一次对话生效。", Label = "技能列表")]
+    public List<CustomSkillEntry> Entries { get; set; } = [];
+}
+
+public sealed class CustomSkillEntry
+{
+    [ConfigField("关闭后 AI 看不到也不能加载这条技能。", Label = "启用")]
+    public bool Enabled { get; set; } = true;
+    [ConfigField("唯一技能名，例如 image-prompt，可用中文。", Label = "名称")]
+    public string Name { get; set; } = "";
+    [ConfigField("告诉 AI 什么时候使用，例如：用户要求制作透明背景贴纸时使用。", Label = "用途")]
+    public string Description { get; set; } = "";
+    [ConfigField("完整说明怎么做、先后步骤、如何选择现有工具及输出要求。", Label = "操作说明", Type = "text")]
+    public string Instructions { get; set; } = "";
 }

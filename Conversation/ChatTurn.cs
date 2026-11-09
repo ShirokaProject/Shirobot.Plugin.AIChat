@@ -7,4 +7,7 @@ namespace ShiroBot.AiChatPlugin.Conversation;
 public sealed record ChatTurn(
     string Role,
     IReadOnlyList<ChatPart> Parts,
-    long Timestamp);
+    long Timestamp)
+{
+    public string? MessageId { get; init; }
+}

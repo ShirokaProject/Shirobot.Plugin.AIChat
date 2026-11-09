@@ -11,12 +11,43 @@ using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.SDK.Adapter;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
+using PluginJson = ShiroBot.AiChatPlugin.PluginJson;
 
 internal static class ImageGenerationChecks
 {
     public static async Task RunAsync()
     {
         static void Check(bool ok, string message) { if (!ok) throw new Exception(message); }
+        using (var baseline = new ImageGenerationTool((_, _, _) => Task.FromResult("queued")))
+        using (var blank = new ImageGenerationTool((_, _, _) => Task.FromResult("queued"), promptInstructions: " \n "))
+        {
+            Check(blank.SystemPrompt == baseline.SystemPrompt, "An empty image prompt policy must preserve the existing instructions.");
+            var configured = new AiChatPlugin();
+            var policyConfig = new PluginConfig();
+            const string policy = "用中文自然语言整理提示词，默认水彩风格，依次说明主体、构图、光影。";
+            policyConfig.ToolUse.ImageGen.PromptInstructions = policy;
+            typeof(AiChatPlugin).GetField("_config", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(configured, policyConfig);
+            var policyMessage = new MessageEvent { Platform = "test", MessageId = "policy", Channel = Channel.Group("g"),
+                Sender = new User("u"), Segments = [] };
+            using var first = configured.CreateImageGenerationTool(policyMessage, [], "history catalog");
+            Check(first.SystemPrompt.Contains(policy) && first.SystemPrompt.Contains("用户本次明确") &&
+                !first.SystemPrompt.Contains("history catalog") &&
+                PluginJson.Serialize(first.Definition) == PluginJson.Serialize(baseline.Definition),
+                "Image prompt rules must reach the chat model without changing tool schema or embedding dynamic image catalogs.");
+            policyConfig.ToolUse.ImageGen.PromptInstructions = "Use English prose and a photographic style.";
+            using var changed = configured.CreateImageGenerationTool(policyMessage, [], "");
+            Check(changed.SystemPrompt.Contains(policyConfig.ToolUse.ImageGen.PromptInstructions) &&
+                !changed.SystemPrompt.Contains(policy) && first.SystemPrompt.Contains(policy),
+                "New turns must pick up changed prompt rules while an existing tool retains its snapshot.");
+        }
+        Console.WriteLine("PASS: configurable image prompt writing rules reach the model, preserve defaults and keep tool schema stable");
+        foreach (var size in new[] { "auto", "1024x1024", "1536x864", "3840x2160", "2160x3840" })
+            Check(ImageGenerationClient.IsValidSize(size), "Supported size rejected: " + size);
+        foreach (var size in new[] { "0x0", "1537x864", "4096x2048", "16x1024", "2147483647x16", "-16x16", "1024X1024" })
+            Check(!ImageGenerationClient.IsValidSize(size), "Invalid size accepted: " + size);
+        try { ImageGenerationClient.ValidateOptions(new() { Background = "transparent", OutputFormat = "jpeg" }); throw new Exception("Transparent JPEG accepted."); }
+        catch (ImageGenerationException) { }
+        ImageGenerationClient.ValidateOptions(new() { Background = "transparent", OutputFormat = "webp", OutputCompression = 0 });
         var png = Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=");
         using var listener = new HttpListener();
         var port = Random.Shared.Next(20000, 40000);
@@ -40,6 +71,8 @@ internal static class ImageGenerationChecks
                 if (ctx.Request.Url!.AbsolutePath == "/v1/images/edits")
                 {
                     Check(ctx.Request.ContentType!.StartsWith("multipart/form-data") && body.Contains("image[]"), "Missing edit input.");
+                    Check(body.Contains("background") && body.Contains("transparent") && body.Contains("output_format") &&
+                        body.Contains("webp") && body.Contains("output_compression") && body.Contains("73"), "Edit request lost image options.");
                     Check(body.Contains("保留地鼠姿势，把毛发改成蓝色，背景不变"), "Model edit prompt was replaced by the user message.");
                     lastPrompt = "保留地鼠姿势，把毛发改成蓝色，背景不变";
                 }
@@ -49,6 +82,10 @@ internal static class ImageGenerationChecks
                     using var json = JsonDocument.Parse(body);
                     Check(json.RootElement.GetProperty("model").GetString() == "gpt-image-2.5-sunburst" &&
                         json.RootElement.GetProperty("n").GetInt32() == 1 && !json.RootElement.TryGetProperty("response_format", out _), "Image request mismatch.");
+                    Check(json.RootElement.GetProperty("background").GetString() == "transparent" &&
+                        json.RootElement.GetProperty("output_format").GetString() == "webp" &&
+                        json.RootElement.GetProperty("output_compression").GetInt32() == 73,
+                        "Configured image options were lost before the generation request.");
                     lastPrompt = json.RootElement.GetProperty("prompt").GetString();
                     if (holdImage) { imageStarted.TrySetResult(); await releaseImage.Task; }
                     lastSize = json.RootElement.GetProperty("size").GetString();
@@ -61,6 +98,9 @@ internal static class ImageGenerationChecks
             }
         });
         var config = new PluginConfig(); config.ToolUse.ImageGen.Enabled = true;
+        config.ToolUse.ImageGen.Background = "transparent";
+        config.ToolUse.ImageGen.OutputFormat = "webp";
+        config.ToolUse.ImageGen.OutputCompression = 73;
         config.Models = [new() { Name = "gpt-image-2.5-sunburst", Provider = "test" }];
         config.Providers = [new() { Name = "test", BaseUrl = $"http://127.0.0.1:{port}/v1", ApiKey = "image-key" }];
         var tempRoot = Path.Combine(Path.GetTempPath(), "image-send-check-" + Guid.NewGuid().ToString("N"));
@@ -116,8 +156,8 @@ internal static class ImageGenerationChecks
             Sender = new User("u"), MessageId = "m", Segments = [] };
         var method = typeof(AiChatPlugin).GetMethod("GenerateAndSendImageAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
         async Task<string> Generate(string prompt, string? size, string? quality, CancellationToken ct)
-        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct, size, quality, null, null])!; }
-        using var tool = new ImageGenerationTool(Generate);
+        { using var pending = new PendingAiRequests().Register(message); return await (Task<string>)method.Invoke(plugin, [message, prompt, pending, ct, new ImageGenerationOptions(size, quality), null, null])!; }
+        using var tool = new ImageGenerationTool((prompt, options, ct) => Generate(prompt, options.Size, options.Quality, ct));
         Check(await tool.ExecuteAsync("{\"prompt\":\"一只猫\",\"size\":\"1536x1024\",\"quality\":\"high\"}") == "图片已生成并发送。", "Image tool failed.");
         Check(lastSize == "1536x1024" && lastQuality == "high", "Tool size and quality were not forwarded.");
         Check(config.ToolUse.ImageGen.Size == "1024x1024" && config.ToolUse.ImageGen.Quality == "auto", "Tool mutated persistent defaults.");
@@ -141,8 +181,9 @@ internal static class ImageGenerationChecks
         Check(sendFailure.Contains("发送失败") && File.Exists(paths.Last()) && deleted.Count == 3,
             "Failed send must retain generated file and retract progress message.");
         config.ToolUse.ImageGen.Enabled = false;
-        Check(await Generate("cat", null, null, CancellationToken.None) == "生图功能未启用。" && calls == 4, "Disabled generation called upstream.");
+        Check(await Generate("cat", null, null, CancellationToken.None) == "" && calls == 4, "Disabled generation called upstream.");
         config.ToolUse.ImageGen.Enabled = true; sendFails = false; holdImage = true;
+        config.ToolUse.ImageGen.PromptInstructions = "Use English prose, default watercolor, describe composition and light.";
         using var fetcher = new ResourceFetcher(5, 10000, 10000, "");
         typeof(AiChatPlugin).GetField("_fetcher", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, fetcher);
         typeof(AiChatPlugin).GetField("_cache", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(plugin, new ResourceCache(tempRoot, "cache", 1));
@@ -155,7 +196,7 @@ internal static class ImageGenerationChecks
         await imageStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check(!jobs.Single().IsCompleted && lastPrompt == modelPrompt,
             "Chat image generation must forward the model prompt unchanged while running independently.");
-        Check(((string)queue.Invoke(plugin, [request, modelPrompt, null, null, null, null])!).Contains("已有"), "Same message must not queue duplicate jobs.");
+        Check(((string)queue.Invoke(plugin, [request, modelPrompt, new ImageGenerationOptions(), null, null])!).Contains("已有"), "Same message must not queue duplicate jobs.");
         // Unrelated work can complete while the image job is still waiting.
         await Task.Run(() => Check(!jobs.Single().IsCompleted, "Background job unexpectedly completed."));
         releaseImage.TrySetResult();
@@ -182,7 +223,7 @@ internal static class ImageGenerationChecks
             Channel = recalledRequest.Channel, MessageId = recalledRequest.MessageId };
         var onRecall = typeof(AiChatPlugin).GetMethod("HandleMessageDeletedAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var beforeImages = paths.Count; var beforeDeletes = deleted.Count;
-        queue.Invoke(plugin, [recalledRequest, "海报", null, null, null, null]);
+        queue.Invoke(plugin, [recalledRequest, "海报", new ImageGenerationOptions(), null, null]);
         await imageStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var running = jobs.Last();
         await (Task)onRecall.Invoke(plugin, [deletedEvent with { InstanceId = "unrelated" }])!;
@@ -199,7 +240,7 @@ internal static class ImageGenerationChecks
         try
         {
             var waiting = recalledRequest with { MessageId = "recall-queued" };
-            queue.Invoke(plugin, [waiting, "排队图", null, null, null, null]);
+            queue.Invoke(plugin, [waiting, "排队图", new ImageGenerationOptions(), null, null]);
             var job = jobs.Last();
             config.ToolUse.ImageGen.CancelOnRecall = false;
             await (Task)onRecall.Invoke(plugin, [deletedEvent with { MessageId = waiting.MessageId }])!;

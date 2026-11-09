@@ -142,7 +142,7 @@ internal static class ProactiveChecks
         typeof(AiChatPlugin).GetField("_config", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(plugin, new PluginConfig());
         var ctx = DispatchProxy.Create<IBotContext, TestProxy>();
         var msg = DispatchProxy.Create<IMessageContext, TestProxy>();
-        ((TestProxy)(object)ctx).Call = (m, _) => m.Name == "get_Message" ? msg : throw new NotSupportedException(m.Name);
+        ((TestProxy)(object)ctx).Call = (m, _) => m.Name switch { "get_Message" => msg, "IsOwner" => false, _ => throw new NotSupportedException(m.Name) };
         typeof(PluginBase).GetProperty("Context", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(plugin, ctx);
         var t0 = new DateTimeOffset(2026, 10, 26, 20, 0, 0, TimeSpan.Zero);
         MessageEvent Msg(string id, string sender, int minute, params MessageSegment[] segments) => new()
@@ -167,11 +167,11 @@ internal static class ProactiveChecks
         };
         var fetch = typeof(AiChatPlugin).GetMethod("GetRecentGroupMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
         async Task<string> Fetch(int count, int recorded) =>
-            await (Task<string>)fetch.Invoke(plugin, [current, count, "露露", recorded, CancellationToken.None])!;
+            await (Task<string>)fetch.Invoke(plugin, [current, count, "露露", recorded, CancellationToken.None, null])!;
         string Time(int minute) => t0.AddMinutes(minute).ToLocalTime().ToString("HH:mm");
         var text = await Fetch(3, 0);
         Check(before == "m5", "History must be requested before the current message.");
-        Check(text == $"{Time(2)} alice: @露露 你在吗\n{Time(3)} 露露（你）: 我在\n{Time(4)} bob: [图片]",
+        Check(text == $"[消息 m2] {Time(2)} alice(alice): @露露 你在吗\n[消息 m3] {Time(3)} 露露（你）(bot): 我在\n[消息 m4] {Time(4)} bob(bob): [图片]",
             "History must drop the current message, sort by time, keep the newest, mark the bot and describe resources.");
         Check(await Fetch(0, 0) == "", "Zero messages must not call the API.");
 
