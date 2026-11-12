@@ -15,3 +15,9 @@ internal interface IChatTool : IDisposable
 
 /// <summary>只读查询工具，可在定时推送生成期间使用。</summary>
 internal interface IReadOnlyChatTool : IChatTool { }
+
+/// <summary>Reference images appended after all tool results, never between assistant tool calls and their results.</summary>
+internal interface IToolAttachments
+{
+    IReadOnlyList<OpenAiMessage> TakeAttachments();
+}

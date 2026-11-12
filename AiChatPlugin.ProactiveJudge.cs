@@ -11,7 +11,9 @@ public sealed partial class AiChatPlugin
     private async Task<bool> JudgeProactiveAsync(MessageEvent message, IReadOnlyList<MessageEvent> batch,
         ConversationKey key, string selfName, string fresh, string policy, CancellationToken ct)
     {
-        var model = ResolveModel(_config.Default.Model) ?? throw new InvalidOperationException("未找到接话判断使用的默认模型。");
+        var judgeModel = string.IsNullOrWhiteSpace(_config.Proactive.JudgeModel)
+            ? _config.Default.Model : _config.Proactive.JudgeModel.Trim();
+        var model = ResolveModel(judgeModel) ?? throw new InvalidOperationException("未找到主动回复判断模型，请检查 proactive.judge_model。");
         var recent = await GetRecentGroupMessagesAsync(batch[0], Math.Clamp(_config.Proactive.JudgeContextMessages, 1, 20),
             selfName, recordedAfter: batch.Count, ct).ConfigureAwait(false);
         using var usageScope = UsageScope.Begin(UsageSource(key), "proactive_judge");
@@ -23,7 +25,7 @@ public sealed partial class AiChatPlugin
         var reply = ProactiveJudge.ShouldReply(response);
         var result = reply ? "接话" : ProactiveJudge.IsExplicitSkip(response) ? "沉默" : "无效判定，保持沉默";
         var marker = response.ReplaceLineEndings(" ").Trim();
-        BotLog.Info($"[AiChat] 群 {message.Channel.Id} 轻量接话判断: 机器人={Truncate(selfName, 64)}，新消息 {batch.Count} 条，输入 {request.Messages.Sum(m => (m.Content as string)?.Length ?? 0)} 字符，结果 {result}，模型输出={Truncate(marker, 80)}。");
+        BotLog.Info($"[AiChat] 群 {message.Channel.Id} 轻量接话判断: 模型={GetModelDisplayId(model)}，机器人={Truncate(selfName, 64)}，新消息 {batch.Count} 条，输入 {request.Messages.Sum(m => (m.Content as string)?.Length ?? 0)} 字符，结果 {result}，模型输出={Truncate(marker, 80)}。");
         return reply;
     }
 }

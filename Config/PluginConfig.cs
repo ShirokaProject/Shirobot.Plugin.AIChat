@@ -239,6 +239,8 @@ public sealed class ProactiveSection
 {
     [ConfigField("开启后，白名单群的普通消息先用少量近期文字判断是否接话，不带完整历史、图片或工具；判断沉默就结束，决定接话后再加载完整上下文生成回复。每次判断调用一次模型，接话时另外调用回复模型。", Label = "启用群聊主动回复")]
     public bool Enabled { get; set; }
+    [ConfigField("只用于判断是否接话，填写已注册模型名或 provider-model；留空沿用默认回复模型。决定接话后的正式回复仍使用原来的回复模型。", Label = "主动回复判断模型")]
+    public string JudgeModel { get; set; } = "";
     [ConfigField("允许主动回复的群号；留空表示不在任何群主动回复。", Label = "主动回复群白名单")]
     public string[] Groups { get; set; } = [];
     [ConfigField("消息里提到这些词（不需要 @）时视为在叫机器人，使用较短的冷却并让模型优先考虑回应，例如机器人的昵称、外号。", Label = "称呼关键词")]
@@ -287,6 +289,9 @@ public sealed class ToolUseSection
     public int MaxParallelCalls { get; set; } = 4;
     [ConfigField("OpenAI 兼容生图接口，支持 AI 工具和 #imagegen。", Label = "图片生成")]
     public ImageGenerationSection ImageGen { get; set; } = new();
+    [ConfigField("允许模型获取用户头像、按消息 ID 重读原消息及图片，并在当前群中真正 @ 用户；所有工具共用全局轮数限制。", Label = "会话查询与 @ 工具")]
+    public bool ConversationTools { get; set; } = true;
+
     [ConfigField("独立配置 Tavily 搜索工具。", Label = "Tavily 网络搜索")]
     public TavilySection Tavily { get; set; } = new();
     [ConfigField("读取网页和文本直链。", Label = "HTTP 请求")]

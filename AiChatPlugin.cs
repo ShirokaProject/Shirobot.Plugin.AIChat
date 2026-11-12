@@ -295,6 +295,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         admin_only_models = []
 
         [tool_use]
+        conversation_tools = true
         # 是否启用工具调用；关闭后不暴露任何工具及其提示词
         enabled = true
         # 工具调用轮数上限（1-8），达到后要求模型输出最终回答
@@ -421,6 +422,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         models = []
 
         [proactive]
+        # 留空沿用默认模型；仅用于判断是否接话，不影响正式回复模型
+        judge_model = ""
         # 群聊主动回复：没被 @ 时在频率限制允许的情况下交给模型，由模型决定说不说；默认关闭
         # 每次判断都会调用一次模型（包括最终选择沉默的）
         enabled = false
@@ -1408,7 +1411,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 var downloads = new DownloadedFiles(() => Context.CreateTempDirectory(TimeSpan.FromHours(1)).Path);
                 using var downloadFetch = _config.ToolUse.Enabled && _config.ToolUse.HttpFetch.Enabled
                     ? new HttpFetchTool(_config.ToolUse.HttpFetch, SummarizeFetchedPageAsync, downloads: downloads) : null;
-                using var sendFile = downloadFetch is null ? null : new SendDownloadedFileTool(downloads, async (file, asImage, token) =>
+                using var sendFile = !_config.ToolUse.Enabled || (!_config.ToolUse.HttpFetch.Enabled && !_config.ToolUse.ConversationTools) ? null : new SendDownloadedFileTool(downloads, async (file, asImage, token) =>
                 {
                     token.ThrowIfCancellationRequested();
                     var uri = new Uri(Path.GetFullPath(file.Path)).AbsoluteUri;
@@ -1418,9 +1421,13 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                     var result = await Context.Message.SendMessageAsync(message.Channel, [segment], token).ConfigureAwait(false);
                     return result.IsSuccess ? "File sent successfully." : "File send failed. Do not claim delivery succeeded.";
                 });
+                using var conversationSet = _config.ToolUse.Enabled && _config.ToolUse.ConversationTools
+                    ? new ConversationToolSet(Context, message, downloads, _fetcher.DownloadImageAsync, m => FormatGroupLine(m, selfName)) : null;
+                var conversationReads = conversationSet is null ? Array.Empty<IChatTool>() : new[] { conversationSet.Avatar, conversationSet.Message };
+                var mentionUser = conversationSet?.Mention;
                 using var imageTool = _config.ToolUse.Enabled && _config.ToolUse.ImageGen.Enabled
                     ? CreateImageGenerationTool(message, historyImages.Select(item => item.Image).ToArray(), imageCatalog, convo?.Key, downloads) : null;
-                IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool, sendFile, downloadFetch }.OfType<IChatTool>(), .. mcpTools];
+                IChatTool[] builtIn = [.. new IChatTool?[] { timer, memoryTool, imageTool, sendFile, downloadFetch, mentionUser }.OfType<IChatTool>(), .. conversationReads, .. mcpTools];
                 var pluginTools = PluginToolsFor(message, proactive, builtIn);
                 var toolImages = parts.OfType<ImagePart>().Concat(historyImages.Select(item => item.Image)).Distinct().Take(8).ToArray();
                 foreach (var tool in pluginTools)
@@ -1437,6 +1444,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 IChatTool[] contextual =
                 [
                     .. new[] { RefusedChatTool.Wrap(timer, proactiveRefusal), memoryTool, RefusedChatTool.Wrap(imageTool, proactiveRefusal), downloadFetch, RefusedChatTool.Wrap(sendFile, proactiveRefusal) }.OfType<IChatTool>(),
+                    .. conversationReads,
+                    .. new[] { RefusedChatTool.Wrap(mentionUser, proactiveRefusal) }.OfType<IChatTool>(),
                     .. mcpTools.Select(tool => RefusedChatTool.Wrap(tool, McpRefusal(message, proactive))!),
                     .. pluginTools.Select(tool => RefusedChatTool.Wrap(tool, pluginRefusal)!)
                 ];
@@ -1458,6 +1467,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 }
 
                 systemPrompt = ApplyOwnerPrompt(systemPrompt);
+                if (conversationReads.Length > 0) systemPrompt += "\n" + conversationReads[0].SystemPrompt;
                 if (sendFile is not null) systemPrompt += "\n" + sendFile.SystemPrompt;
                 if (imageTool is not null) systemPrompt += "\n" + imageTool.SystemPrompt;
                 if (timer is not null) systemPrompt += "\n" + timer.SystemPrompt;

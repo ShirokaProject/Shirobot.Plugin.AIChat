@@ -85,7 +85,7 @@ internal static class ProactiveJudgeChecks
         var historyCalls = 0;
         ((TestProxy)(object)bot).Call = (method, _) => method.Name switch
         {
-            "get_InstanceId" => "i", "get_Platform" => "qq", "get_Message" => messages,
+            "get_InstanceId" => "i", "get_Platform" => "qq", "get_Message" => messages, "IsOwner" => false,
             _ => throw new Exception("Judge touched unrelated bot API: " + method.Name)
         };
         ((TestProxy)(object)messages).Call = (method, _) =>
@@ -134,6 +134,19 @@ internal static class ProactiveJudgeChecks
             var count = upstream.Requests; await Run();
             Check(upstream.Requests == count && gate.CurrentCount == 0, "A busy host must defer judgment rather than queue another model call.");
             gate.Release();
+            upstream.Response = "[skip]";
+            config.Models.Add(new ModelEntry { Name = "judge-tiny", Provider = "cheap", BaseUrl = "https://example.invalid/v1", ApiKey = "fixture" });
+            config.Proactive.JudgeModel = "cheap-judge-tiny";
+            await Run();
+            using (var configured = JsonDocument.Parse(upstream.LastBody))
+                Check(configured.RootElement.GetProperty("model").GetString() == "judge-tiny" && config.Default.Model == "fixture",
+                    "The dedicated provider-model must be used only for judging, without changing the reply model.");
+            config.Proactive.JudgeModel = "  "; await Run();
+            using (var fallback = JsonDocument.Parse(upstream.LastBody))
+                Check(fallback.RootElement.GetProperty("model").GetString() == "fixture", "Blank judge model must retain the default model.");
+            config.Proactive.JudgeModel = "unknown-model";
+            var beforeInvalid = upstream.Requests; await Run();
+            Check(upstream.Requests == beforeInvalid && gate.CurrentCount == 1, "An invalid dedicated model must not silently call another provider or leak a concurrency slot.");
             Console.WriteLine("PASS: proactive skip, invalid marker, failure, cancellation and busy-host paths avoid full history and resource collection");
         }
         finally { gate.Dispose(); Directory.Delete(root, true); }

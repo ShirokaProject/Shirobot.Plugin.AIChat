@@ -118,6 +118,8 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
             });
             var results = await ExecuteCallsAsync(response.ToolCalls, tools, calls, model.Name, round + 1, ct, readOnlyOnly).ConfigureAwait(false);
             messages.AddRange(results);
+            foreach (var source in tools.Values.OfType<IToolAttachments>().Distinct())
+                messages.AddRange(source.TakeAttachments());
         }
         throw new InvalidOperationException("工具调用未返回最终回答。");
     }
