@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <UseRuntimeAsync>true</UseRuntimeAsync>
+    <!-- Pass the compiler feature explicitly, including when built by SDK packaging targets. -->
+    <Features>$(Features);runtime-async=on</Features>
+  </PropertyGroup>
+</Project>
