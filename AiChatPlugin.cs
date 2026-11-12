@@ -39,6 +39,7 @@ namespace ShiroBot.AiChatPlugin;
 public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<PluginConfig>
 {
     private PluginConfig _config = new();
+    private readonly ProviderModelCatalog _providerModels = new();
     private readonly CancellationTokenSource _backgroundStop = new();
     private readonly Lock _backgroundGate = new();
     private readonly HashSet<Task> _recallTasks = [];
@@ -558,48 +559,23 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     /// </summary>
     private async Task<int> FetchAndMergeProviderModelsAsync()
     {
-        var totalAdded = 0;
-        // 没填 api_key 的 provider（例如默认模板里的示例）不拉取，避免每次启动都报失败。
-        foreach (var provider in _config.Providers.Where(p => p.FetchModels && !string.IsNullOrWhiteSpace(p.ApiKey)))
+        var config = _config;
+        var client = _openAi;
+        var totalAdded = _providerModels.Restore(config);
+        foreach (var provider in config.Providers.Where(p => p.FetchModels && !string.IsNullOrWhiteSpace(p.ApiKey)))
         {
             try
             {
-                var modelIds = await _openAi.FetchModelsAsync(provider).ConfigureAwait(false);
-                if (modelIds.Count == 0) continue;
-
-                // 应用过滤
-                if (provider.ModelFilter is { Length: > 0 } filters)
-                {
-                    modelIds = modelIds.Where(id =>
-                        filters.Any(f => id.StartsWith(f, StringComparison.OrdinalIgnoreCase))).ToList();
-                }
-
-                var existingNames = new HashSet<string>(
-                    _config.Models.Select(m => m.Name), StringComparer.OrdinalIgnoreCase);
-
-                var added = 0;
-                foreach (var modelId in modelIds)
-                {
-                    if (existingNames.Contains(modelId)) continue;
-
-                    _config.Models.Add(new ModelEntry
-                    {
-                        Name = modelId,
-                        Provider = provider.Name,
-                        SupportsVision = true
-                    });
-                    existingNames.Add(modelId);
-                    added++;
-                }
-
+                var modelIds = await client.FetchModelsAsync(provider).ConfigureAwait(false);
+                if (!ReferenceEquals(config, _config)) return totalAdded;
+                var added = _providerModels.Remember(config, provider, modelIds);
                 totalAdded += added;
-
                 if (added > 0)
                     BotLog.Info($"[AiChat] 从 {provider.Name} 拉取到 {modelIds.Count} 个模型，新增 {added} 个。");
             }
             catch (Exception ex)
             {
-                BotLog.Warning($"[AiChat] 从 {provider.Name} 拉取模型列表失败: {ex.Message}");
+                BotLog.Warning($"[AiChat] 从 {provider.Name} 拉取模型列表失败，保留已发现模型: {ex.Message}");
             }
         }
 
@@ -2491,16 +2467,6 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     private ModelEntry? ResolveModel(string name)
     {
         name = name.Trim();
-        if (_config.Models.Count == 0)
-        {
-            // 没有模型注册时退化为只用 default 段
-            if (string.Equals(name, _config.Default.Model, StringComparison.OrdinalIgnoreCase))
-            {
-                return new ModelEntry { Name = _config.Default.Model };
-            }
-            return null;
-        }
-
         // 优先支持 "provider-name" 格式匹配（列表显示格式）。必须放在裸 name 前，
         // 避免 provider fetch 拉到同名裸模型时抢先命中错误 provider。
         var match = _config.Models.FirstOrDefault(m =>
@@ -2511,21 +2477,38 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         // 精确匹配 model name
         match = _config.Models.FirstOrDefault(m =>
             string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
-        return match;
+        if (match is not null) return match;
+
+        if (ResolveProviderModel(name) is { } configured) return configured;
+        if (_config.Models.Count == 0 && string.Equals(name, _config.Default.Model, StringComparison.OrdinalIgnoreCase))
+            return new ModelEntry { Name = _config.Default.Model };
+        return null;
+    }
+
+    // Discovery is a catalog, not an authority on whether an explicitly named upstream model exists.
+    private ModelEntry? ResolveProviderModel(string name)
+    {
+        var provider = _config.Providers.Where(p => p.FetchModels && !string.IsNullOrWhiteSpace(p.Name))
+            .OrderByDescending(p => p.Name.Length)
+            .FirstOrDefault(p => name.StartsWith(p.Name + "-", StringComparison.OrdinalIgnoreCase) && name.Length > p.Name.Length + 1);
+        if (provider is not null)
+        {
+            var modelId = name[(provider.Name.Length + 1)..];
+            if (provider.ModelFilter is { Length: > 0 } && !provider.ModelFilter.Any(f => modelId.StartsWith(f, StringComparison.OrdinalIgnoreCase))) return null;
+            return new ModelEntry { Name = modelId, Provider = provider.Name, SupportsVision = true };
+        }
+        return null;
     }
 
     private ModelEntry? ResolveModelForSelection(string name)
     {
         name = name.Trim();
-        if (_config.Models.Count == 0)
-        {
-            return string.Equals(name, _config.Default.Model, StringComparison.OrdinalIgnoreCase)
-                ? new ModelEntry { Name = _config.Default.Model }
-                : null;
-        }
-
-        return _config.Models.FirstOrDefault(m =>
+        var registered = _config.Models.FirstOrDefault(m =>
             string.Equals(GetModelDisplayId(m), name, StringComparison.OrdinalIgnoreCase));
+        if (registered is not null) return registered;
+        if (ResolveProviderModel(name) is { } explicitModel) return explicitModel;
+        return _config.Models.Count == 0 && string.Equals(name, _config.Default.Model, StringComparison.OrdinalIgnoreCase)
+            ? ResolveModel(name) : null;
     }
 
     private string BuildModelNotFoundReply(string keyword)

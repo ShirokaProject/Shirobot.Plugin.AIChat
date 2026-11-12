@@ -43,6 +43,8 @@ static string Completion(string text) => JsonSerializer.Serialize(new
     choices = new[] { new { message = new { role = "assistant", content = text } } }
 });
 
+if (args.Contains("--provider-models-offline")) { await ProviderModelChecks.RunAsync(); return; }
+
 if (args.Contains("--proactive-judge-offline")) { await ProactiveJudgeChecks.RunAsync(); return; }
 
 if (args.Contains("--conversation-tools-offline")) { await ConversationToolChecks.RunAsync(); return; }
