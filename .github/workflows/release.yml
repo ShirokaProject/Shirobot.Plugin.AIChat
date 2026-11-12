@@ -16,7 +16,7 @@ permissions:
 
 env:
   PROJECT_DIR: .
-  PUBLISH_DIR: bin/Release/net10.0/publish
+  PUBLISH_DIR: bin/Release/net11.0/publish
 
 jobs:
   publish:
@@ -29,7 +29,16 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: 11.0.x
+
+      - name: Verify .NET 11 Runtime Async behavior
+        shell: bash
+        run: |
+          dotnet build Tests/Verification/Verification.csproj -c Release -p:ShiroBotPluginPackagingEnabled=false -p:ShiroBotDevelopmentHostEnabled=false
+          dotnet Tests/Verification/bin/Release/net11.0/ShiroBot.AiChatPlugin.Verification.dll
+          for suite in provider-models conversation-tools proactive-judge upstream-completion reply-modes group-context skills-concurrency reference-image image-retry image-command downloads http-methods image-api; do
+            dotnet Tests/Verification/bin/Release/net11.0/ShiroBot.AiChatPlugin.Verification.dll "--${suite}-offline"
+          done
 
       - name: Publish
         run: dotnet publish "$PROJECT_DIR" --configuration Release
@@ -76,4 +85,5 @@ jobs:
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
           target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTES.md
           files: release/*.dll

@@ -12,6 +12,8 @@ ShiroBot 的 OpenAI-compatible AI 聊天插件。
 
 ## 安装
 
+从 v1.4.6 起，插件使用 .NET 11 和 Runtime Async 编译，需要运行在 .NET 11 或更新运行时上的 ShiroBot 宿主。安装 .NET 11 运行时本身不会改变已运行宿主的运行时版本。
+
 将 Release 构建的插件 DLL 放入宿主的插件目录 或 通过插件市场安装。
 
 ## 对外契约
@@ -27,6 +29,8 @@ AIChat 已导出以下 `[PluginContract]`，其他插件可从最终的单文件
 
 ## 本地开发
 
+使用 `global.json` 指定的 .NET 11 SDK。`Directory.Build.props` 显式开启 `UseRuntimeAsync` 和编译器 `runtime-async=on`；发布检查会验证最终 DLL 的目标框架和 Runtime Async 方法标记。开发启动脚本及 Rider 启动配置允许 framework-dependent 宿主使用已安装的更新主版本运行时。
+
 ```sh
 sh scripts/dev.sh --prepare  # 构建插件并准备开发宿主，不启动
 sh scripts/dev.sh            # 构建并启动开发宿主
@@ -36,7 +40,7 @@ sh scripts/dev.sh            # 构建并启动开发宿主
 
 ```sh
 dotnet publish ShiroBot.AiChatPlugin.csproj -c Release
-dotnet run --project Tests/ContractConsumer -c Release -- bin/Release/net10.0/publish/ShiroBot.AiChatPlugin.dll
+dotnet run --project Tests/ContractConsumer -c Release -- bin/Release/net11.0/publish/ShiroBot.AiChatPlugin.dll
 ```
 
 ## 许可证

@@ -13,7 +13,7 @@ done
 
 cd "$(dirname "$0")/.."
 
-sdk_version=$(sed -n 's/.*PackageReference Include="ShiroBot.SDK" Version="\([^"]*\)".*/\1/p' ShiroBot.AiChatPlugin.csproj)
+sdk_version=$(dotnet msbuild ShiroBot.AiChatPlugin.csproj -nologo -getProperty:ShiroBotSdkVersion)
 if [ -z "$sdk_version" ]; then
   echo 'Cannot read ShiroBot.SDK version from ShiroBot.AiChatPlugin.csproj.' >&2
   exit 1
@@ -59,7 +59,7 @@ if [ ! -f "$host_exe" ] || [ "$installed_version" != "$sdk_version" ]; then
 fi
 
 plugin_dir="$cache_dir/plugins/AiChatPlugin"
-build_dir="bin/Debug/net10.0"
+build_dir="bin/Debug/net11.0"
 manifest="$plugin_dir/.shirobot-dev-files"
 mkdir -p "$plugin_dir"
 # Remove files copied by the previous run that the build no longer produces. Files the
@@ -86,4 +86,4 @@ fi
 
 echo "Starting ShiroBot v$sdk_version with ShiroBot.AiChatPlugin..."
 cd "$cache_dir"
-exec ./ShiroBot "$@"
+exec env DOTNET_ROLL_FORWARD=LatestMajor ./ShiroBot "$@"

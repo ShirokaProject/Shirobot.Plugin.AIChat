@@ -3,12 +3,18 @@
     "ShiroBot": {
       "commandName": "Executable",
       "executablePath": "$(MSBuildProjectDirectory)/.shirobot-dev/host/$(NETCoreSdkRuntimeIdentifier)/$(ShiroBotDevelopmentHostExecutable)",
-      "workingDirectory": "$(MSBuildProjectDirectory)/.shirobot-dev/host/$(NETCoreSdkRuntimeIdentifier)"
+      "workingDirectory": "$(MSBuildProjectDirectory)/.shirobot-dev/host/$(NETCoreSdkRuntimeIdentifier)",
+      "environmentVariables": {
+        "DOTNET_ROLL_FORWARD": "LatestMajor"
+      }
     },
     "AIChat DebugAdapter": {
       "commandName": "Executable",
       "executablePath": "$(MSBuildProjectDirectory)/.debug-runtime/ShiroBot",
-      "workingDirectory": "$(MSBuildProjectDirectory)/.debug-runtime"
+      "workingDirectory": "$(MSBuildProjectDirectory)/.debug-runtime",
+      "environmentVariables": {
+        "DOTNET_ROLL_FORWARD": "LatestMajor"
+      }
     }
   }
 }

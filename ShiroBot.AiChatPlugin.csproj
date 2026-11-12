@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-    <Version>1.4.5</Version>
+    <Version>1.4.6</Version>
         <ShiroBotSdkVersion Condition="'$(ShiroBotSdkVersion)' == ''">1.0.2</ShiroBotSdkVersion>
         <TargetFramework>net11.0</TargetFramework>
         <Nullable>enable</Nullable>

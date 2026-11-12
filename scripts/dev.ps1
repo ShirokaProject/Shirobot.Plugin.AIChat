@@ -7,9 +7,8 @@ $ProgressPreference = 'SilentlyContinue'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
 
-[xml]$project = Get-Content ShiroBot.AiChatPlugin.csproj -Raw
-$sdkVersion = ($project.Project.ItemGroup.PackageReference |
-    Where-Object { $_.Include -eq 'ShiroBot.SDK' } | Select-Object -First 1).Version
+$sdkVersion = (dotnet msbuild ShiroBot.AiChatPlugin.csproj -nologo -getProperty:ShiroBotSdkVersion).Trim()
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if (-not $sdkVersion) { throw 'Cannot read ShiroBot.SDK version from ShiroBot.AiChatPlugin.csproj.' }
 
 $architecture = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
@@ -47,7 +46,7 @@ if (-not (Test-Path $hostExe) -or $installedVersion -ne $sdkVersion) {
 }
 
 $pluginDir = Join-Path $cacheDir 'plugins/AiChatPlugin'
-$buildDir = (Resolve-Path 'bin/Debug/net10.0').Path
+$buildDir = (Resolve-Path 'bin/Debug/net11.0').Path
 $manifest = Join-Path $pluginDir '.shirobot-dev-files'
 New-Item -ItemType Directory -Force $pluginDir | Out-Null
 # Remove files copied by the previous run that the build no longer produces. Files the
@@ -79,9 +78,12 @@ if ($prepareOnly) {
 
 Write-Host "Starting ShiroBot v$sdkVersion with ShiroBot.AiChatPlugin..."
 Push-Location $cacheDir
+$previousRollForward = $env:DOTNET_ROLL_FORWARD
+$env:DOTNET_ROLL_FORWARD = 'LatestMajor'
 try {
     & $hostExe @hostArguments
     exit $LASTEXITCODE
 } finally {
+    $env:DOTNET_ROLL_FORWARD = $previousRollForward
     Pop-Location
 }
