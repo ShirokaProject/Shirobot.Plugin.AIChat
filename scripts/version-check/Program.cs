@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 
@@ -9,12 +10,15 @@ var reader = pe.GetMetadataReader();
 var provider = new AttributeTypes();
 string? packageVersion = null;
 string? manifestVersion = null;
+string? targetFramework = null;
 var componentVersions = new List<string>();
 foreach (var handle in reader.GetAssemblyDefinition().GetCustomAttributes())
 {
     var attribute = reader.GetCustomAttribute(handle);
     if (AttributeName(attribute) == "ShiroBotPackageAttribute")
         manifestVersion = (string?)attribute.DecodeValue(provider).FixedArguments[2].Value;
+    if (AttributeName(attribute) == "TargetFrameworkAttribute")
+        targetFramework = (string?)attribute.DecodeValue(provider).FixedArguments[0].Value;
     if (AttributeName(attribute) == "AssemblyInformationalVersionAttribute")
         packageVersion = (string?)attribute.DecodeValue(provider).FixedArguments[0].Value;
 }
@@ -36,6 +40,13 @@ var projectVersion = args[1];
 var tagVersion = args.Length == 3 ? args[2] : projectVersion;
 if (assemblyVersion != projectVersion || componentVersions[0] != projectVersion || tagVersion != projectVersion || manifestVersion != projectVersion)
     throw new InvalidOperationException($"Version mismatch: metadata={componentVersions[0]}, assembly={assemblyVersion}, project={projectVersion}, tag={tagVersion}, manifest={manifestVersion}.");
+if (targetFramework != ".NETCoreApp,Version=v11.0")
+    throw new InvalidOperationException($"Release must target .NET 11, got {targetFramework}.");
+var runtimeAsyncMethods = reader.MethodDefinitions.Count(handle =>
+    (reader.GetMethodDefinition(handle).ImplAttributes & MethodImplAttributes.Async) != 0);
+if (runtimeAsyncMethods == 0)
+    throw new InvalidOperationException("Release contains no Runtime Async methods; check the compiler flags and packaging.");
+Console.WriteLine($"Verified .NET 11 target and {runtimeAsyncMethods} Runtime Async methods in the final DLL.");
 Console.WriteLine($"Verified component metadata, assembly, project and release version: {projectVersion}");
 
 string AttributeName(CustomAttribute attribute)

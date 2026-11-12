@@ -292,19 +292,19 @@ using (var registry = new ChatToolRegistry())
     registry.Register(second);
     handler.Respond = body => handler.Requests.Count == 1 ? handler.RespondInitial : Completion("tool answer");
     var answer = await registry.ChatAsync(client, primary, [new OpenAiMessage { Content = "question" }], 1);
-    Check(answer == "tool answer" && first.Calls == 1 && second.Calls == 1, "Tools must dispatch independently and respect individual limits.");
+    Check(answer == "tool answer" && first.Calls == 2 && second.Calls == 1, "All calls in the permitted round must execute under the shared round limit.");
     Check(handler.Requests[0].GetProperty("tools").GetArrayLength() == 2 && !handler.Requests[1].TryGetProperty("tools", out _), "Final round must omit tools.");
     var assistantWithTools = handler.Requests[1].GetProperty("messages").EnumerateArray().Single(m => m.GetProperty("role").GetString() == "assistant");
     Check(assistantWithTools.GetProperty("reasoning_content").GetString() == "private reasoning payload" && !answer.Contains("private reasoning payload"),
         "JSON tool response reasoning must pass back unchanged without entering visible reply.");
     var results = handler.Requests[1].GetProperty("messages").EnumerateArray().Where(m => m.GetProperty("role").GetString() == "tool").ToArray();
-    Check(results.Length == 4 && results[2].GetProperty("content").GetString()!.Contains("limit") && results[3].GetProperty("content").GetString()!.Contains("Unknown"), "All calls need matching tool replies, including rejected calls.");
-    Check(toolLog.Lines.Count(l => l.Contains("ToolUse 开始")) == 2 && toolLog.Lines.Count(l => l.Contains("ToolUse 完成")) == 2 &&
-        toolLog.Lines.Count(l => l.Contains("ToolUse 拒绝")) == 2, "Every executed and rejected tool call must be logged independently.");
+    Check(results.Length == 4 && results[2].GetProperty("content").GetString() == "first result" && results[3].GetProperty("content").GetString()!.Contains("Unknown"), "Repeated calls in the same round must execute, and unknown calls still need matching tool replies.");
+    Check(toolLog.Lines.Count(l => l.Contains("ToolUse 开始")) == 3 && toolLog.Lines.Count(l => l.Contains("ToolUse 完成")) == 3 &&
+        toolLog.Lines.Count(l => l.Contains("ToolUse 拒绝")) == 1, "Every executed and rejected tool call must be logged independently.");
 }
 using (var tool = new TavilySearchTool(new TavilySection(), ""))
     Check((await tool.ExecuteAsync("{\"query\":42}")).Contains("invalid"), "Non-string query must return a validation error.");
-Console.WriteLine("PASS: two independent tools, call limits, unknown tools, final answer and argument validation");
+Console.WriteLine("PASS: shared tool round limit, repeated calls, unknown tools, final answer and argument validation");
 
 handler = new StubHandler(_ => Completion("custom summary"));
 using (var client = Client(handler))
