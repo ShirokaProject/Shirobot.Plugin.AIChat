@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -9,6 +10,14 @@ using ShiroBot.SDK.Abstractions;
 namespace ShiroBot.AiChatPlugin.OpenAi;
 
 internal sealed class IncompleteUpstreamResponseException(string reason) : HttpRequestException(reason);
+internal sealed class UpstreamHttpException(HttpStatusCode statusCode, string reason) : InvalidOperationException(reason)
+{
+    public HttpStatusCode StatusCode { get; } = statusCode;
+    public bool IsTransient => IsTransientStatusCode(StatusCode);
+    public static bool IsTransientStatusCode(HttpStatusCode statusCode) =>
+        statusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests || (int)statusCode >= 500;
+}
+
 internal sealed class ToolRoundResponseFailedException(Exception inner)
     : Exception("上游回复多次中断，已执行的工具任务不会重新提交。", inner);
 
@@ -182,7 +191,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
         if (!response.IsSuccessStatusCode)
         {
             var error = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
-            throw new InvalidOperationException(TryExtractErrorMessage(error) ?? $"上游返回 HTTP {(int)response.StatusCode}");
+            throw new UpstreamHttpException(response.StatusCode, TryExtractErrorMessage(error) ?? $"上游返回 HTTP {(int)response.StatusCode}");
         }
         using var reader = new StreamReader(await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false));
         var firstLine = await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false);
@@ -328,7 +337,7 @@ internal sealed class OpenAiClient(int timeoutSeconds, string httpProxy, UsageSt
             var trimmed = raw.Length > 800 ? raw[..800] + "…" : raw;
             BotLog.Warning($"[AiChat] OpenAI HTTP {(int)resp.StatusCode}: {trimmed}");
             string? msg = TryExtractErrorMessage(raw);
-            throw new InvalidOperationException(msg ?? $"上游返回 HTTP {(int)resp.StatusCode}");
+            throw new UpstreamHttpException(resp.StatusCode, msg ?? $"上游返回 HTTP {(int)resp.StatusCode}");
         }
 
         // Some gateways ignore stream:false. Never accept their partial SSE as a final answer.

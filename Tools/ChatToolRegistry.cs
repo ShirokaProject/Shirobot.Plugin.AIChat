@@ -48,7 +48,8 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
             }
         maxRounds = Math.Clamp(maxRounds, 1, 8);
         var calls = new Dictionary<string, int>(StringComparer.Ordinal);
-        var definitions = tools.Values.Select(tool => tool.Definition).ToList();
+        var definitions = tools.OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => pair.Value.Definition).ToList();
         var visiblePrefix = "";
         async Task<OpenAiResponseMessage> RequestAsync(OpenAiChatRequest request)
         {
@@ -64,6 +65,14 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
                         ? await client.ChatWithToolsIncrementalAsync(model, request, text => onContent(visiblePrefix + text), ct).ConfigureAwait(false)
                         : await client.ChatWithToolsAsync(model, request, ct).ConfigureAwait(false);
                 }
+                catch (UpstreamHttpException ex) when (request.ToolChoice is not null &&
+                    (int)ex.StatusCode is 400 or 422 && ex.Message.Contains("tool_choice", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Some compatible endpoints reject tool_choice. Preserve the tools-off behavior for them.
+                    request.ToolChoice = null;
+                    request.Tools = null;
+                    attempt--;
+                }
                 catch (Exception ex) when (!ct.IsCancellationRequested && ex is HttpRequestException or TaskCanceledException && attempt < Math.Clamp(requestAttempts, 1, 5))
                 {
                     BotLog.Warning($"[AiChat] 本轮上游响应失败 ({(ex is IncompleteUpstreamResponseException ? ex.Message : ex.GetType().Name)})，保留工具结果重试 {attempt}/{Math.Clamp(requestAttempts, 1, 5)}；不重跑工具。");
@@ -73,15 +82,17 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
                 { throw new ToolRoundResponseFailedException(ex); }
             }
         }
+        var hasTools = definitions.Count > 0;
         for (var round = 0; round <= maxRounds; round++)
         {
             ct.ThrowIfCancellationRequested();
-            // 每轮保留相同工具定义以稳定前缀；达到全局轮数后才移除工具。
+            // 达到轮次上限时用 tool_choice 禁用调用，同时保留工具定义和缓存前缀。
             var request = new OpenAiChatRequest
             {
                 Model = model.Name,
                 Messages = messages,
-                Tools = round < maxRounds && definitions.Count > 0 ? definitions : null,
+                Tools = hasTools ? definitions : null,
+                ToolChoice = hasTools && round == maxRounds ? "none" : null,
                 Stream = false,
                 MaxCompletionTokens = maxOutputTokens
             };
@@ -104,7 +115,8 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
                 foreach (var rejected in response.ToolCalls)
                     messages.Add(new OpenAiMessage { Role = "tool", ToolCallId = rejected.Id, Content = "Tool round limit reached. This call was not executed. Answer from the information already obtained; disclose missing or failed fetches." });
                 messages.Add(new OpenAiMessage { Role = "system", Content = "本次工具调用已达到上限，不能再请求任何工具。请根据已获取的信息回复；没有获取到的内容请明确说明，不要猜测，不要声称已成功读取失败的页面。" });
-                var finalRequest = new OpenAiChatRequest { Model = model.Name, Messages = messages, Stream = false, MaxCompletionTokens = maxOutputTokens };
+                // The endpoint returned tool calls despite the limit. Require a text-only response.
+                var finalRequest = new OpenAiChatRequest { Model = model.Name, Messages = messages, MaxCompletionTokens = maxOutputTokens };
                 var final = await RequestAsync(finalRequest).ConfigureAwait(false);
                 if (final.ToolCalls is { Count: > 0 } || string.IsNullOrWhiteSpace(final.Content))
                     throw new InvalidOperationException("模型在工具耗尽后仍未返回最终回答。");

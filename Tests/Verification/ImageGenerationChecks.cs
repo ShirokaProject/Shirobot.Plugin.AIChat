@@ -53,6 +53,7 @@ internal static class ImageGenerationChecks
         var port = Random.Shared.Next(20000, 40000);
         listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
         var calls = 0; var forbidden = false;
+        var transientResponses = 0;
         string? lastSize = null, lastQuality = null, lastPrompt = null;
         var holdImage = false;
         var imageStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -65,6 +66,13 @@ internal static class ImageGenerationChecks
                 try { ctx = await listener.GetContextAsync(); } catch { return; }
                 calls++;
                 if (forbidden) { ctx.Response.StatusCode = 403; ctx.Response.Close(); continue; }
+                if (transientResponses > 0)
+                {
+                    transientResponses--;
+                    ctx.Response.StatusCode = 503;
+                    ctx.Response.Close();
+                    continue;
+                }
                 Check(ctx.Request.Headers["Authorization"] == "Bearer image-key", "Missing provider authorization.");
                 using var reader = new StreamReader(ctx.Request.InputStream);
                 var body = await reader.ReadToEndAsync();
@@ -258,6 +266,18 @@ internal static class ImageGenerationChecks
         Check((await lateTool.ExecuteAsync("{\"prompt\":\"海报\"}")).Contains("撤回") && jobs.Count == beforeJobs && calls == callsAfterCancellation,
             "A tool result arriving after recall must not queue a new image job.");
         Console.WriteLine("PASS: image recall cancels running HTTP and queued work, cleans progress, isolates instances and prevents late tool submission");
+
+        config.Default.RetryOnTimeoutMaxAttempts = 2;
+        config.Default.RetryOnTimeoutDelayMs = 100;
+        transientResponses = 2;
+        beforeImages = paths.Count;
+        var exhausted = await Generate("retry limit", null, null, CancellationToken.None);
+        Check(exhausted.Contains("HTTP 503") && calls == callsAfterCancellation + 2 && paths.Count == beforeImages,
+            "Image generation must honor the plugin's configured attempt limit.");
+        transientResponses = 1;
+        var recovered = await Generate("retry success", null, null, CancellationToken.None);
+        Check(recovered == "图片已生成并发送。" && calls == callsAfterCancellation + 4 && paths.Count == beforeImages + 1,
+            "Successful image retry must deliver exactly one image.");
         listener.Stop(); await serve;
         Directory.Delete(tempRoot, recursive: true);
         Console.WriteLine("PASS: image generation provider request, one-image delivery, reaction cleanup, text fallback, retry deduplication, cancellation and enabled switch");

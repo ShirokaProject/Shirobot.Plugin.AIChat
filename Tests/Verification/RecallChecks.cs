@@ -63,7 +63,7 @@ internal static class RecallChecks
                 return await client.ChatAsync(config.Default, new ModelEntry { Name = "primary", BaseUrl = "https://example.invalid/v1", ApiKey = "test" },
                     new OpenAiChatRequest { Model = "primary", Messages = [] }, pending.Token);
             };
-            var task = (Task<string>)method.Invoke(plugin, [primary, operation, null, pending.Token])!;
+            var task = (Task<string>)method.Invoke(plugin, [primary, operation, pending.Token, false])!;
             await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
             await registry.CancelBeforeReplyAsync(recall);
             await Canceled(task);
@@ -80,7 +80,7 @@ internal static class RecallChecks
             await Canceled(delivery.AppendAsync("first frame"));
             Check(api.Stream.Frames.Count == 0, "Recall before first stream frame must send nothing.");
         }
-        var store = new ConversationStore("unused", false, 20);
+        var store = new ConversationStore("unused", false);
         var key = new ConversationKey("test-instance", ChatScene.Group, "1", "2");
         await store.AcquireAsync(key);
         using (var pending = registry.Register(message))

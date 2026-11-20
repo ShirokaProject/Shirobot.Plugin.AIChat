@@ -25,7 +25,10 @@ public sealed record ImagePart(
     string? CachePath,
     string Mime,
     int Bytes,
-    [property: JsonIgnore] byte[]? InlineBytes = null) : ChatPart;
+    [property: JsonIgnore] byte[]? InlineBytes = null) : ChatPart
+{
+    internal const string HistoryPlaceholder = "[图片；需要发送的内容附在本次请求末尾。]";
+}
 
 /// <summary>文本类文件的截断后正文。</summary>
 public sealed record FileTextPart(string Name, long Size, string Excerpt, bool Truncated) : ChatPart;

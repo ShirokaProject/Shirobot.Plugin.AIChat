@@ -58,6 +58,11 @@ internal sealed class StreamingChatContent : HttpContent
             await WriteAsync(stream, ",\"max_completion_tokens\":", ct);
             await JsonSerializer.SerializeAsync(stream, tokens, JsonOptions, ct);
         }
+        if (request.ToolChoice is { } toolChoice)
+        {
+            await WriteAsync(stream, ",\"tool_choice\":", ct);
+            await JsonSerializer.SerializeAsync(stream, toolChoice, JsonOptions, ct);
+        }
         using var prefix = request.CapturePrefix ? new PrefixCaptureStream(stream) : null;
         if (prefix is not null) stream = prefix;
         if (request.Tools is {} tools)

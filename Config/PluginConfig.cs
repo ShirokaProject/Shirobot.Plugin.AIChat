@@ -43,8 +43,8 @@ public sealed class DefaultSection
     public const string LegacySharedPromptSuffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代，像群聊成员一样自然、简短地回复，不要写成大段说明，不要使用Markdown格式，除非用户明确要求。";
     [ConfigField("填写已注册模型名或 provider-model。", Label = "默认模型")]
     public string Model { get; set; } = "gpt-4o-mini";
-    /// <summary>文本请求重试后仍失败时使用的模型；留空禁用，不改变用户模型偏好。</summary>
-    [ConfigField("文本请求重试后仍失败时调用；留空禁用，不改变用户模型选择。", Label = "备用模型")]
+    /// <summary>对话或历史压缩失败时使用的模型；留空禁用。</summary>
+    [ConfigField("对话或历史压缩失败时使用；留空禁用。", Label = "备用模型")]
     public string FallbackModel { get; set; } = "";
     [ConfigField("默认对话的 system prompt。", Label = "默认提示词", Type = "text")]
     public string DefaultPrompt { get; set; } = "你是一个乐于助人的助手。";
@@ -54,13 +54,16 @@ public sealed class DefaultSection
     [ConfigField("单次上游请求的超时时间。", Label = "请求超时（秒）", Min = 5)]
     public int TimeoutSeconds { get; set; } = 60;
 
-    /// <summary>超时或瞬时网络失败时的总尝试次数，包含首次请求。</summary>
-    [ConfigField("超时、临时网络错误或空响应时的总尝试次数，包含首次请求。", Label = "请求最大尝试次数", Min = 1, Max = 5)]
-    public int RetryOnTimeoutMaxAttempts { get; set; } = 3;
+    internal const int DefaultRetryAttempts = 3;
+    internal const int DefaultRetryDelayMs = 1000;
+
+    /// <summary>可重试请求的总尝试次数，包含首次请求。</summary>
+    [ConfigField("可重试请求的总尝试次数，包含首次请求。适用于对话、历史压缩、生图和编辑。", Label = "请求最大尝试次数", Min = 1, Max = 5)]
+    public int RetryOnTimeoutMaxAttempts { get; set; } = DefaultRetryAttempts;
 
     /// <summary>重试前的基础等待毫秒数；后续重试线性递增。</summary>
     [ConfigField("重试前的基础等待时间；后续重试线性递增。", Label = "重试等待（毫秒）", Min = 100, Max = 10000)]
-    public int RetryOnTimeoutDelayMs { get; set; } = 1000;
+    public int RetryOnTimeoutDelayMs { get; set; } = DefaultRetryDelayMs;
     [ConfigField("允许同时处理的 AI 请求数量；修改后重载插件生效。", Label = "最大并发请求数", Min = 1)]
     public int MaxConcurrency { get; set; } = 4;
 
@@ -108,16 +111,22 @@ public sealed class HistorySection
     [ConfigField("生成历史摘要使用的模型名称，可填更便宜的模型；留空使用当前对话的模型。", Label = "上下文压缩模型")]
     public string CompactModel { get; set; } = "";
     /// <summary>
-    /// 单会话保留的最大轮次（user+assistant 各算一轮）。
+    /// 单会话的轮数压缩阈值，每轮包含用户消息和 AI 回复。
     /// </summary>
-    [ConfigField("保留的对话轮数，每轮包含用户消息和 AI 回复；接近上限时自动压缩成历史摘要。0 表示按 Token 预算压缩，同时会在存储安全上限前提前压缩。", Label = "最大历史轮数", Min = 0)]
+    [ConfigField("接近此轮数时自动压缩成历史摘要；0 使用默认阈值 1000 轮。", Label = "历史轮数压缩阈值", Min = 0)]
     public int MaxTurns { get; set; }
 
     /// <summary>
-    /// 单次请求的软上限 token，超出则按最早 turn 裁剪。
+    /// 用于估算何时触发历史压缩的 Token 预算。
     /// </summary>
-    [ConfigField("单次请求的估算 token 上限：超过时本次请求跳过最早的历史；历史超过其 75% 时自动并入历史摘要。", Label = "上下文 Token 软上限", Min = 1000)]
+    [ConfigField("历史估算用量超过此预算的 75% 时自动压缩成历史摘要。", Label = "历史压缩 Token 预算", Min = 1000)]
     public int MaxTokens { get; set; } = 128000;
+
+    [ConfigField("压缩后保留的近期原文估算 Token 上限，同时受历史压缩 Token 预算的四分之一限制。至少保留最近一轮。", Label = "压缩保留原文 Token", Min = 1)]
+    public int CompactKeepTokens { get; set; } = 16000;
+
+    [ConfigField("压缩后保留的近期原文轮数，同时受历史轮数压缩阈值的四分之一限制。每轮从一条用户消息开始。", Label = "压缩保留原文轮数", Min = 1)]
+    public int CompactKeepTurns { get; set; } = 32;
 
     /// <summary>
     /// 是否落盘到 JSONL。
@@ -473,7 +482,7 @@ public sealed class ImageGenerationSection
     public string Model { get; set; } = "gpt-image-2.5-sunburst";
     [ConfigField("聊天模型调用生图工具时，按这些规则整理 prompt，例如语言、自然语言或标签格式、默认画风、构图和光影；用户本次明确要求优先。留空沿用内置规则。只指导提示词编写，不直接拼接到生图接口；#imagegen 命令仍原样提交。", Label = "生图提示词编写规则", Type = "text")]
     public string PromptInstructions { get; set; } = "";
-    [ConfigField("生图独立超时，不沿用聊天超时。", Label = "生图超时（秒）", Min = 30, Max = 1800)]
+    [ConfigField("生图或编辑每次请求的独立超时。", Label = "生图超时（秒）", Min = 30, Max = 1800)]
     public int TimeoutSeconds { get; set; } = 600;
     [ConfigField("发送给 images/generations 的 size。", Label = "图片尺寸")]
     public string Size { get; set; } = "1024x1024";

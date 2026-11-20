@@ -165,7 +165,8 @@ public sealed partial class AiChatPlugin
             }
             clear = await ShowImageGenerationProgressAsync(message, ct).ConfigureAwait(false);
             var image = await ImageGenerationClient.GenerateAsync(url, key ?? "", model.Name, prompt, config,
-                _config.Network.HttpProxy, ct, inputs).ConfigureAwait(false);
+                _config.Network.HttpProxy, ct, inputs, maxAttempts: _config.Default.RetryOnTimeoutMaxAttempts,
+                retryDelayMs: _config.Default.RetryOnTimeoutDelayMs).ConfigureAwait(false);
             inputs.Clear();
             ct.ThrowIfCancellationRequested();
             if (!pending.TryBeginReply()) throw new OperationCanceledException(ct);

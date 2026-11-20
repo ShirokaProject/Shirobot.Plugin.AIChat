@@ -229,7 +229,7 @@ internal static class ProactiveChecks
         typeof(AiChatPlugin).GetField("_config", flags)!.SetValue(plugin, noModels);
         var stateRoot = Path.Combine(Path.GetTempPath(), "aichat-proactive-" + Guid.NewGuid().ToString("N"));
         typeof(AiChatPlugin).GetField("_userSettings", flags)!.SetValue(plugin, new UserSettingsStore(stateRoot));
-        typeof(AiChatPlugin).GetField("_conversations", flags)!.SetValue(plugin, new ConversationStore(stateRoot, false, 4));
+        typeof(AiChatPlugin).GetField("_conversations", flags)!.SetValue(plugin, new ConversationStore(stateRoot, false));
         var process = typeof(AiChatPlugin).GetMethod("ProcessAiAsync", flags)!;
         var resolveKey = typeof(AiChatPlugin).GetMethod("ResolveConversationKey", flags)!;
         var failing = Msg("p3", "alice", 8, new TextSegment("在吗"));

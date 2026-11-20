@@ -28,13 +28,13 @@ internal static class IdentityScopeChecks
             var other = key with { InstanceId = "second" };
             Check(key.ToFileSafeString() != other.ToFileSafeString() && !key.ToFileSafeString().Contains('/') && !key.ToFileSafeString().Contains('\\'), "Conversation path is unsafe or lacks instance scope.");
             Check(key.ToFileSafeString() == (key with { InstanceId = "FIRST" }).ToFileSafeString(), "Conversation filename is not deterministic.");
-            var store = new ConversationStore(root, true, 20);
+            var store = new ConversationStore(root, true);
             var state = await store.AcquireAsync(key);
             state.SharedPrompt = "first-secret";
             store.SaveMetadata(state); store.Release(key);
             var isolated = await store.AcquireAsync(other);
             Check(isolated.SharedPrompt is null, "Conversation history crossed instances."); store.Release(other);
-            var restored = await new ConversationStore(root, true, 20).AcquireAsync(key);
+            var restored = await new ConversationStore(root, true).AcquireAsync(key);
             Check(restored.SharedPrompt == "first-secret", "Scoped metadata did not persist.");
             Console.WriteLine("PASS: opaque identity persistence, instance isolation, safe deterministic filenames and legacy data preservation");
         }

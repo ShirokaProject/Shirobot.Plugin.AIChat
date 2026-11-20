@@ -111,6 +111,10 @@ internal static class McpChecks
                 Check((await Tool("mcp_fake_fail").ExecuteAsync("{}")).StartsWith("MCP tool error: boom"), "Tool errors must be marked.");
                 Check((await echo.ExecuteAsync("[1]")).Contains("JSON object"), "Non-object arguments must be rejected.");
                 Check((await Tool("mcp_fake_exit").ExecuteAsync("")).StartsWith("MCP call failed"), "A server crash must fail the call cleanly.");
+                section.Servers[0].Command = "/nonexistent/mcp-server";
+                Check((await echo.ExecuteAsync("""{"text":"offline"}""")).StartsWith("MCP call failed") &&
+                    hub.Tools.SequenceEqual(tools), "A failed reconnect must preserve the last advertised tool definitions.");
+                section.Servers[0].Command = "python3";
                 Check((await echo.ExecuteAsync("""{"text":"again"}""")).StartsWith("echo:again"), "A crashed stdio server must be restarted on the next call.");
             }
             Console.WriteLine("PASS: MCP stdio handshake, paging, ping, calls, errors, crash recovery and filters");

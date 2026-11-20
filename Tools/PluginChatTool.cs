@@ -62,6 +62,7 @@ internal sealed partial class PluginChatTool : IChatTool
                 continue;
             tools.Add(new PluginChatTool(context, entry, info, chat));
         }
+        tools.Sort((left, right) => StringComparer.Ordinal.Compare(left.Definition.Function.Name, right.Definition.Function.Name));
         return tools;
     }
 

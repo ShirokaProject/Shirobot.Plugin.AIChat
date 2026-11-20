@@ -44,11 +44,13 @@ internal static class ImageRetryChecks
             var parts = ((MultipartFormDataContent)request.Content!).ToArray();
             var image = parts.Single(part => part.Headers.ContentDisposition!.Name!.Trim('"') == "image[]");
             Check((await image.ReadAsByteArrayAsync()).SequenceEqual(png), "Retry lost reference bytes.");
-            if (calls == 1) return Error("background", "unknown background parameter");
+            if (calls == 1) return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+            if (calls == 2) return Error("background", "unknown background parameter");
             Check(parts.All(part => part.Headers.ContentDisposition!.Name!.Trim('"') != "background"), "Multipart unsupported field not omitted.");
             return Success();
-        })) await ImageGenerationClient.GenerateAsync("https://example.invalid/v1", "test", "image-model", "prompt", new(), "", default, [new(png, "image/png")], handler);
-        Check(calls == 2, "Edit request was not rebuilt for retry.");
+        })) await ImageGenerationClient.GenerateAsync("https://example.invalid/v1", "test", "image-model", "prompt", new(), "", default,
+            [new(png, "image/png")], handler, retryDelayMs: 100);
+        Check(calls == 3, "Edit request was not rebuilt for transient and compatibility retries.");
 
         foreach (var (param, message, code, cfg, status) in new[] {
             ("", "GIF output is not enabled for this request.", "invalid_request_error", new ImageGenerationSection { EnableGif = true, OutputFormat = "gif" }, HttpStatusCode.BadRequest),
@@ -90,6 +92,54 @@ internal static class ImageRetryChecks
         Check(calls == 2, "Expected one original GIF upload and one PNG fallback.");
         Check(gif.AsSpan().StartsWith("GIF89a"u8), "Original GIF was mutated.");
 
+        calls = 0;
+        string? initialBody = null;
+        using (var handler = new Handler(async (request, ct) =>
+        {
+            var body = await request.Content!.ReadAsStringAsync(ct);
+            initialBody ??= body;
+            Check(body == initialBody, "Transient retries changed image request parameters.");
+            return ++calls switch
+            {
+                1 => throw new HttpRequestException("fixture connection failure"),
+                2 => throw new TaskCanceledException("fixture timeout"),
+                3 => new HttpResponseMessage(HttpStatusCode.TooManyRequests),
+                4 => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable),
+                _ => Success()
+            };
+        }))
+            Check((await ImageGenerationClient.GenerateAsync("https://example.invalid/v1", "test", "image-model", "prompt",
+                new(), "", default, handler: handler, maxAttempts: 5, retryDelayMs: 100)).SequenceEqual(png) && calls == 5,
+                "Configured attempts must cover network failure, timeout, throttling and HTTP 503.");
+
+        calls = 0;
+        using (var handler = new Handler((_, _) => Task.FromResult(++calls == 1
+            ? Error("background", "unknown background parameter")
+            : new HttpResponseMessage(HttpStatusCode.ServiceUnavailable))))
+        {
+            try
+            {
+                await ImageGenerationClient.GenerateAsync("https://example.invalid/v1", "test", "image-model", "prompt",
+                    new(), "", default, handler: handler, maxAttempts: 2, retryDelayMs: 100);
+                throw new Exception("Expected attempt exhaustion.");
+            }
+            catch (ImageGenerationException ex) when (ex.Message.Contains("HTTP 503")) { }
+            Check(calls == 2, "Compatibility recovery and transient failures must share the attempt limit.");
+        }
+
+        calls = 0;
+        using (var handler = new Handler((_, _) => { calls++; return Task.FromResult(Error("quality")); }))
+        {
+            try
+            {
+                await ImageGenerationClient.GenerateAsync("https://example.invalid/v1", "test", "image-model", "prompt",
+                    new(), "", default, handler: handler, maxAttempts: 1);
+                throw new Exception("Expected a single attempt.");
+            }
+            catch (ImageGenerationException) { }
+            Check(calls == 1, "An attempt limit of one must also disable compatibility retries.");
+        }
+
         using var cancelled = new CancellationTokenSource(); calls = 0;
         using (var handler = new Handler((_, _) => { calls++; cancelled.Cancel(); return Task.FromResult(Error("quality")); }))
         {
@@ -98,6 +148,7 @@ internal static class ImageRetryChecks
             Check(calls == 1, "Canceled task retried.");
         }
         Console.WriteLine("PASS: silent bounded 400 recovery, defaults/size/quality compatibility, multipart reference preservation, cancellation, immutable config, and GIF/auth/policy preservation");
+        Console.WriteLine("PASS: configured image attempts cover timeout, network errors, HTTP 429/503 and HTTP 400 compatibility");
     }
     sealed class Handler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {

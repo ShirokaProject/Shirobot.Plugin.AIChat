@@ -199,7 +199,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         [default]
         # 默认模型名（需在 [[models]] 或 provider fetch 中存在）
         model = "gpt-4o-mini"
-        # 文本请求重试后仍失败时使用的备用模型（支持 provider-model）；留空禁用
+        # 对话或历史压缩失败时使用的备用模型（支持 provider-model）；留空禁用
         fallback_model = ""
         # 默认 system prompt。保持稳定以提高上游前缀缓存命中率；动态时间和会话信息会附在每条用户消息末尾。
         default_prompt = "你是一个乐于助人的助手。"
@@ -207,7 +207,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         shared_prompt_suffix = "你正在群聊中对话。用户消息会带有说话者标识（如 [张三/123456]）。请根据说话者区分上下文和指代。闲聊时像群聊成员一样自然、简短地回复；有人认真提问、需要详细说明时可以完整回答。"
         # 请求超时（秒）
         timeout_seconds = 60
-        # 超时或临时网络失败时的总尝试次数（含首次请求）
+        # 可重试请求的总尝试次数（含首次请求），适用于对话、历史压缩、生图和编辑
         retry_on_timeout_max_attempts = 3
         # 重试前的基础等待毫秒数；后续重试线性递增
         retry_on_timeout_delay_ms = 1000
@@ -225,10 +225,13 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         template = ""
 
         [history]
-        # 单会话保留的最大轮次（user+assistant 算一轮）；0 表示不按轮数限制，只按 max_tokens 压缩
+        # 历史接近此轮数时压缩（user+assistant 算一轮）；0 使用默认轮数阈值
         max_turns = 0
-        # 单次请求的估算 token 上限：超出时本次请求跳过最早的历史；历史超过 75% 时并入历史摘要
+        # 历史超过此估算 Token 预算的 75% 时并入历史摘要
         max_tokens = 128000
+        # 压缩后保留的近期原文上限，同时最多使用上述 Token 和轮数阈值的四分之一
+        compact_keep_tokens = 16000
+        compact_keep_turns = 32
         # 是否落盘到 JSONL
         persist = true
         # 后续请求中重新发送图片的最近用户轮次数；0 表示只保留文字摘要
@@ -399,6 +402,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         # 聊天模型编写生图提示词的规则，例如语言、标签格式、默认画风；留空使用内置规则
         # 只指导聊天模型整理 prompt；#imagegen 提示词仍原样提交
         prompt_instructions = ""
+        # 生图或编辑每次请求的独立超时（秒）
         timeout_seconds = 600
         size = "1024x1024"
         quality = "auto"
@@ -511,7 +515,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         // 仅在首次加载时构造长期持有状态的服务，避免热重载冲掉内存里的会话/限流。
         if (initial)
         {
-            _conversations = new ConversationStore(pluginRoot, _config.History.Persist, _config.History.MaxTurns);
+            _conversations = new ConversationStore(pluginRoot, _config.History.Persist);
             _userSettings = new UserSettingsStore(pluginRoot);
             _memory = new MemoryNotebookStore(pluginRoot);
             _usage = new UsageStats(Path.Combine(pluginRoot, "usage-stats.json"));
@@ -1361,7 +1365,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 // Catch existing full histories before sending another huge chat
                 // request. A failed attempt is not repeated again in this turn.
                 var attemptedCompaction = convo is not null && NeedsCompaction(convo);
-                if (attemptedCompaction) await TryCompactConversationAsync(convo!, model).ConfigureAwait(false);
+                if (attemptedCompaction) await TryCompactConversationAsync(convo!, model, ct).ConfigureAwait(false);
                 var selfName = await ResolveSelfNameAsync(message).ConfigureAwait(false);
                 // 同一会话每次请求的工具列表和 system prompt 保持不变，上游的前缀缓存才能命中：
                 // 本次不允许使用的工具（主动插话、非管理员）仍然列出，调用时由 RefusedChatTool 拒绝。
@@ -1436,7 +1440,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 {
                     systemPrompt += "\n" + _config.Default.SharedPromptSuffix;
                 }
-                systemPrompt += $"\n你的当前机器人名称是“{selfName}”。在群聊中介绍自己、回应问候或被询问身份时，应使用这个名称；不要笼统自称“AI助手”或“人工智能助手”，除非用户明确询问你的技术性质。";
+                systemPrompt += "\n你的机器人名称见当前消息的会话上下文。在群聊中介绍自己、回应问候或被询问身份时，应使用这个名称；不要笼统自称“AI助手”或“人工智能助手”，除非用户明确询问你的技术性质。";
                 if (_tools.HasTools)
                 {
                     systemPrompt += "\n" + _tools.SystemPrompt;
@@ -1505,9 +1509,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 try
                 {
                     var hasImageInCurrent = parts.Any(p => p is ImagePart);
-                    var requestHistory = (convo?.Turns ?? []).ToList();
-                    TrimHistoryToTokenBudget(systemPrompt, requestHistory, requestUserTurn);
-                    BotLog.Info($"[AiChat] 请求 {GetModelDisplayId(model)}: 历史 {requestHistory.Count}/{convo?.Turns.Count ?? 0} turns, " +
+                    var requestHistory = convo?.Turns ?? [];
+                    BotLog.Info($"[AiChat] 请求 {GetModelDisplayId(model)}: 历史 {requestHistory.Count} turns, " +
                         $"历史摘要 {convo?.Summary?.Length ?? 0} 字, 估算 {EstimateRequestTokens(systemPrompt, requestHistory, requestUserTurn)} tokens");
                     if (hasImageInCurrent && !_tools.HasTools && contextualTools is null)
                     {
@@ -1515,7 +1518,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                             ExecuteReplyAttemptAsync(delivery, onContent =>
                                 _openAi.ChatStreamingBodyAsync(_config.Default, model,
                                     BuildMessageDescriptors(systemPrompt, requestHistory, requestUserTurn), ct: ct, onContent: onContent), ct),
-                            () => TrimRequestHistoryForRetry(requestHistory), ct).ConfigureAwait(false);
+                            ct).ConfigureAwait(false);
                     }
                     else
                     {
@@ -1537,7 +1540,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                                 return onContent is null
                                     ? _openAi.ChatAsync(_config.Default, requestModel, request, ct)
                                     : _openAi.ChatIncrementalAsync(requestModel, request, onContent, ct);
-                            }, ct), () => TrimRequestHistoryForRetry(requestHistory), ct).ConfigureAwait(false);
+                            }, ct), ct).ConfigureAwait(false);
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1642,13 +1645,12 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                         "assistant",
                         [new TextPart(assistantText)],
                         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-                    // Compact the full appended history before the storage cap.
                     await _conversations.AppendTurnsAsync(convo, userTurn, assistantTurn, attemptedCompaction ? null : async () =>
                     {
                         if (!NeedsCompaction(convo)) return false;
                         await _globalConcurrency.WaitAsync(ct).ConfigureAwait(false);
                         holdsGlobal = true;
-                        return await TryCompactConversationAsync(convo, model).ConfigureAwait(false);
+                        return await TryCompactConversationAsync(convo, model, ct).ConfigureAwait(false);
                     }).ConfigureAwait(false);
                 }
 
@@ -2192,36 +2194,45 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
 
     // -------- 工具方法 --------
 
+    private const int DefaultCompactionTurns = 1000;
+    private int CompactionTurnLimit => _config.History.MaxTurns <= 0 ? DefaultCompactionTurns : Math.Max(2, _config.History.MaxTurns);
+    private int CompactionTokenBudget => Math.Max(1000, _config.History.MaxTokens);
+
     /// <summary>
-    /// Context compact：轮数达到 maxTurns 的 80% 或历史估算 token 超过上限的 75% 时，
+    /// Context compact：轮数达到压缩阈值的 80% 或历史估算 token 超过预算的 75% 时，
     /// 把较早的对话合并进会话的历史摘要，只保留最近的对话原文。
     /// 历史摘要每次在旧摘要基础上增量更新，不会对摘要反复再摘要。
     /// </summary>
     private bool NeedsCompaction(ConversationState convo) =>
-        convo.Turns.Count >= ConversationStore.MaxItemsFor(_config.History.MaxTurns) * 4L / 5 ||
-        convo.Turns.Sum(turn => (long)EstimateTurnTokens(turn)) > Math.Max(1000, _config.History.MaxTokens) * 3L / 4;
+        convo.Turns.Count >= CompactionTurnLimit * 8L / 5 ||
+        convo.Turns.Sum(turn => (long)EstimateTurnTokens(turn)) > CompactionTokenBudget * 3L / 4;
 
-    private async Task<bool> TryCompactConversationAsync(ConversationState convo, ModelEntry model)
+    private int CountMessagesToCompact(IReadOnlyList<ChatTurn> messages)
+    {
+        var keepTokenLimit = Math.Clamp(_config.History.CompactKeepTokens, 1, CompactionTokenBudget / 4);
+        var keepTurnLimit = Math.Clamp(_config.History.CompactKeepTurns, 1, Math.Max(1, CompactionTurnLimit / 4));
+        var firstKept = messages.Count;
+        var keptTurns = 0;
+        long suffixTokens = 0;
+        for (var i = messages.Count - 1; i >= 0; i--)
+        {
+            var message = messages[i];
+            suffixTokens += EstimateTurnTokens(message);
+            if (message.Role != "user") continue;
+            // A round starts at the user message and includes all subsequent replies and image notices.
+            if (keptTurns > 0 && (keptTurns >= keepTurnLimit || suffixTokens > keepTokenLimit)) break;
+            firstKept = i;
+            keptTurns++;
+        }
+        return keptTurns == 0 ? Math.Max(0, messages.Count - 1) : firstKept;
+    }
+
+    private async Task<bool> TryCompactConversationAsync(ConversationState convo, ModelEntry model, CancellationToken ct)
     {
         if (!NeedsCompaction(convo)) return false;
+        var compactCount = CountMessagesToCompact(convo.Turns);
+        if (compactCount == 0) return false;
         using var usageScope = UsageScope.Begin(UsageSource(convo.Key), "compact");
-        // user+assistant 配对；不按轮数限制时只看 token 预算。
-        var maxItems = ConversationStore.MaxItemsFor(_config.History.MaxTurns);
-        var tokenBudget = Math.Max(1000, _config.History.MaxTokens);
-
-        // 从最新往前保留不超过一半轮数、一半 token 预算的原文，至少保留最近一对。
-        var keep = 0;
-        long keptTokens = 0;
-        while (keep + 2 <= convo.Turns.Count)
-        {
-            var pairTokens = EstimateTurnTokens(convo.Turns[^(keep + 1)]) + EstimateTurnTokens(convo.Turns[^(keep + 2)]);
-            if (keep >= 2 && (keep + 2 > maxItems / 2 || keptTokens + pairTokens > tokenBudget / 2)) break;
-            keep += 2;
-            keptTokens += pairTokens;
-        }
-        var compactCount = convo.Turns.Count - keep;
-        if (compactCount % 2 != 0) compactCount--;
-        if (compactCount < 2) return false;
 
         var transcript = new StringBuilder();
         foreach (var turn in convo.Turns.Take(compactCount))
@@ -2250,51 +2261,32 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         }
         try
         {
-            var summaryRequest = new OpenAiChatRequest
-            {
-                Model = model.Name,
-                Messages = summaryMessages,
-                Stream = false,
-                MaxCompletionTokens = _config.Default.OutputTokenLimit() is { } limit ? Math.Min(limit, 2048) : 2048
-            };
-
-            var summary = (await _openAi.ChatAsync(_config.Default, model, summaryRequest, _backgroundStop.Token).ConfigureAwait(false)).Trim();
-            if (summary.Length == 0) throw new InvalidOperationException("摘要为空");
+            var summary = (await ExecuteTextWithFallbackAsync(model, requestModel => _openAi.ChatAsync(
+                _config.Default, requestModel, new OpenAiChatRequest
+                {
+                    Model = requestModel.Name,
+                    Messages = summaryMessages,
+                    MaxCompletionTokens = _config.Default.OutputTokenLimit() is { } limit ? Math.Min(limit, 2048) : 2048
+                }, ct), ct, retryTransientHttpErrors: true).ConfigureAwait(false)).Trim();
 
             // Persist first; if writing fails keep the original in-memory history
-            // so AppendTurnsAsync can save the current pair and apply its fallback.
+            // so AppendTurnsAsync can still save the current pair.
+            ct.ThrowIfCancellationRequested();
             var rewritten = new ConversationState(convo.Key) { Summary = summary };
             rewritten.Turns.AddRange(convo.Turns.Skip(compactCount));
             await _conversations.RewriteAsync(rewritten, throwOnFailure: true).ConfigureAwait(false);
             convo.Turns.RemoveRange(0, compactCount);
             convo.Summary = summary;
 
-            BotLog.Info($"[AiChat] Context compact 完成: {compactCount} turns 并入历史摘要, 剩余 {convo.Turns.Count} turns, 摘要 {summary.Length} 字:\n{ForLog(summary)}");
+            var keptTokens = convo.Turns.Sum(turn => (long)EstimateTurnTokens(turn));
+            BotLog.Info($"[AiChat] Context compact 完成: {compactCount} 条消息并入历史摘要, 保留 {convo.Turns.Count} 条原文 (估算 {keptTokens} tokens), 摘要 {summary.Length} 字:\n{ForLog(summary)}");
             return true;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            // compact 失败不影响正常对话，超出轮数上限后由存储层截断最早的历史。
             BotLog.Warning($"[AiChat] Context compact 失败，保留原历史: {ex.Message}");
             return false;
         }
-    }
-
-    /// <summary>从最早的历史开始成对丢弃，直到本次请求的估算 token 不超过 history.max_tokens。只影响本次请求。</summary>
-    private void TrimHistoryToTokenBudget(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn)
-    {
-        var budget = Math.Max(1000, _config.History.MaxTokens);
-        var total = EstimateRequestTokens(systemPrompt, history, currentUserTurn);
-        var removed = 0;
-        while (total > budget && history.Count > 0)
-        {
-            var count = history.Count >= 2 ? 2 : 1;
-            total -= history.Take(count).Sum(EstimateTurnTokens);
-            history.RemoveRange(0, count);
-            removed += count;
-        }
-        if (removed > 0)
-            BotLog.Info($"[AiChat] 上下文超过 {budget} tokens，本次请求跳过最早 {removed} turns。");
     }
 
     private static int EstimateRequestTokens(string systemPrompt, IEnumerable<ChatTurn> history, ChatTurn currentUserTurn) =>
@@ -2568,7 +2560,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         return isDefault && includeDefaultMark ? display + " (默认)" : display;
     }
 
-    private async Task<string> ExecuteWithRetryAsync(Func<Task<string>> operation, Action? onEmptyResponse = null, CancellationToken ct = default)
+    private async Task<string> ExecuteWithRetryAsync(Func<Task<string>> operation, CancellationToken ct,
+        bool retryTransientHttpErrors = false)
     {
         var maxAttempts = Math.Clamp(_config.Default.RetryOnTimeoutMaxAttempts, 1, 5);
         var delayMs = Math.Clamp(_config.Default.RetryOnTimeoutDelayMs, 100, 10_000);
@@ -2582,31 +2575,21 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 ct.ThrowIfCancellationRequested();
                 return result;
             }
-            catch (Exception ex) when (!ct.IsCancellationRequested && (ex is TaskCanceledException or HttpRequestException or EmptyUpstreamResponseException) && attempt < maxAttempts)
+            catch (Exception ex) when (!ct.IsCancellationRequested && attempt < maxAttempts &&
+                (ex is TaskCanceledException or HttpRequestException or EmptyUpstreamResponseException ||
+                    retryTransientHttpErrors && ex is UpstreamHttpException { IsTransient: true }))
             {
-                if (ex is EmptyUpstreamResponseException)
+                var reason = ex switch
                 {
-                    onEmptyResponse?.Invoke();
-                }
-
+                    EmptyUpstreamResponseException => "空响应",
+                    UpstreamHttpException http => $"HTTP {(int)http.StatusCode}",
+                    _ => ex.GetType().Name
+                };
                 var delay = TimeSpan.FromMilliseconds(delayMs * attempt);
-                var reason = ex is EmptyUpstreamResponseException ? "空响应" : ex.GetType().Name;
                 BotLog.Warning($"[AiChat] 上游请求第 {attempt}/{maxAttempts} 次失败 ({reason})，{delay.TotalMilliseconds:0}ms 后重试。");
                 await Task.Delay(delay, ct).ConfigureAwait(false);
             }
         }
-    }
-
-    private static void TrimRequestHistoryForRetry(List<ChatTurn> history)
-    {
-        if (history.Count < 2) return;
-
-        var removeCount = history.Count / 2;
-        if (removeCount % 2 != 0) removeCount--;
-        if (removeCount < 2) return;
-
-        history.RemoveRange(0, removeCount);
-        BotLog.Warning($"[AiChat] 空响应重试：已从本次请求上下文移除最旧 {removeCount} turns，剩余 {history.Count} turns。");
     }
 
     private async Task<string> ExecuteReplyAttemptAsync(OfficialReplyDelivery delivery,
@@ -2627,11 +2610,11 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     }
 
     private async Task<string> ExecuteTextWithFallbackAsync(ModelEntry model,
-        Func<ModelEntry, Task<string>> operation, Action? onEmptyResponse = null, CancellationToken ct = default)
+        Func<ModelEntry, Task<string>> operation, CancellationToken ct, bool retryTransientHttpErrors = false)
     {
         try
         {
-            return await ExecuteWithRetryAsync(() => operation(model), onEmptyResponse, ct).ConfigureAwait(false);
+            return await ExecuteWithRetryAsync(() => operation(model), ct, retryTransientHttpErrors).ConfigureAwait(false);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested && ex is not ToolRoundResponseFailedException && (ex is not OperationCanceledException || ex is TaskCanceledException))
         {
@@ -2646,26 +2629,26 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 throw;
 
             BotLog.Warning($"[AiChat] 模型 {GetModelDisplayId(model)} 请求失败，回退到 {GetModelDisplayId(fallback)}: {ex.Message}");
-            return await ExecuteWithRetryAsync(() => operation(fallback), onEmptyResponse, ct).ConfigureAwait(false);
+            return await ExecuteWithRetryAsync(() => operation(fallback), ct, retryTransientHttpErrors).ConfigureAwait(false);
         }
     }
 
-    private List<OpenAiMessage> BuildOpenAiMessages(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn, bool supportsVision = true)
+    private List<OpenAiMessage> BuildOpenAiMessages(string systemPrompt, IReadOnlyList<ChatTurn> history, ChatTurn currentUserTurn, bool supportsVision = true)
         => BuildVisionMessages(systemPrompt, history, currentUserTurn, supportsVision)
             .Select(message => new OpenAiMessage { Role = message.Role, Content = message }).ToList();
 
-    private List<ChatMessageDescriptor> BuildMessageDescriptors(string systemPrompt, List<ChatTurn> history, ChatTurn currentUserTurn)
+    private List<ChatMessageDescriptor> BuildMessageDescriptors(string systemPrompt, IReadOnlyList<ChatTurn> history, ChatTurn currentUserTurn)
         => BuildVisionMessages(systemPrompt, history, currentUserTurn, true);
 
     // Historical text is serialized identically whether an image expires or is selected again.
     // Only the trailing vision payload changes; cache files remain available for explicit image tools.
-    internal List<ChatMessageDescriptor> BuildVisionMessages(string systemPrompt, List<ChatTurn> history, ChatTurn current, bool supportsVision)
+    internal List<ChatMessageDescriptor> BuildVisionMessages(string systemPrompt, IReadOnlyList<ChatTurn> history, ChatTurn current, bool supportsVision)
     {
         var messages = new List<ChatMessageDescriptor>
         {
             new() { Role = "system", Segments = [new() { Kind = SegmentKind.Text, Text = systemPrompt }] }
         };
-        for (var i = 0; i < history.Count; i++) messages.Add(TurnToDescriptor(ShrinkOldFiles(history, i), false));
+        foreach (var turn in history) messages.Add(TurnToDescriptor(turn, false));
         messages.Add(TurnToDescriptor(current, false));
         if (!supportsVision) return messages;
 
@@ -2689,26 +2672,6 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         BotLog.Info($"[AiChat] 本轮携带图片 {count} 张，上限 {limit}，历史图片记忆轮数 {_config.History.ImageMemoryTurns}");
         return messages;
     }
-
-    /// <summary>最近 2 个用户轮次之前的文件只保留开头摘录，避免同一份文件在每轮请求里重复发送。</summary>
-    private static ChatTurn ShrinkOldFiles(IReadOnlyList<ChatTurn> history, int index)
-    {
-        var turn = history[index];
-        if (turn.Role != "user" || !turn.Parts.Any(p => p is FileTextPart { Excerpt.Length: > OldFileExcerptChars })) return turn;
-        var newerUserTurns = 0;
-        for (var i = history.Count - 1; i > index; i--)
-            if (history[i].Role == "user") newerUserTurns++;
-        // 当前消息不在 history 中，因此这里只需再保留一轮完整文件。
-        if (newerUserTurns < 1) return turn;
-        return turn with
-        {
-            Parts = turn.Parts.Select(p => p is FileTextPart { Excerpt.Length: > OldFileExcerptChars } file
-                ? file with { Excerpt = file.Excerpt[..OldFileExcerptChars] + "\n…（较早的文件，后文已省略）", Truncated = true }
-                : p).ToList()
-        };
-    }
-
-    private const int OldFileExcerptChars = 500;
 
     private bool ShouldIncludeHistoryImages(IReadOnlyList<ChatTurn> history, int index)
     {
@@ -2749,7 +2712,7 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
                 case ImagePart ip:
                     if (!includeImages)
                     {
-                        segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = "[图片；需要发送的内容附在本次请求末尾。]" });
+                        segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = ImagePart.HistoryPlaceholder });
                         break;
                     }
 

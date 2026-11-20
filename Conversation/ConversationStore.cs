@@ -18,18 +18,12 @@ internal sealed class ConversationStore
     private readonly ConcurrentDictionary<ConversationKey, SemaphoreSlim> _locks = new();
     private readonly string _conversationsDir;
     private readonly bool _persist;
-    private readonly int _maxTurns;
-    internal const int UnlimitedTurnsCap = 1000;
-    internal static int MaxItemsFor(int maxTurns) => (int)Math.Min(int.MaxValue,
-        (long)(maxTurns <= 0 ? UnlimitedTurnsCap : Math.Max(2, maxTurns)) * 2);
     private readonly JsonSerializerOptions _jsonOptions;
 
-    public ConversationStore(string pluginRootDir, bool persist, int maxTurns)
+    public ConversationStore(string pluginRootDir, bool persist)
     {
         _conversationsDir = Path.Combine(pluginRootDir, "data", "conversations");
         _persist = persist;
-        // 0 表示不按轮数限制（由 token 预算触发压缩）；仍保留一个很大的安全上限，避免压缩一直失败时文件无限增长。
-        _maxTurns = maxTurns <= 0 ? UnlimitedTurnsCap : Math.Max(2, maxTurns);
         _jsonOptions = new JsonSerializerOptions
         {
             WriteIndented = false,
@@ -72,32 +66,25 @@ internal sealed class ConversationStore
     }
 
     /// <summary>
-    /// 追加一对 user+assistant turn 到磁盘，并执行 trim。
+    /// 追加一对 user+assistant turn。压缩成功时已重写历史，否则追加到磁盘。
     /// 调用方必须已通过 AcquireAsync 持有锁。
     /// </summary>
     public async Task AppendTurnsAsync(ConversationState state, ChatTurn userTurn, ChatTurn assistantTurn,
-        Func<Task<bool>>? compactBeforeTrim = null)
+        Func<Task<bool>>? compact = null)
     {
-        state.Turns.Add(StripTransientPayloads(userTurn));
+        var storedUserTurn = StripTransientPayloads(userTurn);
+        state.Turns.Add(storedUserTurn);
         state.Turns.Add(assistantTurn);
 
-        // Give the summarizer the complete transcript, including the oldest pair,
-        // before the storage safety cap can discard anything.
-        bool compacted = false;
+        var compacted = false;
         try
         {
-            compacted = compactBeforeTrim is not null && await compactBeforeTrim().ConfigureAwait(false);
+            compacted = compact is not null && await compact().ConfigureAwait(false);
         }
         finally
         {
-            var trimmed = TrimAndReturnRemoved(state);
-            if (_persist)
-            {
-                if (trimmed)
-                    await RewriteAsync(state).ConfigureAwait(false);
-                else if (!compacted)
-                    await AppendToDiskAsync(state.Key, StripTransientPayloads(userTurn), assistantTurn).ConfigureAwait(false);
-            }
+            if (_persist && !compacted)
+                await AppendToDiskAsync(state.Key, storedUserTurn, assistantTurn).ConfigureAwait(false);
         }
     }
 
@@ -203,24 +190,11 @@ internal sealed class ConversationStore
         foreach (var part in turn.Parts)
         {
             stripped.Add(part is ImagePart { CachePath: null }
-                ? new TextPart("[图片已在上一轮发送给模型，后续上下文不再附带图片内容。]")
+                ? new TextPart(ImagePart.HistoryPlaceholder)
                 : part);
         }
 
         return turn with { Parts = stripped };
-    }
-
-    /// <summary>
-    /// 裁剪到 maxTurns，返回是否发生了裁剪。
-    /// </summary>
-    private bool TrimAndReturnRemoved(ConversationState state)
-    {
-        var maxItems = MaxItemsFor(_maxTurns);
-        if (state.Turns.Count <= maxItems) return false;
-
-        var remove = state.Turns.Count - maxItems;
-        state.Turns.RemoveRange(0, remove);
-        return true;
     }
 
     private void LoadTurnsFromDisk(ConversationState state)
@@ -257,9 +231,6 @@ internal sealed class ConversationStore
                 state.Summary = legacy[LegacySummaryPrefix.Length..];
                 state.Turns.RemoveAt(0);
             }
-
-            // Leave oversized legacy histories intact for pre-request compaction.
-            // AppendTurnsAsync still enforces the cap if summarization fails.
         }
         catch (Exception ex)
         {

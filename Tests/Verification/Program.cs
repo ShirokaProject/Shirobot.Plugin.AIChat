@@ -203,10 +203,11 @@ toolsConfig.ToolUse.Tavily.Enabled = true;
 using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(!registry.HasTools && registry.SystemPrompt == "", "Disabled tools must not advertise capabilities.");
 Console.WriteLine("PASS: TOML template, nested Tavily config, removed legacy entry and tool disable");
 
-// 0 表示不限制：最大输出 token 不发送参数，历史轮数只按 token 预算压缩；模板字段与默认值一致。
+// 模板字段与默认值一致。最大输出 Token 为 0 时不发送该参数。
 Check(config.Default.MaxOutputTokens == 0 && config.Default.OutputTokenLimit() is null && new DefaultSection { MaxOutputTokens = 4096 }.OutputTokenLimit() == 4096,
     "Zero max output tokens must mean no limit.");
-Check(config.History.MaxTurns == 0 && config.History.MaxTokens == 128000 && config.Resources.RecursiveDepth == 3 && config.Resources.MaxFileExcerptChars == 16000
+Check(config.History is { MaxTurns: 0, MaxTokens: 128000, CompactKeepTurns: 32, CompactKeepTokens: 16000 } &&
+    config.Resources.RecursiveDepth == 3 && config.Resources.MaxFileExcerptChars == 16000
     && config.Default.SharedPromptSuffix == DefaultSection.DefaultSharedPromptSuffix, "Template defaults must match the config class.");
 Check(!config.History.CompactPrompt.Contains("长期记忆") && DefaultSection.DefaultSharedPromptSuffix.Contains("完整回答"),
     "History compaction must be called a history summary and group replies may answer in full.");
@@ -249,7 +250,7 @@ using (var client = Client(handler))
 {
     Func<ModelEntry, Task<string>> operation = model => client.ChatAsync(config.Default, model,
         new OpenAiChatRequest { Model = model.Name, Messages = [new OpenAiMessage { Content = "question" }] });
-    var answer = await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, operation, (Action)(() => { }), CancellationToken.None);
+    var answer = await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, operation, CancellationToken.None, false);
     Check(answer == "fallback answer" && handler.Requests.Select(r => r.GetProperty("model").GetString())
         .SequenceEqual(["primary", "primary", "backup"]), "Fallback must run after primary retries.");
 }
@@ -258,7 +259,7 @@ var attempts = 0;
 try
 {
     Func<ModelEntry, Task<string>> fail = _ => { attempts++; throw new InvalidOperationException("failure"); };
-    await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, fail, (Action)(() => { }), CancellationToken.None);
+    await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, fail, CancellationToken.None, false);
     throw new Exception("Expected failure for identical fallback.");
 }
 catch (InvalidOperationException) { Check(attempts == 1, "Same fallback must not retry itself."); }
@@ -267,7 +268,7 @@ attempts = 0;
 try
 {
     Func<ModelEntry, Task<string>> fail = _ => { attempts++; throw new InvalidOperationException("failure"); };
-    await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, fail, (Action)(() => { }), CancellationToken.None);
+    await (Task<string>)Invoke(plugin, "ExecuteTextWithFallbackAsync", primary, fail, CancellationToken.None, false);
     throw new Exception("Expected failure for unregistered fallback.");
 }
 catch (InvalidOperationException) { Check(attempts == 1, "Missing fallback must preserve primary error."); }
@@ -293,7 +294,9 @@ using (var registry = new ChatToolRegistry())
     handler.Respond = body => handler.Requests.Count == 1 ? handler.RespondInitial : Completion("tool answer");
     var answer = await registry.ChatAsync(client, primary, [new OpenAiMessage { Content = "question" }], 1);
     Check(answer == "tool answer" && first.Calls == 2 && second.Calls == 1, "All calls in the permitted round must execute under the shared round limit.");
-    Check(handler.Requests[0].GetProperty("tools").GetArrayLength() == 2 && !handler.Requests[1].TryGetProperty("tools", out _), "Final round must omit tools.");
+    var definitions = handler.Requests[0].GetProperty("tools");
+    Check(definitions.GetArrayLength() == 2 && handler.Requests[1].GetProperty("tools").GetRawText() == definitions.GetRawText() &&
+        handler.Requests[1].GetProperty("tool_choice").GetString() == "none", "Final round must disable calls while preserving tool definitions.");
     var assistantWithTools = handler.Requests[1].GetProperty("messages").EnumerateArray().Single(m => m.GetProperty("role").GetString() == "assistant");
     Check(assistantWithTools.GetProperty("reasoning_content").GetString() == "private reasoning payload" && !answer.Contains("private reasoning payload"),
         "JSON tool response reasoning must pass back unchanged without entering visible reply.");
@@ -301,45 +304,82 @@ using (var registry = new ChatToolRegistry())
     Check(results.Length == 4 && results[2].GetProperty("content").GetString() == "first result" && results[3].GetProperty("content").GetString()!.Contains("Unknown"), "Repeated calls in the same round must execute, and unknown calls still need matching tool replies.");
     Check(toolLog.Lines.Count(l => l.Contains("ToolUse 开始")) == 3 && toolLog.Lines.Count(l => l.Contains("ToolUse 完成")) == 3 &&
         toolLog.Lines.Count(l => l.Contains("ToolUse 拒绝")) == 1, "Every executed and rejected tool call must be logged independently.");
+
+    handler.Requests.Clear();
+    handler.Status = _ => handler.Requests.Count == 2 ? HttpStatusCode.BadRequest : HttpStatusCode.OK;
+    handler.Respond = _ => handler.Requests.Count switch
+    {
+        1 => handler.RespondInitial,
+        2 => """{"error":{"message":"Unsupported parameter: tool_choice"}}""",
+        _ => Completion("compatible answer")
+    };
+    answer = await registry.ChatAsync(client, primary, [new OpenAiMessage { Content = "question" }], 1);
+    Check(answer == "compatible answer" && first.Calls == 4 && second.Calls == 2 && handler.Requests.Count == 3 &&
+        handler.Requests[1].GetProperty("messages").GetRawText() == handler.Requests[2].GetProperty("messages").GetRawText() &&
+        !handler.Requests[2].TryGetProperty("tools", out _) && !handler.Requests[2].TryGetProperty("tool_choice", out _),
+        "An endpoint rejecting tool_choice must receive the same transcript without tools and without rerunning tools.");
 }
 using (var tool = new TavilySearchTool(new TavilySection(), ""))
     Check((await tool.ExecuteAsync("{\"query\":42}")).Contains("invalid"), "Non-string query must return a validation error.");
 Console.WriteLine("PASS: shared tool round limit, repeated calls, unknown tools, final answer and argument validation");
 
+var compactor = Model("compactor");
+config.Models.Add(compactor);
+config.History.CompactModel = "compactor";
+config.Default.FallbackModel = "backup";
 handler = new StubHandler(_ => Completion("custom summary"));
+handler.Status = _ => handler.Requests.Count < 4 ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK;
 using (var client = Client(handler))
 {
     config.History.MaxTurns = 4;
     config.History.CompactPrompt = "custom compact prompt";
     Set(plugin, "_openAi", client);
-    Set(plugin, "_conversations", new ConversationStore(Path.GetTempPath(), false, 4));
+    Set(plugin, "_conversations", new ConversationStore(Path.GetTempPath(), false));
     var state = new ConversationState(new ConversationKey("test-instance", ChatScene.Friend, "1", "1"));
     for (var i = 0; i < 8; i++) state.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart($"turn {i}")], i));
+    state.Turns.Insert(2, new ChatTurn("assistant", [new TextPart("old image")], 1));
+    state.Turns.Add(new ChatTurn("assistant", [new TextPart("latest image")], 8));
     state.Summary = "old memory";
-    await (Task)Invoke(plugin, "TryCompactConversationAsync", state, primary);
+    await (Task)Invoke(plugin, "TryCompactConversationAsync", state, primary, CancellationToken.None);
     var compactMessages = handler.Requests[0].GetProperty("messages");
+    Check(handler.Requests.Select(r => r.GetProperty("model").GetString()).SequenceEqual(["compactor", "compactor", "backup", "backup"]) &&
+        handler.Requests.All(r => r.GetProperty("messages").GetRawText() == compactMessages.GetRawText()),
+        "HTTP 503 compaction failures must retry the configured compactor and fallback using the same transcript.");
     Check(compactMessages[0].GetProperty("content").GetString() == "custom compact prompt", "Compact must send configured system prompt.");
     var compactInput = compactMessages[1].GetProperty("content").GetString()!;
     Check(compactMessages.GetArrayLength() == 2 && compactInput.Contains("old memory") && compactInput.Contains("用户: turn 0") &&
-        compactInput.Contains("机器人: turn 3") && !compactInput.Contains("turn 4"), "Compact must merge the previous memory with only the evicted transcript.");
-    Check(state.Summary == "custom summary" && state.Turns.Count == 4 && state.Turns[0].Parts.OfType<TextPart>().Single().Text == "turn 4",
-        "Compact must store the merged memory separately and keep the newest turns verbatim.");
+        compactInput.Contains("机器人: old image") && compactInput.Contains("机器人: turn 5") &&
+        !compactInput.Contains("turn 6") && !compactInput.Contains("latest image"),
+        "Compact must merge only the older transcript with the previous summary, even with an odd message count.");
+    Check(state.Summary == "custom summary" && state.Turns.Select(t => t.Role).SequenceEqual(["user", "assistant", "assistant"]) &&
+        state.Turns[0].Parts.OfType<TextPart>().Single().Text == "turn 6" &&
+        state.Turns[^1].Parts.OfType<TextPart>().Single().Text == "latest image",
+        "Compact must keep the latest user turn, its reply and its additional image notice together.");
 
     // 只有 2 轮但 token 超过预算的 75% 时也要压缩，且至少保留最近一对。
     config.History.MaxTokens = 1000;
     var big = new ConversationState(new ConversationKey("test-instance", ChatScene.Friend, "1", "2"));
     for (var i = 0; i < 4; i++) big.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart(new string('字', 300))], i));
-    await (Task)Invoke(plugin, "TryCompactConversationAsync", big, primary);
+    await (Task)Invoke(plugin, "TryCompactConversationAsync", big, primary, CancellationToken.None);
     Check(big.Turns.Count == 2 && big.Summary == "custom summary", "Token pressure must compact even below the turn threshold.");
 
-    var history = Enumerable.Range(0, 6).Select(i => new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart(new string('字', 300))], i)).ToList();
-    Invoke(plugin, "TrimHistoryToTokenBudget", "system", history, new ChatTurn("user", [new TextPart("hi")], 9));
-    Check(history.Count == 2 && history[0].Role == "user", "Request history must drop the oldest pairs until it fits history.max_tokens.");
-    config.History.MaxTokens = 16000;
+    config.History.MaxTurns = 0;
+    config.History.MaxTokens = 256000;
+    var longChat = new ConversationState(new ConversationKey("test-instance", ChatScene.Group, "long", "0"));
+    for (var i = 0; i < 200; i++)
+        longChat.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart(new string('字', 1000))], i));
+    var expectedRecent = longChat.Turns.TakeLast(14).ToArray();
+    Check(await (Task<bool>)Invoke(plugin, "TryCompactConversationAsync", longChat, primary, CancellationToken.None) &&
+        longChat.Turns.SequenceEqual(expectedRecent), "A 256K history budget must compact down to at most 16K recent tokens at complete turn boundaries.");
+    var compactRequests = handler.Requests.Count;
+    for (var i = 0; i < 4; i++)
+        longChat.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart(new string('字', 16000))], 200 + i));
+    Check(!await (Task<bool>)Invoke(plugin, "TryCompactConversationAsync", longChat, primary, CancellationToken.None) &&
+        handler.Requests.Count == compactRequests, "Two large rounds after compaction must leave substantial room before the next summary request.");
 }
 {
     var root = Path.Combine(Path.GetTempPath(), "aichat-memory-" + Guid.NewGuid().ToString("N"));
-    var store = new ConversationStore(root, true, 20);
+    var store = new ConversationStore(root, true);
     var key = new ConversationKey("test-instance", ChatScene.Friend, "1", "1");
     var state = await store.AcquireAsync(key);
     state.Summary = "人物：小明";
@@ -368,10 +408,9 @@ using (var client = Client(handler))
     store.Release(legacyKey);
     Directory.Delete(root, true);
 }
-Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, request token budget, persistence, clear and legacy migration");
+Console.WriteLine("PASS: compaction fallback and retries, token-triggered compact, persistence, clear and legacy migration");
 
-// The full oldest pair must reach compaction before storage trimming, including
-// an oversized history from an earlier version. Failure must preserve recent turns.
+// Compaction works with oversized legacy histories. Failure preserves the complete transcript.
 {
     var root = Path.Combine(Path.GetTempPath(), "aichat-compact-cap-" + Guid.NewGuid().ToString("N"));
     Directory.CreateDirectory(root);
@@ -380,9 +419,10 @@ Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, 
         var capConfig = new PluginConfig();
         capConfig.History.MaxTurns = 0;
         capConfig.History.MaxTokens = 2_560_000;
+        capConfig.Default.RetryOnTimeoutDelayMs = 100;
         var capPlugin = new AiChatPlugin();
         Set(capPlugin, "_config", capConfig);
-        var capStore = new ConversationStore(root, true, 0);
+        var capStore = new ConversationStore(root, true);
         Set(capPlugin, "_conversations", capStore);
         var capKey = new ConversationKey("cap", ChatScene.Group, "test", "u");
         var capState = new ConversationState(capKey) { Summary = "existing summary" };
@@ -398,22 +438,26 @@ Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, 
             var stateForCompact = capState;
             await capStore.AppendTurnsAsync(capState, new ChatTurn("user", [new TextPart("latest user")], 2002),
                 new ChatTurn("assistant", [new TextPart("latest answer")], 2003),
-                () => (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", stateForCompact, primary));
+                () => (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", stateForCompact, primary, CancellationToken.None));
             var input = summaryHandler.Requests.Single().GetProperty("messages")[1].GetProperty("content").GetString()!;
-            Check(input.Contains("original 0") && input.Contains("original 1003") && !input.Contains("latest user"),
-                "Compact must see the oldest transcript and keep the newest pair out of the summary request.");
-            Check(capState.Summary == "merged summary" && capState.Turns.Count == 1000 &&
-                capState.Turns[^1].Parts.OfType<TextPart>().Single().Text == "latest answer", "Safety compact must keep a bounded recent half and the current answer.");
+            Check(input.Contains("original 0") && input.Contains("original 1939") && !input.Contains("original 1940") && !input.Contains("latest user"),
+                "Compact must send the entire older transcript and leave the most recent 32 rounds intact.");
+            Check(capState.Summary == "merged summary" && capState.Turns.Count == 64 &&
+                capState.Turns[^1].Parts.OfType<TextPart>().Single().Text == "latest answer",
+                "Turn-triggered compaction must honor the recent-round target and keep the current answer.");
         }
         capStore.Release(capKey);
         var reloaded = await capStore.AcquireAsync(capKey);
-        Check(reloaded.Summary == "merged summary" && reloaded.Turns.Count == 1000 &&
+        Check(reloaded.Summary == "merged summary" && reloaded.Turns.Count == 64 &&
             reloaded.Turns.Count(t => t.Parts.OfType<TextPart>().Any(p => p.Text == "latest answer")) == 1,
             "A compacted append must persist the summary and latest pair exactly once.");
         capStore.Release(capKey);
 
-        var failed = new ConversationState(new ConversationKey("cap", ChatScene.Group, "failed", "u")) { Summary = "old summary" };
+        var failedKey = new ConversationKey("cap", ChatScene.Group, "failed", "u");
+        var failed = await capStore.AcquireAsync(failedKey);
+        failed.Summary = "old summary";
         for (int i = 0; i < 2000; i++) failed.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart("failed " + i)], i));
+        await capStore.RewriteAsync(failed);
         var failureHandler = new StubHandler(_ => Completion("unused"))
             { Respond = _ => throw new HttpRequestException("fixture unavailable") };
         using (var failureClient = Client(failureHandler))
@@ -421,10 +465,15 @@ Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, 
             Set(capPlugin, "_openAi", failureClient);
             await capStore.AppendTurnsAsync(failed, new ChatTurn("user", [new TextPart("kept user")], 2000),
                 new ChatTurn("assistant", [new TextPart("kept answer")], 2001),
-                () => (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", failed, primary));
+                () => (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", failed, primary, CancellationToken.None));
         }
-        Check(failed.Summary == "old summary" && failed.Turns.Count == 2000 && failed.Turns[^1].Parts.OfType<TextPart>().Single().Text == "kept answer",
-            "Failed summaries must retain the previous summary, latest pair and bounded storage.");
+        capStore.Release(failedKey);
+        failed = await capStore.AcquireAsync(failedKey);
+        Check(failed.Summary == "old summary" && failed.Turns.Count == 2002 &&
+            failed.Turns[0].Parts.OfType<TextPart>().Single().Text == "failed 0" &&
+            failed.Turns[^1].Parts.OfType<TextPart>().Single().Text == "kept answer",
+            "Failed summaries must keep the oldest and newest turns on disk with the previous summary.");
+        capStore.Release(failedKey);
 
         var canceled = new ConversationState(new ConversationKey("cap", ChatScene.Group, "canceled", "u"));
         try
@@ -436,7 +485,7 @@ Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, 
         }
         catch (OperationCanceledException) { }
         var persistedCanceled = await capStore.AcquireAsync(canceled.Key);
-        Check(persistedCanceled.Turns.Count == 2, "A canceled pre-trim callback must still save an already delivered pair.");
+        Check(persistedCanceled.Turns.Count == 2, "Canceled compaction must still save an already delivered pair.");
         capStore.Release(canceled.Key);
 
         var failingPath = Path.Combine(root, "data", "conversations", failed.Key.ToFileSafeString() + ".jsonl");
@@ -446,13 +495,14 @@ Console.WriteLine("PASS: incremental long-term memory, token-triggered compact, 
         using (var writingClient = Client(new StubHandler(_ => Completion("must not replace old summary"))))
         {
             Set(capPlugin, "_openAi", writingClient);
-            Check(!await (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", failed, primary), "Write failure must report unsuccessful compaction.");
+            Check(!await (Task<bool>)Invoke(capPlugin, "TryCompactConversationAsync", failed, primary, CancellationToken.None),
+                "Write failure must report unsuccessful compaction.");
         }
         Check(failed.Summary == "old summary" && failed.Turns.SequenceEqual(snapshot) && originalFile.AsSpan().SequenceEqual(File.ReadAllBytes(failingPath)),
             "A summary write failure must leave both original history and summary intact.");
     }
     finally { Directory.Delete(root, recursive: true); }
-    Console.WriteLine("PASS: safety-cap compaction precedes trimming; full legacy transcripts, persisted pairs, summary failure, cancellation and write failure");
+    Console.WriteLine("PASS: full legacy transcripts, persisted pairs, summary failure, cancellation and write failure");
 }
 
 var messageContext = DispatchProxy.Create<IMessageContext, TestProxy>();
@@ -702,6 +752,7 @@ sealed class StubHandler : HttpMessageHandler
     public List<JsonElement> Requests { get; } = [];
     public string RespondInitial { get; }
     public Func<JsonElement, string> Respond { get; set; }
+    public Func<JsonElement, HttpStatusCode> Status { get; set; } = _ => HttpStatusCode.OK;
     public StubHandler(Func<JsonElement, string> respond)
     {
         Respond = respond;
@@ -712,7 +763,7 @@ sealed class StubHandler : HttpMessageHandler
     {
         using var doc = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
         Requests.Add(doc.RootElement.Clone());
-        return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(Respond(doc.RootElement), Encoding.UTF8, "application/json") };
+        return new HttpResponseMessage(Status(doc.RootElement)) { Content = new StringContent(Respond(doc.RootElement), Encoding.UTF8, "application/json") };
     }
 }
 sealed class FakeTool(string name) : IChatTool

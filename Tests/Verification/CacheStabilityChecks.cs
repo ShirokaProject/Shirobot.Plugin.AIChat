@@ -25,15 +25,19 @@ internal static class CacheStabilityChecks
     private sealed class Upstream : HttpMessageHandler
     {
         public List<JsonDocument> Requests { get; } = [];
+        public Func<JsonElement, (HttpStatusCode Status, string Text)> Reply { get; set; } = _ => (HttpStatusCode.OK, "好的");
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
-            Requests.Add(JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct)));
-            return new HttpResponseMessage(HttpStatusCode.OK)
+            var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
+            Requests.Add(body);
+            var (status, text) = Reply(body.RootElement);
+            var response = JsonSerializer.Serialize(new
             {
-                Content = new StringContent("""{"choices":[{"index":0,"message":{"role":"assistant","content":"好的"}}],"usage":{"prompt_tokens":10,"completion_tokens":1}}""",
-                    Encoding.UTF8, "application/json")
-            };
+                choices = new[] { new { index = 0, message = new { role = "assistant", content = text } } },
+                usage = new { prompt_tokens = 10, completion_tokens = 1 }
+            });
+            return new HttpResponseMessage(status) { Content = new StringContent(response, Encoding.UTF8, "application/json") };
         }
     }
 
@@ -147,6 +151,39 @@ internal static class CacheStabilityChecks
             Check(!System(first).Contains("当前没有可用历史图片") && LastUser(first).Contains("当前没有可用历史图片"),
                 "The history image catalog must be sent with the current user message, not in the system prompt.");
             Console.WriteLine("PASS: system prompt and tool definitions stay identical across speakers, memory changes and proactive replies");
+
+            settings.History.MaxTokens = 1000;
+            settings.Default.RetryOnTimeoutMaxAttempts = 2;
+            settings.Default.RetryOnTimeoutDelayMs = 100;
+            var store = (ConversationStore)typeof(AiChatPlugin).GetField("_conversations", Flags)!.GetValue(plugin)!;
+            var history = await store.AcquireAsync(sharedKey);
+            var fileExcerpt = new string('文', 1600) + "文件末尾";
+            try
+            {
+                history.Turns.InsertRange(0,
+                [
+                    new ChatTurn("user", [new FileTextPart("old.txt", 4800, fileExcerpt, false)], 1),
+                    new ChatTurn("assistant", [new TextPart("old answer")], 2)
+                ]);
+                await store.RewriteAsync(history, throwOnFailure: true);
+            }
+            finally { store.Release(sharedKey); }
+
+            var attempts = 0;
+            upstream.Reply = request => request.TryGetProperty("tools", out _)
+                ? (HttpStatusCode.OK, ++attempts == 1 ? "" : "好的")
+                : (HttpStatusCode.BadRequest, "");
+            await Send("m4", "alice", "继续");
+            await Send("m5", "bob", "再继续");
+            var chatRequests = upstream.Requests.Skip(3)
+                .Where(request => request.RootElement.TryGetProperty("tools", out _))
+                .Select(request => request.RootElement.GetProperty("messages")).ToArray();
+            Check(chatRequests.Length == 3 && chatRequests[0].GetRawText() == chatRequests[1].GetRawText(),
+                "Empty chat responses must retry with byte-identical history after compaction fails.");
+            Check(chatRequests[0][1].GetRawText() == chatRequests[2][1].GetRawText() &&
+                chatRequests[2][1].GetProperty("content").EnumerateArray().Any(part => part.GetProperty("text").GetString()!.Contains(fileExcerpt)),
+                "Over-budget chat must keep the oldest user message and its complete excerpt across successive requests.");
+            Console.WriteLine("PASS: failed compaction preserves over-budget history and identical retry payloads, including old file excerpts");
         }
         finally
         {

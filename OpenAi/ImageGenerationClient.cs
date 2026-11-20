@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -45,96 +46,138 @@ internal static class ImageGenerationClient
     }
 
     internal static async Task<byte[]> GenerateAsync(string baseUrl, string key, string model, string prompt,
-        ImageGenerationSection config, string proxy, CancellationToken ct, IReadOnlyList<ImageGenerationInput>? images = null, HttpMessageHandler? handler = null)
+        ImageGenerationSection config, string proxy, CancellationToken ct, IReadOnlyList<ImageGenerationInput>? images = null,
+        HttpMessageHandler? handler = null, int maxAttempts = DefaultSection.DefaultRetryAttempts,
+        int retryDelayMs = DefaultSection.DefaultRetryDelayMs)
     {
         ValidateOptions(config);
+        maxAttempts = Math.Clamp(maxAttempts, 1, 5);
+        retryDelayMs = Math.Clamp(retryDelayMs, 100, 10_000);
         using var http = new HttpClient(handler ?? HttpProxy.CreateHandler(proxy)) { Timeout = Timeout.InfiniteTimeSpan };
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.TimeoutSeconds, 30, 1800)));
+        var attemptTimeout = TimeSpan.FromSeconds(Math.Clamp(config.TimeoutSeconds, 30, 1800));
         var omitted = new HashSet<string>(StringComparer.Ordinal);
         var repaired = new HashSet<string>(StringComparer.Ordinal);
         var size = config.Size;
         var quality = config.Quality;
-        for (var attempt = 0; ; attempt++)
+
+        HttpRequestMessage CreateRequest()
         {
-        timeout.Token.ThrowIfCancellationRequested();
-        using var request = new HttpRequestMessage(HttpMethod.Post, baseUrl.TrimEnd('/') + (images is { Count: > 0 } ? "/images/edits" : "/images/generations"));
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
-        if (images is { Count: > 0 })
-        {
-            var multipart = new MultipartFormDataContent();
-            void AddField(string value, string name) { if (!omitted.Contains(name)) multipart.Add(new StringContent(value), name); }
-            AddField(model, "model"); AddField(prompt, "prompt");
-            AddField("1", "n"); AddField(size, "size");
-            AddField(quality, "quality");
-            AddField(config.Background, "background");
-            AddField(config.OutputFormat, "output_format");
-            if (config.OutputFormat is "jpeg" or "webp")
-                AddField(config.OutputCompression.ToString(System.Globalization.CultureInfo.InvariantCulture), "output_compression");
-            if (config.OutputFormat == "gif")
+            var request = new HttpRequestMessage(HttpMethod.Post, baseUrl.TrimEnd('/') + (images is { Count: > 0 } ? "/images/edits" : "/images/generations"));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+            if (images is { Count: > 0 })
             {
-                AddField(config.FrameCount.ToString(System.Globalization.CultureInfo.InvariantCulture), "frame_count");
-                AddField(config.FrameDurationMs.ToString(System.Globalization.CultureInfo.InvariantCulture), "frame_duration_ms");
-            }
-            foreach (var (image, index) in images.Select((image, index) => (image, index)))
-            {
-                var content = new ByteArrayContent(image.Bytes);
-                content.Headers.ContentType = new MediaTypeHeaderValue(image.Mime);
-                var ext = image.Mime == "image/jpeg" ? "jpg" : image.Mime == "image/webp" ? "webp" : image.Mime == "image/gif" ? "gif" : "png";
-                multipart.Add(content, "image[]", $"reference-{index}.{ext}");
-            }
-            request.Content = multipart;
-        }
-        else
-        {
-            var body = new System.Text.Json.Nodes.JsonObject
-            {
-                ["model"] = model, ["prompt"] = prompt, ["n"] = 1,
-                ["size"] = size, ["quality"] = quality,
-                ["background"] = config.Background, ["output_format"] = config.OutputFormat
-            };
-            if (config.OutputFormat is "jpeg" or "webp") body["output_compression"] = config.OutputCompression;
-            if (config.OutputFormat == "gif") { body["frame_count"] = config.FrameCount; body["frame_duration_ms"] = config.FrameDurationMs; }
-            foreach (var name in omitted) body.Remove(name);
-            request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-        }
-        using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-        {
-            if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
-            {
-                var error = await ReadErrorAsync(response.Content, timeout.Token).ConfigureAwait(false);
-                if (attempt < 2 && images is { Count: > 0 } && !repaired.Contains("gif_input") &&
-                    error.Code is "invalid_image_file" or "invalid_image_format" or "unsupported_image_format" &&
-                    images.Any(image => image.Mime == "image/gif"))
+                var multipart = new MultipartFormDataContent();
+                void AddField(string value, string name) { if (!omitted.Contains(name)) multipart.Add(new StringContent(value), name); }
+                AddField(model, "model"); AddField(prompt, "prompt");
+                AddField("1", "n"); AddField(size, "size");
+                AddField(quality, "quality");
+                AddField(config.Background, "background");
+                AddField(config.OutputFormat, "output_format");
+                if (config.OutputFormat is "jpeg" or "webp")
+                    AddField(config.OutputCompression.ToString(System.Globalization.CultureInfo.InvariantCulture), "output_compression");
+                if (config.OutputFormat == "gif")
                 {
-                    try
+                    AddField(config.FrameCount.ToString(System.Globalization.CultureInfo.InvariantCulture), "frame_count");
+                    AddField(config.FrameDurationMs.ToString(System.Globalization.CultureInfo.InvariantCulture), "frame_duration_ms");
+                }
+                foreach (var (image, index) in images.Select((image, index) => (image, index)))
+                {
+                    var content = new ByteArrayContent(image.Bytes);
+                    content.Headers.ContentType = new MediaTypeHeaderValue(image.Mime);
+                    var ext = image.Mime == "image/jpeg" ? "jpg" : image.Mime == "image/webp" ? "webp" : image.Mime == "image/gif" ? "gif" : "png";
+                    multipart.Add(content, "image[]", $"reference-{index}.{ext}");
+                }
+                request.Content = multipart;
+            }
+            else
+            {
+                var body = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["model"] = model, ["prompt"] = prompt, ["n"] = 1,
+                    ["size"] = size, ["quality"] = quality,
+                    ["background"] = config.Background, ["output_format"] = config.OutputFormat
+                };
+                if (config.OutputFormat is "jpeg" or "webp") body["output_compression"] = config.OutputCompression;
+                if (config.OutputFormat == "gif") { body["frame_count"] = config.FrameCount; body["frame_duration_ms"] = config.FrameDurationMs; }
+                foreach (var name in omitted) body.Remove(name);
+                request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+            }
+
+            return request;
+        }
+
+        for (var attempt = 1; ; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var canRetry = attempt < maxAttempts;
+            string reason;
+            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                timeout.CancelAfter(attemptTimeout);
+                try
+                {
+                    using var request = CreateRequest();
+                    using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+                    if (response.IsSuccessStatusCode)
+                        return await ReadImageAsync(response, timeout.Token).ConfigureAwait(false);
+
+                    if (response.StatusCode == HttpStatusCode.BadRequest)
                     {
-                        images = images.Select(image => image.Mime == "image/gif" ? ReferenceImage.ToPng(image.Bytes) : image).ToArray();
+                        var error = await ReadErrorAsync(response.Content, timeout.Token).ConfigureAwait(false);
+                        if (canRetry && images is { Count: > 0 } && !repaired.Contains("gif_input") &&
+                            error.Code is "invalid_image_file" or "invalid_image_format" or "unsupported_image_format" &&
+                            images.Any(image => image.Mime == "image/gif"))
+                        {
+                            try
+                            {
+                                images = images.Select(image => image.Mime == "image/gif" ? ReferenceImage.ToPng(image.Bytes) : image).ToArray();
+                            }
+                            catch (ArgumentException ex) { throw new ImageGenerationException(ex.Message); }
+                            repaired.Add("gif_input");
+                            reason = "HTTP 400，GIF 参考图转为首帧 PNG";
+                        }
+                        else if (canRetry && TryRepair(error, config, omitted, repaired, ref size, ref quality))
+                        {
+                            reason = "HTTP 400，兼容参数";
+                        }
+                        else
+                        {
+                            if (config.OutputFormat == "gif" && (error.Message.Contains("gif", StringComparison.OrdinalIgnoreCase) || error.Param == "output_format") &&
+                                new[] { "not enabled", "not supported", "not available", "unsupported", "preview" }.Any(marker => error.Message.Contains(marker, StringComparison.OrdinalIgnoreCase)))
+                                throw new ImageGenerationException("当前生图接口或模型未开放 GIF 输出，请更换已支持GIF的接口/模型，或选择静态图片格式。");
+                            throw new ImageGenerationException("生图接口返回 HTTP 400，请检查内容、模型和所选参数。");
+                        }
                     }
-                    catch (ArgumentException ex) { throw new ImageGenerationException(ex.Message); }
-                    repaired.Add("gif_input");
-                    BotLog.Info("[AiChat] 上游拒绝GIF参考图，转为首帧PNG后静默重试。");
-                    continue;
+                    else if (canRetry && UpstreamHttpException.IsTransientStatusCode(response.StatusCode))
+                    {
+                        reason = $"HTTP {(int)response.StatusCode}";
+                    }
+                    else
+                    {
+                        throw new ImageGenerationException(response.StatusCode switch
+                        {
+                            HttpStatusCode.Forbidden => "生图接口拒绝访问（HTTP 403），请检查 API 密钥所属分组是否已开放生图权限。",
+                            HttpStatusCode.Unauthorized => "生图接口鉴权失败（HTTP 401），请检查服务商密钥。",
+                            _ => $"生图接口返回 HTTP {(int)response.StatusCode}，请检查服务商状态与模型权限。"
+                        });
+                    }
                 }
-                if (attempt < 2 && TryRepair(error, config, omitted, repaired, ref size, ref quality))
+                catch (Exception ex) when (canRetry && !ct.IsCancellationRequested &&
+                    (ex is HttpRequestException or IOException or OperationCanceledException))
                 {
-                    // Never log upstream text, prompts, URLs or credentials.
-                    BotLog.Info($"[AiChat] 生图HTTP 400，静默兼容重试 {attempt + 1}/2。");
-                    continue;
+                    reason = ex is OperationCanceledException ? "请求超时" : ex.GetType().Name;
                 }
-                if (config.OutputFormat == "gif" && (error.Message.Contains("gif", StringComparison.OrdinalIgnoreCase) || error.Param == "output_format") &&
-                    new[] { "not enabled", "not supported", "not available", "unsupported", "preview" }.Any(reason => error.Message.Contains(reason, StringComparison.OrdinalIgnoreCase)))
-                    throw new ImageGenerationException("当前生图接口或模型未开放 GIF 输出，请更换已支持GIF的接口/模型，或选择静态图片格式。");
-                throw new ImageGenerationException(attempt > 0 ? "生图接口返回 HTTP 400，兼容重试后仍失败；请检查模型是否支持所选格式、尺寸及参考图。" : "生图接口返回 HTTP 400，无法自动修正；请检查内容、模型和所选参数。" );
             }
-            throw new ImageGenerationException(response.StatusCode == System.Net.HttpStatusCode.Forbidden
-                ? "生图接口拒绝访问（HTTP 403），请检查 API 密钥所属分组是否已开放生图权限。"
-                : response.StatusCode == System.Net.HttpStatusCode.Unauthorized
-                    ? "生图接口鉴权失败（HTTP 401），请检查服务商密钥。"
-                    : $"生图接口返回 HTTP {(int)response.StatusCode}，请检查服务商状态与模型权限。");
+
+            var delay = retryDelayMs * attempt;
+            BotLog.Info($"[AiChat] 生图请求第 {attempt}/{maxAttempts} 次失败（{reason}），{delay}ms 后重试。");
+            await Task.Delay(delay, ct).ConfigureAwait(false);
         }
-        await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+    }
+
+    private static async Task<byte[]> ReadImageAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         const int maximumResponseBytes = 32_000_000;
         var length = response.Content.Headers.ContentLength;
         if (length > maximumResponseBytes) throw new InvalidOperationException("生图响应超过大小限制。");
@@ -143,7 +186,7 @@ internal static class ImageGenerationClient
         try
         {
             int read;
-            while ((read = await stream.ReadAsync(chunk.AsMemory(0, 16 * 1024), timeout.Token).ConfigureAwait(false)) > 0)
+            while ((read = await stream.ReadAsync(chunk.AsMemory(0, 16 * 1024), ct).ConfigureAwait(false)) > 0)
             {
                 if (buffer.Length + read > maximumResponseBytes) throw new InvalidOperationException("生图响应超过大小限制。");
                 buffer.Write(chunk, 0, read);
@@ -151,7 +194,6 @@ internal static class ImageGenerationClient
         }
         finally { ArrayPool<byte>.Shared.Return(chunk); }
         return DecodeResponse(buffer.GetBuffer().AsSpan(0, checked((int)buffer.Length)));
-        }
     }
 
     internal sealed record UpstreamError(string Param, string Code, string Message);

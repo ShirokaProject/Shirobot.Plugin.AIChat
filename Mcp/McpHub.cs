@@ -134,6 +134,7 @@ internal sealed class McpHub : IAsyncDisposable
         public readonly McpServerEntry Entry = entry;
         public readonly SemaphoreSlim Gate = new(1, 1);
         public McpServerConnection? Connection;
+        public volatile IReadOnlyList<McpToolInfo> LastKnownTools = [];
         public string Status = "连接中";
     }
 
@@ -168,10 +169,12 @@ internal sealed class McpHub : IAsyncDisposable
             server.Connection = null;
             try
             {
-                server.Connection = await McpServerConnection.ConnectAsync(_createTransport(server.Entry), _clientVersion, Timeout, ct).ConfigureAwait(false);
-                server.Status = $"已连接，{server.Connection.Tools.Count} 个工具";
-                BotLog.Info($"[AiChat] MCP 服务 {server.Entry.Name} 已连接，工具: {string.Join(", ", server.Connection.Tools.Select(t => t.Name))}");
-                return server.Connection;
+                var connection = await McpServerConnection.ConnectAsync(_createTransport(server.Entry), _clientVersion, Timeout, ct).ConfigureAwait(false);
+                server.Connection = connection;
+                server.LastKnownTools = connection.Tools;
+                server.Status = $"已连接，{connection.Tools.Count} 个工具";
+                BotLog.Info($"[AiChat] MCP 服务 {server.Entry.Name} 已连接，工具: {string.Join(", ", connection.Tools.Select(t => t.Name))}");
+                return connection;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -183,7 +186,7 @@ internal sealed class McpHub : IAsyncDisposable
         finally { server.Gate.Release(); }
     }
 
-    /// <summary>当前可用的工具；还没连上或连接失败的服务不提供工具。</summary>
+    /// <summary>短暂掉线时保留上次获取的工具定义，调用时再确认服务可用。</summary>
     public IReadOnlyList<(string ToolName, string Server, McpToolInfo Tool)> Tools
     {
         get
@@ -192,9 +195,10 @@ internal sealed class McpHub : IAsyncDisposable
             var used = new HashSet<string>(StringComparer.Ordinal);
             foreach (var server in _servers)
             {
-                if (server.Connection is not { } connection) continue;
+                var tools = server.LastKnownTools;
+                if (tools.Count == 0) continue;
                 var allowed = server.Entry.AllowedTools.Where(t => !string.IsNullOrWhiteSpace(t)).Select(t => t.Trim()).ToHashSet(StringComparer.Ordinal);
-                foreach (var tool in connection.Tools)
+                foreach (var tool in tools)
                 {
                     if (allowed.Count > 0 && !allowed.Contains(tool.Name)) continue;
                     var name = ToolName(server.Entry.Name, tool.Name);
@@ -210,6 +214,8 @@ internal sealed class McpHub : IAsyncDisposable
         var server = _servers.FirstOrDefault(s => s.Entry.Name == serverName) ?? throw new McpException($"MCP 服务 {serverName} 不存在。");
         // 进程意外退出时在调用前重连一次。
         var connection = await EnsureConnectedAsync(server, ct).ConfigureAwait(false) ?? throw new McpException(server.Status);
+        if (!connection.Tools.Any(tool => tool.Name == toolName))
+            throw new McpException($"MCP 服务 {serverName} 已不提供工具 {toolName}。");
         return await connection.CallToolAsync(toolName, arguments, Timeout, Math.Clamp(_config.MaxResultChars, 500, 100_000), ct).ConfigureAwait(false);
     }
 
