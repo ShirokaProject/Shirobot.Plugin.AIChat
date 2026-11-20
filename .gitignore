@@ -19,3 +19,5 @@ dev/mock-requests.jsonl
 dev/*.gcdump
 dev/*.txt
 dev/probe/
+
+.idea/

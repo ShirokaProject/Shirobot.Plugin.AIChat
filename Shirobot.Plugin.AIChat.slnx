@@ -1,0 +1,20 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="DebugPlugin" />
+    <BuildType Name="DebugAdapter" />
+    <BuildType Name="DebugAll" />
+    <BuildType Name="Release" />
+  </Configurations>
+  <Folder Name="/scripts/">
+    <Project Path="scripts/version-check/VersionCheck.csproj" />
+  </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Tests/ContractConsumer/ContractConsumer.csproj">
+      <!-- The consumer imports contracts from the published plugin DLL. -->
+      <Build Project="false" />
+    </Project>
+    <Project Path="Tests/Verification/Verification.csproj" />
+  </Folder>
+  <Project Path="ShiroBot.AiChatPlugin.csproj" />
+</Solution>

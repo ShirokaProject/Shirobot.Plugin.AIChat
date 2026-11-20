@@ -15,7 +15,6 @@ permissions:
   contents: write
 
 env:
-  PROJECT_DIR: .
   PUBLISH_DIR: bin/Release/net11.0/publish
 
 jobs:
@@ -41,7 +40,7 @@ jobs:
           done
 
       - name: Publish
-        run: dotnet publish "$PROJECT_DIR" --configuration Release
+        run: dotnet publish ShiroBot.AiChatPlugin.csproj --configuration Release
 
       - name: Verify exported contracts and isolated consumer
         run: dotnet run --project Tests/ContractConsumer -c Release -- "$PUBLISH_DIR/ShiroBot.AiChatPlugin.dll"
