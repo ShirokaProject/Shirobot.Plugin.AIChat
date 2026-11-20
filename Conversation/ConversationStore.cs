@@ -18,6 +18,8 @@ internal sealed class ConversationStore
     private const string LegacySummaryPrefix = "[对话摘要] ";
 
     private readonly ConcurrentDictionary<ConversationKey, SemaphoreSlim> _locks = new();
+    /// <summary>只保护 metadata 文件的读改写，持有时间极短，与会话锁无关。</summary>
+    private readonly Lock _metadataGate = new();
     private readonly string _conversationsDir;
     private readonly bool _persist;
     private readonly JsonSerializerOptions _jsonOptions;
@@ -93,21 +95,46 @@ internal sealed class ConversationStore
     /// <summary>
     /// 保存共享会话的 metadata（SharedPrompt/SharedModel）到磁盘。
     /// </summary>
+    /// <summary>只读取 metadata（共享模型、共享提示词、清空时间），不加载历史，也不占会话锁。</summary>
+    public ConversationState LoadMetadata(ConversationKey key)
+    {
+        var state = new ConversationState(key);
+        if (_persist)
+            lock (_metadataGate) LoadMetadataFromDisk(state);
+        return state;
+    }
+
+    /// <summary>
+    /// 保存共享模型和共享提示词。清空时间以磁盘上的为准，避免拿着旧状态覆盖期间发生的 #clear。
+    /// </summary>
     public void SaveMetadata(ConversationState state)
     {
         if (!_persist) return;
+        lock (_metadataGate)
+        {
+            var current = new ConversationState(state.Key);
+            LoadMetadataFromDisk(current);
+            WriteMetadata(state.Key, state.SharedPrompt, state.SharedModel, current.ClearedAt);
+        }
+    }
 
-        var path = GetMetadataFile(state.Key);
+    private void WriteMetadata(ConversationKey key, string? sharedPrompt, string? sharedModel, long? clearedAt)
+    {
+
+        var path = GetMetadataFile(key);
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             var meta = new ConversationMetadata
             {
-                SharedPrompt = state.SharedPrompt,
-                SharedModel = state.SharedModel
+                SharedPrompt = sharedPrompt,
+                SharedModel = sharedModel,
+                ClearedAt = clearedAt
             };
             var json = PluginJson.Serialize(meta, _jsonOptions);
-            File.WriteAllText(path, json, Encoding.UTF8);
+            var temporary = path + ".tmp";
+            File.WriteAllText(temporary, json, Encoding.UTF8);
+            File.Move(temporary, path, overwrite: true);
         }
         catch (Exception ex)
         {
@@ -115,13 +142,13 @@ internal sealed class ConversationStore
         }
     }
 
-    public void Clear(ConversationKey key)
+    /// <summary>清空对话历史并记下清空时间；metadata（SharedModel/SharedPrompt）保留。</summary>
+    public void Clear(ConversationKey key, DateTimeOffset clearedAt)
     {
         if (!_persist) return;
 
         try
         {
-            // 只清对话历史，不清 metadata（SharedModel/SharedPrompt）
             var path = GetConversationFile(key);
             if (File.Exists(path)) File.Delete(path);
         }
@@ -129,6 +156,21 @@ internal sealed class ConversationStore
         {
             BotLog.Warning($"[AiChat] 清理会话文件失败: {ex.Message}");
         }
+
+        // 记下清空时间，之后附带群聊上下文时不再带上清空之前的消息。
+        lock (_metadataGate)
+        {
+            var state = new ConversationState(key);
+            LoadMetadataFromDisk(state);
+            WriteMetadata(key, state.SharedPrompt, state.SharedModel, clearedAt.ToUnixTimeMilliseconds());
+        }
+    }
+
+    /// <summary>最近一次 #clear 的时间；没有清空过时返回 null。</summary>
+    public DateTimeOffset? GetClearedAt(ConversationKey key)
+    {
+        var state = LoadMetadata(key);
+        return state.ClearedAt is { } ms ? DateTimeOffset.FromUnixTimeMilliseconds(ms) : null;
     }
 
     /// <summary>
@@ -179,6 +221,9 @@ internal sealed class ConversationStore
         }
     }
 
+    /// <summary>比较两次读取的历史是否同一条消息：按落盘格式序列化。</summary>
+    internal string Fingerprint(ChatTurn turn) => PluginJson.Serialize(turn, _jsonOptions);
+
     private static ChatTurn StripTransientPayloads(ChatTurn turn)
     {
         var hasTransient = false;
@@ -204,6 +249,17 @@ internal sealed class ConversationStore
         return turn with { Parts = stripped };
     }
 
+    /// <summary>旧版本记录的“[生成图片：…]”读取时换成程序记录格式，避免模型模仿这段文字代替工具调用。</summary>
+    internal static ChatTurn UpgradeGeneratedImageRecord(ChatTurn turn)
+    {
+        if (turn.Role != "assistant" || turn.Parts is not [TextPart { Text: var text }, ..] ||
+            !text.StartsWith(ImagePart.LegacyGeneratedPrefix, StringComparison.Ordinal) || !turn.Parts.Any(p => p is ImagePart))
+            return turn;
+        var prompt = text[ImagePart.LegacyGeneratedPrefix.Length..];
+        if (prompt.EndsWith(']')) prompt = prompt[..^1];
+        return turn with { Parts = [new TextPart(ImagePart.GeneratedRecord(prompt)), .. turn.Parts.Skip(1)] };
+    }
+
     private void LoadTurnsFromDisk(ConversationState state)
     {
         var path = GetConversationFile(state.Key);
@@ -226,7 +282,7 @@ internal sealed class ConversationStore
                         state.MemorySnapshot = PluginJson.Deserialize<List<Memory.MemoryEntry>>(
                             string.Concat(turn.Parts.OfType<TextPart>().Select(p => p.Text))) ?? [];
                     else
-                        state.Turns.Add(turn);
+                        state.Turns.Add(UpgradeGeneratedImageRecord(turn));
                 }
                 catch (JsonException ex)
                 {
@@ -261,6 +317,7 @@ internal sealed class ConversationStore
             {
                 state.SharedPrompt = meta.SharedPrompt;
                 state.SharedModel = meta.SharedModel;
+                state.ClearedAt = meta.ClearedAt;
             }
         }
         catch (Exception ex)
@@ -307,4 +364,5 @@ internal sealed class ConversationMetadata
 {
     public string? SharedPrompt { get; set; }
     public string? SharedModel { get; set; }
+    public long? ClearedAt { get; set; }
 }

@@ -28,6 +28,15 @@ public sealed record ImagePart(
     [property: JsonIgnore] byte[]? InlineBytes = null) : ChatPart
 {
     internal const string HistoryPlaceholder = "[图片；需要发送的内容附在本次请求末尾。]";
+
+    /// <summary>
+    /// 生图完成后写进历史的说明。工具调用本身不进历史，只写“生成图片：提示词”时，
+    /// 模型会以为输出这段文字就能出图，转而模仿它而不调用 imagegen。
+    /// </summary>
+    internal const string GeneratedRecordPrefix = "[程序记录：imagegen 工具已生成并单独发送这张图片，不是你在回复里写的文字；提示词：";
+    internal const string LegacyGeneratedPrefix = "[生成图片：";
+
+    internal static string GeneratedRecord(string prompt) => GeneratedRecordPrefix + prompt + "]";
 }
 
 /// <summary>文本类文件的截断后正文。</summary>

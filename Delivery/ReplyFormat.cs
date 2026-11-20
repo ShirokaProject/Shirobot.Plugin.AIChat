@@ -6,7 +6,7 @@ internal enum ReplyMode { Answer, Chat }
 
 /// <summary>
 /// 模型自选的回复模式。模型在首行写 [chat]、[chat+reply] 或 [answer]，正文从下一行开始；
-/// 缺少标记时按解答模式整条发送，保持旧行为。
+/// 缺少标记时，短小的回复按聊天模式分条发送（引用第一条），长内容、列表、代码或网址按解答模式整条发送。
 /// </summary>
 internal sealed record ParsedReply(ReplyMode Mode, bool Quote, string Text, IReadOnlyList<string> Messages)
 {
@@ -55,6 +55,8 @@ internal sealed record ParsedReply(ReplyMode Mode, bool Quote, string Text, IRea
         var text = string.Join('\n', body).Trim();
         if (text.Length == 0) text = raw.Trim();
         if (forceChat && mode != ReplyMode.Chat) quote = false;
+        // 不少模型（DeepSeek、GLM、MiMo 等）经常漏写标记；短小、没有列表或代码的回复按聊天分条发送，第一条照旧引用。
+        else if (mode is null && LooksLikeChat(body)) quote = true;
         else if (mode != ReplyMode.Chat) return new(ReplyMode.Answer, true, text, [text]);
 
         var messages = body.Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
@@ -63,6 +65,20 @@ internal sealed record ParsedReply(ReplyMode Mode, bool Quote, string Text, IRea
             messages = [.. messages.Take(maxMessages - 1), string.Join('\n', messages.Skip(maxMessages - 1))];
         if (messages.Count == 0) messages = [text];
         return new(ReplyMode.Chat, quote, string.Join('\n', messages), messages);
+    }
+
+    private const int UntaggedChatMaxChars = 200;
+    private const int UntaggedChatMaxLines = 4;
+
+    private static bool LooksLikeChat(IReadOnlyList<string> body)
+    {
+        var lines = body.Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
+        if (lines.Count == 0 || lines.Count > UntaggedChatMaxLines) return false;
+        if (lines.Sum(l => l.EnumerateRunes().Count()) > UntaggedChatMaxChars) return false;
+        // 列表、代码、网址说明是在整理资料，保持一条完整发送。
+        return !lines.Any(l => l.StartsWith("```") || l.StartsWith("· ") || l.StartsWith("- ") ||
+            l.Contains("http://", StringComparison.OrdinalIgnoreCase) || l.Contains("https://", StringComparison.OrdinalIgnoreCase) ||
+            l.Length > 2 && char.IsAsciiDigit(l[0]) && (l[1] == '.' || l[1] == '、'));
     }
 
     /// <summary>流式预览内容：解答模式去掉标记后推送；聊天模式或标记尚未写完时返回 null。</summary>

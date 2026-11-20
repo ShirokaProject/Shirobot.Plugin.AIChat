@@ -151,13 +151,13 @@ internal sealed class ProactiveTrigger
     }
 
     /// <summary>最近 count 条群消息；excludeLatest 跳过最新的几条（例如刚记录的这条）。</summary>
-    public string Recent(string groupKey, int count, int excludeLatest = 0)
+    public string Recent(string groupKey, int count, int excludeLatest = 0, DateTimeOffset? after = null)
     {
         lock (_groups)
         {
             if (count <= 0 || !_groups.TryGetValue(groupKey, out var state)) return "";
             var end = Math.Max(0, state.Recent.Count - excludeLatest);
-            return Format(state.Recent.Take(end).Skip(Math.Max(0, end - count)));
+            return Format(state.Recent.Take(end).Skip(Math.Max(0, end - count)).Where(line => after is null || line.At > after));
         }
     }
 
@@ -246,6 +246,12 @@ internal readonly record struct ProactiveDecision(string? Prompt, TimeSpan? Retr
 /// <param name="Abort">依据的消息被撤回时触发，回复发出前取消这次请求。</param>
 internal sealed record ProactiveRequest(string GroupKey, string Context, CancellationToken Abort = default)
 {
+    /// <summary>
+    /// 新消息叫到了机器人（称呼关键词或名字，例如手打的“@名字”）。这时是有人在找它，
+    /// 工具权限和被 @ 时相同；只有没人叫它、它自己插话时才限制会产生动作的工具。
+    /// </summary>
+    public bool Addressed { get; init; }
+
     /// <summary>回复是否已经开始发送（发出后撤回也无法收回）。</summary>
     public bool ReplyStarted { get; set; }
 }

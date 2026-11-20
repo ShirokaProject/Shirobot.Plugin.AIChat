@@ -146,7 +146,8 @@ internal static class McpChecks
             Check((await refused.ExecuteAsync("{}")).Contains("管理员"), "A refused MCP call must explain why without running the tool.");
             admin = true;
             Check(Allowed(), "Admins must be allowed to call MCP tools.");
-            Check(!Allowed(new ProactiveRequest("i:g", "")), "Proactive replies must never call MCP tools.");
+            Check(!Allowed(new ProactiveRequest("i:g", "")) && !Allowed(new ProactiveRequest("i:g", "") { Addressed = true }),
+                "Proactive replies must never call MCP tools, even when the bot is called by name.");
             admin = false;
             config.ToolUse.Mcp.AllowEveryone = true;
             Check(Allowed(), "allow_everyone must allow MCP tools for everyone.");

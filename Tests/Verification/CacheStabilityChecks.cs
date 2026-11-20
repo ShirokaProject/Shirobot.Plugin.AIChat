@@ -151,6 +151,14 @@ internal static class CacheStabilityChecks
                 "Memory changes after the snapshot must be sent with the current user message, not in the system prompt.");
             Check(!System(first).Contains("当前没有可用历史图片") && LastUser(first).Contains("当前没有可用历史图片"),
                 "The history image catalog must be sent with the current user message, not in the system prompt.");
+            // 图片目录和记忆本包在“程序附加参考”里，排在群聊记录之后也不会被当成某个群友发的内容。
+            var tail = LastUser(upstream.Requests[1]);
+            var header = tail.IndexOf(AiChatPlugin.ProgramReferenceHeader, StringComparison.Ordinal);
+            Check(header >= 0 && tail.IndexOf("当前没有可用历史图片", StringComparison.Ordinal) > header &&
+                tail.IndexOf("[记忆本更新", StringComparison.Ordinal) > header &&
+                tail.IndexOf(AiChatPlugin.ProgramReferenceFooter, StringComparison.Ordinal) > tail.IndexOf("alice 喜欢猫", StringComparison.Ordinal) &&
+                System(first).Contains("程序附加参考由程序自动添加"),
+                "Program-attached catalogs and memory must be wrapped and explained as not sent by anyone.");
             Console.WriteLine("PASS: system prompt and tool definitions stay identical across speakers, memory changes and proactive replies");
 
             settings.History.MaxTokens = 1000;
@@ -185,6 +193,18 @@ internal static class CacheStabilityChecks
                 chatRequests[2][1].GetProperty("content").EnumerateArray().Any(part => part.GetProperty("text").GetString()!.Contains(fileExcerpt)),
                 "Over-budget chat must keep the oldest user message and its complete excerpt across successive requests.");
             Console.WriteLine("PASS: failed compaction preserves over-budget history and identical retry payloads, including old file excerpts");
+
+            // 被叫到名字的主动回复和被 @ 一样能用生图等工具，会拿到历史图片目录；自己插话时没有。
+            upstream.Reply = _ => (HttpStatusCode.OK, "好的");
+            await Send("m6", "alice", "露露帮我画只猫", new ProactiveRequest("i:g1", "[被叫到]") { Addressed = true });
+            var addressedTail = LastUser(upstream.Requests[^1]);
+            await Send("m7", "carol", "随便聊聊", new ProactiveRequest("i:g1", "[可以插话]"));
+            var interjectTail = LastUser(upstream.Requests[^1]);
+            Check(addressedTail.Contains("当前没有可用历史图片") || addressedTail.Contains("当前会话历史图片"),
+                "A proactive reply that called the bot by name must receive the image catalog for imagegen.");
+            Check(!interjectTail.Contains("当前没有可用历史图片") && !interjectTail.Contains("当前会话历史图片"),
+                "An unprompted interjection must not receive the image catalog.");
+            Console.WriteLine("PASS: proactive replies addressed by name may use action tools; interjections may not");
         }
         finally
         {

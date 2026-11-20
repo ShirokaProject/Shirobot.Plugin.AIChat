@@ -341,6 +341,60 @@ using (var tool = new TavilySearchTool(new TavilySection(), ""))
     Check((await tool.ExecuteAsync("{\"query\":42}")).Contains("invalid"), "Non-string query must return a validation error.");
 Console.WriteLine("PASS: shared tool round limit, repeated calls, unknown tools, final answer and argument validation");
 
+// 回复声称已执行操作却没调用工具时，纠正一次让模型真正调用；执行过的工具整理成程序记录写进历史。
+{
+    Check(ToolCallRecord.CheckClaims("好，整张画面纯 #ffff00 正黄色已经提交生图排队啦，画好会单独发出来~", new HashSet<string> { "imagegen" }, new HashSet<string>()) is { } fix &&
+        fix.Contains("imagegen"), "An image claim without an imagegen call must ask for a correction.");
+    Check(ToolCallRecord.CheckClaims("已经提交生图排队啦", new HashSet<string> { "imagegen" }, new HashSet<string> { "imagegen" }) is null &&
+        ToolCallRecord.CheckClaims("已经提交生图排队啦", new HashSet<string>(), new HashSet<string>()) is null &&
+        ToolCallRecord.CheckClaims("哈哈这图画得真好看", new HashSet<string> { "imagegen" }, new HashSet<string>()) is null &&
+        ToolCallRecord.CheckClaims("你好呀，今天想聊点什么？", new HashSet<string> { "imagegen", "timer_tool", "memory_note" }, new HashSet<string>()) is null,
+        "Claims must only be checked for available tools that were not called, and ordinary chat must pass.");
+    Check(ToolCallRecord.CheckClaims("好的，明天早上八点的提醒已经设好了", new HashSet<string> { "timer_tool" }, new HashSet<string>()) is not null &&
+        ToolCallRecord.CheckClaims("已经记进记忆本了", new HashSet<string> { "memory_note" }, new HashSet<string>()) is not null,
+        "Timer and memory claims without calls must also be corrected.");
+
+    var claimHandler = new StubHandler(_ => "");
+    claimHandler.Respond = _ => claimHandler.Requests.Count switch
+    {
+        1 => Completion("好，已经提交生图排队啦，画好会单独发出来~"),
+        2 => """{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"g1","type":"function","function":{"name":"imagegen","arguments":"{\"prompt\":\"solid #ffff00 yellow\"}"}}]}}]}""",
+        _ => Completion("这次真的提交啦，画好单独发你~")
+    };
+    var imageFake = new FakeTool("imagegen");
+    using (var claimClient = Client(claimHandler))
+    using (var claimRegistry = new ChatToolRegistry())
+    {
+        claimRegistry.Register(imageFake);
+        var transcript = new List<OpenAiMessage> { new() { Role = "user", Content = "生成一张图片，填满#ffff00" } };
+        var start = transcript.Count;
+        var reply = await claimRegistry.ChatAsync(claimClient, primary, transcript, 3,
+            verifyFinal: (text, called) => ToolCallRecord.CheckClaims(text, new HashSet<string> { "imagegen" }, called));
+        Check(reply == "这次真的提交啦，画好单独发你~" && imageFake.Calls == 1 && claimHandler.Requests.Count == 3,
+            "A false claim must be corrected once so the model actually calls the tool.");
+        Check(claimHandler.Requests[1].GetProperty("messages").EnumerateArray()
+                .Any(m => m.GetProperty("role").GetString() == "system" && m.GetProperty("content").GetString()!.Contains("没有调用 imagegen")),
+            "The retry must explain that the claimed action was not executed.");
+        var record = ToolCallRecord.Describe(transcript.Skip(start).ToList());
+        Check(record.StartsWith(ToolCallRecord.Prefix) && record.Contains("imagegen（solid #ffff00 yellow）→ imagegen result"),
+            "The executed tool call must be summarized as a program record.");
+        Check(ToolCallRecord.Describe([new OpenAiMessage { Role = "assistant", Content = "hi" }]) == "",
+            "Turns without tool calls must not get a record.");
+    }
+
+    // 纠正最多一次：模型坚持只说不做时，接受第二次回复，不无限重试。
+    var stubborn = new StubHandler(_ => Completion("已经提交生图排队啦"));
+    using (var stubbornClient = Client(stubborn))
+    using (var stubbornRegistry = new ChatToolRegistry())
+    {
+        stubbornRegistry.Register(new FakeTool("imagegen"));
+        var reply = await stubbornRegistry.ChatAsync(stubbornClient, primary, [new OpenAiMessage { Role = "user", Content = "画图" }], 3,
+            verifyFinal: (text, called) => ToolCallRecord.CheckClaims(text, new HashSet<string> { "imagegen" }, called));
+        Check(stubborn.Requests.Count == 2 && reply == "已经提交生图排队啦", "Claim correction must happen at most once per reply.");
+    }
+    Console.WriteLine("PASS: false action claims are corrected once and executed tool calls are recorded for history");
+}
+
 var compactor = Model("compactor");
 config.Models.Add(compactor);
 config.History.CompactModel = "compactor";
@@ -409,10 +463,29 @@ using (var client = Client(handler))
     state = await store.AcquireAsync(key);
     Check(state.Summary == "人物：小明" && state.Turns.Count == 4 && state.Turns.All(t => t.Role != "summary"),
         "Long-term memory must survive reload separately from turns.");
-    store.Clear(key);
+    state.SharedPrompt = "shared prompt";
+    store.SaveMetadata(state);
+    var clearedAt = DateTimeOffset.FromUnixTimeMilliseconds(1_800_000_000_000);
+    store.Clear(key, clearedAt);
     store.Release(key);
     state = await store.AcquireAsync(key);
     Check(state.Summary is null && state.Turns.Count == 0, "Clearing a conversation must also clear its long-term memory.");
+    Check(state.ClearedAt == clearedAt.ToUnixTimeMilliseconds() && state.SharedPrompt == "shared prompt" && store.GetClearedAt(key) == clearedAt,
+        "Clearing must record the clear time and keep shared settings.");
+    // AI 请求占着会话锁时，#model/#prompt 读写 metadata 不能被阻塞；旧状态保存时不能覆盖期间的 #clear。
+    var stale = store.LoadMetadata(key);
+    var laterClear = clearedAt.AddMinutes(5);
+    var metadataTask = Task.Run(() =>
+    {
+        store.Clear(key, laterClear);
+        stale.SharedModel = "sg-model";
+        store.SaveMetadata(stale);
+        return store.LoadMetadata(key);
+    });
+    Check(metadataTask.Wait(TimeSpan.FromSeconds(5)), "Metadata access must not wait for the conversation lock.");
+    Check(metadataTask.Result is { SharedModel: "sg-model", SharedPrompt: "shared prompt" } meta &&
+        meta.ClearedAt == laterClear.ToUnixTimeMilliseconds(),
+        "Saving shared settings from an older state must keep a newer clear time.");
     store.Release(key);
 
     var legacyKey = new ConversationKey("test-instance", ChatScene.Friend, "1", "3");
@@ -523,6 +596,81 @@ Console.WriteLine("PASS: compaction fallback and retries, token-triggered compac
     Console.WriteLine("PASS: full legacy transcripts, persisted pairs, summary failure, cancellation and write failure");
 }
 
+// Post-reply compaction runs in the background: chats keep appending meanwhile, the result is written once,
+// and a #clear during summarization discards it.
+{
+    var root = Path.Combine(Path.GetTempPath(), "aichat-compact-bg-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+        var bgConfig = new PluginConfig();
+        bgConfig.History.MaxTurns = 0;
+        bgConfig.History.MaxTokens = 2_560_000;
+        var bgPlugin = new AiChatPlugin();
+        Set(bgPlugin, "_config", bgConfig);
+        var bgStore = new ConversationStore(root, true);
+        Set(bgPlugin, "_conversations", bgStore);
+        var compactions = (System.Collections.Concurrent.ConcurrentDictionary<ConversationKey, Task>)typeof(AiChatPlugin)
+            .GetField("_backgroundCompactions", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(bgPlugin)!;
+        async Task Seed(ConversationKey key)
+        {
+            var seed = new ConversationState(key) { Summary = "old summary" };
+            for (int i = 0; i < 1700; i++) seed.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart("bg " + i)], i));
+            await bgStore.RewriteAsync(seed, throwOnFailure: true);
+        }
+        async Task WaitIdle()
+        {
+            foreach (var task in compactions.Values.ToArray()) await task.WaitAsync(TimeSpan.FromSeconds(10));
+            Check(compactions.IsEmpty, "Background compaction must unregister when finished.");
+        }
+
+        using var entered = new SemaphoreSlim(0);
+        using var gate = new ManualResetEventSlim(false);
+        var bgHandler = new StubHandler(_ => Completion("bg summary"));
+        bgHandler.Respond = _ => { entered.Release(); gate.Wait(TimeSpan.FromSeconds(10)); return Completion("bg summary"); };
+        using var bgClient = Client(bgHandler);
+        Set(bgPlugin, "_openAi", bgClient);
+
+        var key = new ConversationKey("bg", ChatScene.Group, "kept", "u");
+        await Seed(key);
+        var before = await bgStore.AcquireAsync(key);
+        var keptBefore = before.Turns.Skip(1636).Select(bgStore.Fingerprint).ToList();
+        bgStore.Release(key);
+        Invoke(bgPlugin, "ScheduleBackgroundCompaction", key, primary);
+        Invoke(bgPlugin, "ScheduleBackgroundCompaction", key, primary);
+        Check(await entered.WaitAsync(TimeSpan.FromSeconds(10)), "Background compaction must start summarizing.");
+        Check(compactions.Count == 1, "Only one background compaction may run per conversation.");
+        var during = await bgStore.AcquireAsync(key).WaitAsync(TimeSpan.FromSeconds(2));
+        Check(during.Summary == "old summary" && during.Turns.Count == 1700, "Chats during background compaction must still see the old history.");
+        await bgStore.AppendTurnsAsync(during, new ChatTurn("user", [new TextPart("during user")], 5000),
+            new ChatTurn("assistant", [new TextPart("during answer")], 5001));
+        bgStore.Release(key);
+        gate.Set();
+        await WaitIdle();
+        var after = await bgStore.AcquireAsync(key);
+        Check(after.Summary == "bg summary" && after.Turns.Count == 66 &&
+            after.Turns.Take(64).Select(bgStore.Fingerprint).SequenceEqual(keptBefore) &&
+            after.Turns[^1].Parts.OfType<TextPart>().Single().Text == "during answer",
+            "Background compaction must write once, keep the recent turns byte-identical and keep pairs appended meanwhile.");
+        bgStore.Release(key);
+        Check(bgHandler.Requests.Count == 1, "Background compaction must summarize once.");
+
+        gate.Reset();
+        var clearedKey = new ConversationKey("bg", ChatScene.Group, "cleared", "u");
+        await Seed(clearedKey);
+        Invoke(bgPlugin, "ScheduleBackgroundCompaction", clearedKey, primary);
+        Check(await entered.WaitAsync(TimeSpan.FromSeconds(10)), "Second background compaction must start.");
+        bgStore.Clear(clearedKey, DateTimeOffset.UtcNow);
+        gate.Set();
+        await WaitIdle();
+        var cleared = await bgStore.AcquireAsync(clearedKey);
+        Check(cleared.Summary is null && cleared.Turns.Count == 0, "A #clear during background compaction must not be undone by its result.");
+        bgStore.Release(clearedKey);
+    }
+    finally { Directory.Delete(root, recursive: true); }
+    Console.WriteLine("PASS: background compaction keeps chats unblocked, writes once, keeps recent turns and respects #clear");
+}
+
 // Compaction extracts long-term facts into the memory notebook and refreshes the cached snapshot.
 {
     var root = Path.Combine(Path.GetTempPath(), "aichat-compact-memory-" + Guid.NewGuid().ToString("N"));
@@ -582,6 +730,34 @@ Console.WriteLine("PASS: compaction fallback and retries, token-triggered compac
         Directory.Delete(root, recursive: true);
     }
     Console.WriteLine("PASS: compaction extracts memory notes, skips duplicates and refreshes the persisted snapshot");
+}
+
+// Generated images are recorded as program notes so models call imagegen instead of imitating the record.
+{
+    var legacy = new ChatTurn("assistant", [new TextPart("[生成图片：a cute piglet]"), new ImagePart("cache/p.png", "image/png", 10)], 1);
+    var upgraded = ConversationStore.UpgradeGeneratedImageRecord(legacy);
+    var written = new ChatTurn("assistant", [new TextPart("[生成图片：模型自己写的文字]")], 2);
+    Check(upgraded.Parts[0] is TextPart { Text: var record } && record == ImagePart.GeneratedRecord("a cute piglet") &&
+        record.StartsWith("[程序记录：imagegen 工具已生成") && upgraded.Parts[1] is ImagePart &&
+        ReferenceEquals(ConversationStore.UpgradeGeneratedImageRecord(written), written) &&
+        ConversationStore.UpgradeGeneratedImageRecord(upgraded).Parts[0] is TextPart { Text: var again } && again == record,
+        "Legacy generated-image records must become program notes; plain assistant text must stay untouched.");
+    var root = Path.Combine(Path.GetTempPath(), "aichat-genrecord-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        var store = new ConversationStore(root, true);
+        var key = new ConversationKey("gen", ChatScene.Group, "g", "u");
+        var state = await store.AcquireAsync(key);
+        state.Turns.AddRange([new ChatTurn("user", [new TextPart("画小猪")], 0), legacy]);
+        await store.RewriteAsync(state, throwOnFailure: true);
+        store.Release(key);
+        var reloaded = await store.AcquireAsync(key);
+        store.Release(key);
+        Check(reloaded.Turns[1].Parts[0] is TextPart { Text: var loaded } && loaded == ImagePart.GeneratedRecord("a cute piglet"),
+            "Loading history must upgrade stored legacy generated-image records.");
+    }
+    finally { Directory.Delete(root, true); }
+    Console.WriteLine("PASS: generated images are recorded as program notes and legacy records are upgraded on load");
 }
 
 // Chunked compaction keeps the same retained boundary, halves chunks on context-length errors,

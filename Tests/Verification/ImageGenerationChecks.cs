@@ -22,6 +22,9 @@ internal static class ImageGenerationChecks
         using (var blank = new ImageGenerationTool((_, _, _) => Task.FromResult("queued"), promptInstructions: " \n "))
         {
             Check(blank.SystemPrompt == baseline.SystemPrompt, "An empty image prompt policy must preserve the existing instructions.");
+            Check(baseline.SystemPrompt.Contains("必须调用 imagegen；不能用文字或方括号标记代替工具调用") &&
+                baseline.SystemPrompt.Length < 600 && !baseline.SystemPrompt.Contains("output_compression"),
+                "The image tool prompt must require calling imagegen and leave parameter details to the tool schema.");
             var configured = new AiChatPlugin();
             var policyConfig = new PluginConfig();
             const string policy = "用中文自然语言整理提示词，默认水彩风格，依次说明主体、构图、光影。";

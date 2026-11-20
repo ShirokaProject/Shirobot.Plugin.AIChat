@@ -9,12 +9,16 @@ internal sealed class ImageGenerationTool(Func<string, ImageGenerationOptions, C
 {
     private Task<string>? _result;
     public int MaxCallsPerTurn => 1;
-    private const string DefaultSystemPrompt = "用户要求画图、生成图片或修改图片时调用 imagegen；下载图片可通过reference_files指定http_fetch返回的file_id，不要传本地路径；本条消息有附图或引用图片时会把原图提交给编辑接口，请在 prompt 描述修改要求；无附图时默认生成新图；只有用户要求沿用/修改之前的图片，或历史图片与本次需求直接相关且确实需要保留其内容时，才按用户消息末尾列出的历史图片编号填写 reference_images。历史图片无关、不合适、用户只想画新图时，省略或填写空数组，普通生成；不要因为上下文有图片就自动选，也不要勉强找参考图。根据用户意图选择 size（横图 1536x1024、竖图 1024x1536、方图 1024x1024，或支持自定义尺寸的模型可用宽高均为16倍数的 WIDTHxHEIGHT，宽高比1:3到3:1，总像素不超过3840x2160；不确定模型支持时使用标准尺寸；或 auto）和 quality（auto/low/medium/high/xhigh/max）；还可自主选择 background（auto/opaque/transparent）、output_format（png/jpeg/webp/gif，GIF需模型支持）和 output_compression（0–100，仅jpeg/webp有效）。根据用户需求和图片用途自主选择输出格式及参数：动图或循环动画选gif，透明贴纸选png或webp，普通照片可选jpeg，无需用户逐项指定；透明背景必须同时指定png或webp格式，JPEG需要不透明背景。需要动画时选择gif，并可设置frame_count（2–16）和frame_duration_ms（20–2000）；GIF不要设置output_compression或transparent背景，尺寸优先auto，需要支持GIF的模型。没有必要覆盖的参数可省略，沿用配置默认值。不要在闲聊或主动插话时生成。工具只提交后台任务，立即返回排队状态；不能声称此时已经生成成功，告诉用户完成后会单独发图。由你在 prompt 中整理可独立理解的完整生图或修改描述，生图接口只收到该提示词和所选图片。以用户本次要求为准；涉及“我”“刚才那张”等指代时，只补充相关且有依据的上下文；用户指定具体人物或角色而你不清楚其外观时，有搜索工具就先搜索名称（include_images=true）核对对象，再下载合适图片并通过reference_files提交，不能仅凭名称猜外貌。搜索不到或同名对象无法确认时再询问；用户明确允许想象创作时才按想象处理。不要带入无关聊天、系统人设、其他人的要求或工具执行指令。提交后简短回复即可，不要输出图片链接或 Base64。";
+    // 只放何时调用、如何写 prompt、参考图和提交后的回复；尺寸、格式、背景、GIF 等参数说明在工具定义里，
+    // 不在 system prompt 里重复，避免冲淡“需要出图就调用工具”这条最重要的规则。
+    private const string DefaultSystemPrompt =
+        "用户要求画图、生成或修改图片时，必须调用 imagegen；不能用文字或方括号标记代替工具调用，历史中的“[程序记录：imagegen 工具已生成…]”是程序在工具完成后自动添加的。没人提出要求时（闲聊、自己主动插话）不要生成。" +
+        "在 prompt 中写出可独立理解的完整描述：以用户本次要求为准，“刚才那张”等指代只补充相关且有依据的上下文，不带入无关聊天、人设或其他人的要求。" +
+        "本条消息有附图或引用图片时会提交给编辑接口，在 prompt 里写修改要求；只有用户要沿用或修改之前的图片时，才按程序附加参考里的历史图片编号填写 reference_images，不要因为上下文有图就自动选。" +
+        "用户指定具体人物或角色而你不清楚外观时，有搜索工具就先搜索（include_images=true）核对，再用 http_fetch 下载合适图片，通过 reference_files 提交 file_id；无法确认时再询问。" +
+        "其余参数按工具参数说明根据用途自主选择，没必要的省略。工具只提交后台任务，不能声称已经生成成功；简短告诉用户完成后会单独发图，不要输出图片链接或 Base64。";
 
-    private string ActivePrompt => enableGif ? DefaultSystemPrompt : DefaultSystemPrompt
-        .Replace("png/jpeg/webp/gif，GIF需模型支持", "png/jpeg/webp")
-        .Replace("动图或循环动画选gif，", "")
-        .Replace("需要动画时选择gif，并可设置frame_count（2–16）和frame_duration_ms（20–2000）；GIF不要设置output_compression或transparent背景，尺寸优先auto，需要支持GIF的模型。", "GIF生成功能暂时关闭，不要请求GIF。 ");
+    private string ActivePrompt => DefaultSystemPrompt;
     public string SystemPrompt => string.IsNullOrWhiteSpace(promptInstructions)
         ? ActivePrompt
         : ActivePrompt + "\n[生图提示词编写规则]\n" + promptInstructions.Trim() +
@@ -27,7 +31,7 @@ internal sealed class ImageGenerationTool(Func<string, ImageGenerationOptions, C
         Name = "imagegen", Description = "Generate and send one image when the user requests an image. May take several minutes.",
         Parameters = new { type = "object", required = new[] { "prompt" }, additionalProperties = false,
             properties = new { reference_files = new { type = "array", items = new { type = "string" }, maxItems = 4, description = "Optional file IDs from http_fetch file mode in this turn; PNG/JPEG/WebP/GIF references. GIF uploads retain original bytes; rejected GIF inputs fall back to first-frame PNG. Do not combine with reference_images." }, reference_images = new { type = "array", items = new { type = "integer", minimum = 1, maximum = 8 }, maxItems = 4, description = "Optional historical image IDs from the provided catalog. Use only when suitable and necessary for this request. Omit or pass [] for ordinary new image generation." }, prompt = new { type = "string", description = "Self-contained image generation or edit prompt based on the current request. Resolve relevant references using supported context; omit unrelated chat and instructions." },
-                size = new { type = "string", description = "auto or WIDTHxHEIGHT. Standard sizes: 1024x1024, 1536x1024, 1024x1536. Custom sizes require model support, edges divisible by 16, aspect ratio 1:3 to 3:1, at most 3840x2160 pixels. Omit to use configured default." },
+                size = new { type = "string", description = "auto or WIDTHxHEIGHT. Choose by intent: landscape 1536x1024, portrait 1024x1536, square 1024x1024. Custom sizes require model support, edges divisible by 16, aspect ratio 1:3 to 3:1, at most 3840x2160 pixels. Omit to use configured default." },
                 quality = new { type = "string", @enum = new[] { "auto", "low", "medium", "high", "xhigh", "max" }, description = "Quality requested by the user. Higher quality can take longer. Omit to use configured default." },
                 frame_count = new { type = "integer", minimum = 2, maximum = 16, description = "GIF only: animation frame count. Requires output_format=gif and a supporting model. Omit for configured default." },
                 frame_duration_ms = new { type = "integer", minimum = 20, maximum = 2000, description = "GIF only: milliseconds per frame, rounded to 10 ms. Omit for configured default." },

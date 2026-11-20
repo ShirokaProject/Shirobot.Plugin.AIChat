@@ -48,7 +48,11 @@ internal static class RichReplyChecks
 
     public static async Task RunAsync()
     {
-        Check(OfficialReplyDelivery.ApplyPromptPolicy("custom\nlast", false) == "custom\nlast\n不要使用markdown", "Disabled Markdown must append the policy at the very end.");
+        Check(OfficialReplyDelivery.ApplyPromptPolicy("custom\nlast", false) == "custom\nlast\n" + OfficialReplyDelivery.PlainTextPolicy, "Disabled Markdown must append the policy at the very end.");
+        var plain = PlainTextFormat.Strip("搜了一圈：\n\n## 结论\n**按绝对数量，碧蓝航线更多**。\n- 第一点\n* 第二点\n1. 编号保留\n> 引用\n---\n来源：[维基百科](https://zh.wikipedia.org/wiki/A) 和 <https://x.y>\n![图](https://a.b/c.png)\n```bash\nls **/*.cs\n- not a list\n```\n用 `pacman -Syyu` 更新，2*3*4=24，>_< 别慌");
+        Check(plain == "搜了一圈：\n\n结论\n按绝对数量，碧蓝航线更多。\n· 第一点\n· 第二点\n1. 编号保留\n引用\n\n来源：维基百科 https://zh.wikipedia.org/wiki/A 和 <https://x.y>\n图 https://a.b/c.png\nls **/*.cs\n- not a list\n用 pacman -Syyu 更新，2*3*4=24，>_< 别慌",
+            "Plain-text delivery must strip common Markdown but keep code and ordinary symbols: " + plain);
+        Check(PlainTextFormat.Strip("[chat]\n**哈**\n好") == "[chat]\n哈\n好", "Reply-mode tags must survive stripping.");
         Check(OfficialReplyDelivery.ApplyPromptPolicy("custom", true) == "custom", "Enabled Markdown must not forbid formatting.");
         Check(!new DefaultSection().SharedPromptSuffix.Contains("Markdown"), "Default shared prompt must not forbid Markdown.");
         var behaviour = new BehaviourSection { UseMarkdown = true, UseStreaming = true };

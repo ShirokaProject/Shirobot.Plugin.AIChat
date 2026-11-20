@@ -1,6 +1,7 @@
 using System.Reflection;
 using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.AiChatPlugin.Delivery;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
@@ -25,8 +26,18 @@ internal static class ReplyModeChecks
         Check(capped.Messages.SequenceEqual(["1", "2\n3\n4"]), "Extra chat lines must merge into the last message.");
         var answer = ParsedReply.Parse("[answer]\n第一段\n\n第二段", 4);
         Check(answer.Mode == ReplyMode.Answer && answer.Messages.Single() == "第一段\n\n第二段", "Answer mode must keep the full text.");
-        var untagged = ParsedReply.Parse("没有标记\n第二行", 4);
-        Check(untagged.Mode == ReplyMode.Answer && untagged.Text == "没有标记\n第二行", "Missing tag must fall back to a single message.");
+        var at = new DateTimeOffset(2026, 11, 20, 20, 28, 0, TimeSpan.FromHours(8));
+        var label = AiChatPlugin.HistoryImageLabel(new ChatTurn("user", [new TextPart("[张三/123456] [引用消息 #100]")], at.ToUnixTimeMilliseconds()));
+        Check(label.Contains("张三(123456)") && label.Contains(at.ToLocalTime().ToString("MM-dd HH:mm")) && label.Contains("不是当前用户这次发的"),
+            "History image labels must name the original sender and readable time: " + label);
+        Check(AiChatPlugin.HistoryImageLabel(new ChatTurn("user", [new TextPart("没有说话者")], 0)).Contains("之前的消息中"), "Unknown senders must still be marked as earlier messages.");
+        var untagged = ParsedReply.Parse("哈，这图太真实了！\n\n你这是又在为哪门课临时抱佛脚呀~", 2);
+        Check(untagged.Mode == ReplyMode.Chat && untagged.Quote && untagged.Messages.SequenceEqual(["哈，这图太真实了！", "你这是又在为哪门课临时抱佛脚呀~"]),
+            "A short untagged reply must be sent as quoted chat messages.");
+        var longUntagged = ParsedReply.Parse(new string('长', 201) + "\n第二行", 4);
+        Check(longUntagged.Mode == ReplyMode.Answer && longUntagged.Messages.Count == 1, "A long untagged reply must stay one answer message.");
+        foreach (var structured in new[] { "步骤：\n1. 先这样\n2. 再那样", "看这里\nhttps://example.com", "命令：\n```\nls\n```", "要点\n· 一\n· 二" })
+            Check(ParsedReply.Parse(structured, 4).Mode == ReplyMode.Answer, "Untagged lists, links and code must stay one answer message: " + structured);
         var tooled = ParsedReply.Parse("[chat]\n我查一下\n\n[answer]\n结果如下", 4);
         Check(tooled.Mode == ReplyMode.Answer && tooled.Text == "我查一下\n\n结果如下", "The last tag wins and every tag line is removed.");
         Check(ParsedReply.Parse("[chat]", 4).Text == "[chat]", "A tag-only reply must not become empty.");

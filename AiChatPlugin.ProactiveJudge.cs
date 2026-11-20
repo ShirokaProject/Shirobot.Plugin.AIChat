@@ -15,7 +15,7 @@ public sealed partial class AiChatPlugin
             ? _config.Default.Model : _config.Proactive.JudgeModel.Trim();
         var model = ResolveModel(judgeModel) ?? throw new InvalidOperationException("未找到主动回复判断模型，请检查 proactive.judge_model。");
         var recent = await GetRecentGroupMessagesAsync(batch[0], Math.Clamp(_config.Proactive.JudgeContextMessages, 1, 20),
-            selfName, recordedAfter: batch.Count, ct).ConfigureAwait(false);
+            selfName, recordedAfter: batch.Count, ct, after: ClearedAt(key)).ConfigureAwait(false);
         using var usageScope = UsageScope.Begin(UsageSource(key), "proactive_judge");
         var request = ProactiveJudge.Request(model.Name, selfName, _config.Proactive.Keywords, recent, fresh, policy);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);

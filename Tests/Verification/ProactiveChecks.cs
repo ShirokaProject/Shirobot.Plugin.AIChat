@@ -175,14 +175,17 @@ internal static class ProactiveChecks
             return Task.FromResult(history);
         };
         var fetch = typeof(AiChatPlugin).GetMethod("GetRecentGroupMessagesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        async Task<string> Fetch(int count, int recorded) =>
-            await (Task<string>)fetch.Invoke(plugin, [current, count, "露露", recorded, CancellationToken.None, null])!;
+        async Task<string> Fetch(int count, int recorded, DateTimeOffset? after = null) =>
+            await (Task<string>)fetch.Invoke(plugin, [current, count, "露露", recorded, CancellationToken.None, null, after])!;
         string Time(int minute) => t0.AddMinutes(minute).ToLocalTime().ToString("HH:mm");
         var text = await Fetch(3, 0);
         Check(before == "m5", "History must be requested before the current message.");
         Check(text == $"[消息 m2] {Time(2)} alice(alice): @露露 你在吗\n[消息 m3] {Time(3)} 露露（你）(bot): 我在\n[消息 m4] {Time(4)} bob(bob): [图片]",
             "History must drop the current message, sort by time, keep the newest, mark the bot and describe resources.");
         Check(await Fetch(0, 0) == "", "Zero messages must not call the API.");
+        // #clear 之后只附带清空时间之后的消息。
+        Check(await Fetch(3, 0, t0.AddMinutes(2)) == $"[消息 m3] {Time(3)} 露露（你）(bot): 我在\n[消息 m4] {Time(4)} bob(bob): [图片]",
+            "Group context must exclude messages sent at or before the last #clear.");
 
         // 适配器不支持时退回内存记录。
         ((TestProxy)(object)msg).Call = (_, _) => throw new NotSupportedException("GetHistoryMessagesAsync");
@@ -190,6 +193,7 @@ internal static class ProactiveChecks
         trigger.Record("i:g1", "bob", "内存里的", 10, t0);
         trigger.Record("i:g1", "alice", "现在呢", 10, t0.AddMinutes(5));
         Check(await Fetch(5, 1) == $"{Time(0)} bob: 内存里的", "Unsupported history must fall back to recorded messages, skipping the current one.");
+        Check(await Fetch(5, 1, t0) == "", "The memory fallback must also exclude messages before the last #clear.");
         Console.WriteLine("PASS: group context uses message history with ordering, bot marking and memory fallback");
 
         // 撤回：从内存记录、待判断批次中去掉；正在判断的批次包含它时取消这次判断。

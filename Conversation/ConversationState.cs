@@ -19,6 +19,9 @@ internal sealed class ConversationState
     /// </summary>
     public List<MemoryEntry>? MemorySnapshot { get; set; }
 
+    /// <summary>最近一次 #clear 的时间（Unix 毫秒）；之前的群聊消息不再作为上下文附带。</summary>
+    public long? ClearedAt { get; set; }
+
     /// <summary>共享会话的公共 system prompt（仅 shared 模式使用）。null 表示用默认。</summary>
     public string? SharedPrompt { get; set; }
 

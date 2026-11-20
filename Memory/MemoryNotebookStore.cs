@@ -86,7 +86,7 @@ internal sealed class MemoryNotebookStore
         var currentIds = current.Select(e => e.Id).ToHashSet(StringComparer.Ordinal);
         var deleted = before.Keys.Where(id => !currentIds.Contains(id)).ToList();
         if (changed.Count == 0 && deleted.Count == 0) return "";
-        var text = new StringBuilder("[记忆本更新：system prompt 中 [记忆本] 之后的变化，以这里为准]");
+        var text = new StringBuilder("[记忆本更新：system prompt 末尾 [记忆本] 之后的增改删，以这里为准]");
         if (changed.Count > 0) text.Append('\n').Append(Format(changed));
         if (deleted.Count > 0) text.Append("\n已删除：").Append(string.Join("、", deleted.Select(id => "#" + id)));
         return text.ToString();

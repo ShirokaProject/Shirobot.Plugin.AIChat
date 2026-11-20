@@ -35,7 +35,8 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
     public void Register(IChatTool tool) => _tools.Add(tool.Definition.Function.Name, tool);
 
     public async Task<string> ChatAsync(OpenAiClient client, ModelEntry model,
-        List<OpenAiMessage> messages, int maxRounds, Func<string, Task>? onContent = null, CancellationToken ct = default, IReadOnlyList<IChatTool>? contextualTools = null, bool readOnlyOnly = false, int? maxOutputTokens = null)
+        List<OpenAiMessage> messages, int maxRounds, Func<string, Task>? onContent = null, CancellationToken ct = default, IReadOnlyList<IChatTool>? contextualTools = null, bool readOnlyOnly = false, int? maxOutputTokens = null,
+        Func<string, IReadOnlySet<string>, string?>? verifyFinal = null)
     {
         var tools = _tools.Where(pair => !readOnlyOnly || pair.Value is IReadOnlyChatTool)
             .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
@@ -51,6 +52,9 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
         var definitions = tools.OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair => pair.Value.Definition).ToList();
         var visiblePrefix = "";
+        // 本轮实际执行过的工具，用于核对回复里“已经做了”的说法；纠正最多一次，避免来回拉扯。
+        var called = new HashSet<string>(StringComparer.Ordinal);
+        var corrected = false;
         async Task<OpenAiResponseMessage> RequestAsync(OpenAiChatRequest request)
         {
             for (var attempt = 1; ; attempt++)
@@ -102,6 +106,16 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
             if (response.ToolCalls is not { Count: > 0 })
             {
                 if (string.IsNullOrWhiteSpace(response.Content)) throw new EmptyUpstreamResponseException();
+                // 流式时文字已经发出，无法收回，只在非流式回复上核对。
+                if (!corrected && onContent is null && round < maxRounds &&
+                    verifyFinal?.Invoke(response.Content, called) is { } correction)
+                {
+                    corrected = true;
+                    BotLog.Warning($"[AiChat] 回复声称已执行操作但没有调用对应工具，要求模型重新处理一次: {correction[..Math.Min(40, correction.Length)]}");
+                    messages.Add(new OpenAiMessage { Role = "assistant", Content = response.Content, ReasoningContent = response.ReasoningContent });
+                    messages.Add(new OpenAiMessage { Role = "system", Content = correction });
+                    continue;
+                }
                 return visiblePrefix + response.Content;
             }
             if (onContent is not null && !string.IsNullOrEmpty(response.Content))
@@ -128,6 +142,8 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
                 Role = "assistant", Content = response.Content ?? "", ToolCalls = response.ToolCalls,
                 ReasoningContent = response.ReasoningContent
             });
+            foreach (var call in response.ToolCalls)
+                if (call.Function?.Name is { Length: > 0 } calledName) called.Add(calledName);
             var results = await ExecuteCallsAsync(response.ToolCalls, tools, calls, model.Name, round + 1, ct, readOnlyOnly).ConfigureAwait(false);
             messages.AddRange(results);
             foreach (var source in tools.Values.OfType<IToolAttachments>().Distinct())

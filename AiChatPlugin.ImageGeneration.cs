@@ -203,7 +203,7 @@ public sealed partial class AiChatPlugin
                             var state = await _conversations.AcquireAsync(historyKey, ct).ConfigureAwait(false);
                             try
                             {
-                                state.Turns.Add(new ChatTurn("assistant", [new TextPart("[生成图片：" + prompt + "]"),
+                                state.Turns.Add(new ChatTurn("assistant", [new TextPart(ImagePart.GeneratedRecord(prompt)),
                                     new ImagePart(cachedImage, outputMime, imageLength)], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
                                 await _conversations.RewriteAsync(state).ConfigureAwait(false);
                             }

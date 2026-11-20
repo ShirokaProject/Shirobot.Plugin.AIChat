@@ -72,7 +72,11 @@ internal sealed class OfficialReplyDelivery : IAsyncDisposable
     }
 
     public static string ApplyPromptPolicy(string prompt, bool useMarkdown) =>
-        useMarkdown ? prompt : prompt.TrimEnd() + "\n不要使用markdown";
+        useMarkdown ? prompt : prompt.TrimEnd() + "\n" + PlainTextPolicy;
+
+    public const string PlainTextPolicy =
+        "回复按 QQ 纯文本发送，Markdown 不会被渲染：不要使用 **加粗**、# 标题、- 或 * 列表符号、[文字](链接)、代码块围栏；" +
+        "链接直接写网址，需要分点时换行写或用 1. 2. 编号。";
 
     public async Task AppendAsync(string cumulativeText)
     {
