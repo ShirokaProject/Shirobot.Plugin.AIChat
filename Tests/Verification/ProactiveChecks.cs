@@ -249,16 +249,18 @@ internal static class ProactiveChecks
         Console.WriteLine("PASS: proactive failures are logged without replying in the group");
 
         // 判断期间同一个人继续发消息：打断这次判断，和新消息一起重新判断；别人发的不打断。
+        // 直接放入一个正在判断的待处理状态，不经过 ScheduleProactive 启动后台窗口任务，
+        // 避免后台任务先看到空批次并删掉这个状态（CI 上出现过的时序竞态）。
         var first = Msg("q1", "alice", 9, new TextSegment("看这个"));
-        schedule.Invoke(plugin, ["i:g2", first, false]);
-        var g2 = pendingMap["i:g2"]!;
+        var pendingType = typeof(AiChatPlugin).GetNestedType("PendingProactive", BindingFlags.NonPublic)!;
+        var g2 = Activator.CreateInstance(pendingType, DateTimeOffset.UtcNow.AddMinutes(10))!;
         T Get<T>(string name) => (T)g2.GetType().GetField(name)!.GetValue(g2)!;
         using var judgingAbort = new CancellationTokenSource();
         lock (typeof(AiChatPlugin).GetField("_backgroundGate", flags)!.GetValue(plugin)!)
         {
-            Get<List<MessageEvent>>("Batch").Clear();
             g2.GetType().GetField("Judging")!.SetValue(g2, new[] { first });
             g2.GetType().GetField("JudgingAbort")!.SetValue(g2, judgingAbort);
+            pendingMap["i:g2"] = g2;
         }
         schedule.Invoke(plugin, ["i:g2", Msg("q2", "bob", 9, new TextSegment("别人说的")), false]);
         Check(!judgingAbort.IsCancellationRequested && !Get<bool>("Interrupted"), "Other people's messages must not interrupt a judgment.");
@@ -266,6 +268,7 @@ internal static class ProactiveChecks
         Check(judgingAbort.IsCancellationRequested && Get<bool>("Interrupted") && Get<List<MessageEvent>>("Batch").Select(m => m.MessageId).SequenceEqual(["q2", "q3"]),
             "A follow-up from the same sender must interrupt the running judgment and queue behind it.");
         g2.GetType().GetField("Judging")!.SetValue(g2, null);
+        lock (typeof(AiChatPlugin).GetField("_backgroundGate", flags)!.GetValue(plugin)!) pendingMap.Remove("i:g2");
 
         // 被取消的判断不算发言：冷却和消息计数恢复到触发前。
         var restore = new ProactiveTrigger();
