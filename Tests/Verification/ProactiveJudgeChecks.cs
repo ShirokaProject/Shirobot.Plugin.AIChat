@@ -45,10 +45,13 @@ internal static class ProactiveJudgeChecks
         var recent = string.Join('\n', Enumerable.Range(0, 100).Select(i => $"old-{i:D2}: " + new string('旧', 1000)));
         var request = ProactiveJudge.Request("fixture", new string('名', 10000), Enumerable.Repeat(new string('称', 1000), 100),
             recent, fresh, new string('规', 10000));
-        Check(request.Messages.Count == 2 && request.Tools is null && !request.Stream && request.MaxCompletionTokens == 256,
+        Check(request.Messages.Count == 2 && request.Tools is null && !request.Stream && request.MaxCompletionTokens == 512,
             "Judgment must use two text messages, no tools, and a small output budget.");
         Check(request.Messages.All(m => m.Content is string) && request.Messages.Sum(m => ((string)m.Content).Length) < 8000,
             "Long policies, names, context and batches must fit the bounded judge input.");
+        var system = (string)request.Messages[0].Content;
+        Check(!system.Contains("拿不准或无需回应输出 [skip]") && system.Contains("按参与规则中的倾向决定") && system.Contains("不需要你自己限制次数"),
+            "Uncertainty must follow the eagerness policy instead of always skipping.");
         var user = (string)request.Messages[1].Content;
         Check(Enumerable.Range(0, 30).All(i => user.Contains($"msg-{i:D2}:")), "All messages in a valid batch must survive truncation.");
         Check(ProactiveJudge.BoundLines(string.Join('\n', Enumerable.Repeat("x", 10000)), 2000).Length <= 2000,

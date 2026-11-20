@@ -74,6 +74,24 @@ internal sealed class MemoryNotebookStore
     public static string Format(IReadOnlyList<MemoryEntry> entries) =>
         string.Join("\n", entries.Select(e => $"#{e.Id} {e.Text}"));
 
+    public static string NextId(IReadOnlyList<MemoryEntry> entries) =>
+        "m" + (entries.Select(e => int.TryParse(e.Id.TrimStart('m'), out var n) ? n : 0).DefaultIfEmpty(0).Max() + 1);
+
+    /// <summary>列出 current 相对 snapshot 的新增、修改和删除；没有变化时返回空字符串。</summary>
+    public static string FormatChanges(IReadOnlyList<MemoryEntry> snapshot, IReadOnlyList<MemoryEntry> current)
+    {
+        var before = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var entry in snapshot) before[entry.Id] = entry.Text;
+        var changed = current.Where(e => !before.TryGetValue(e.Id, out var text) || text != e.Text).ToList();
+        var currentIds = current.Select(e => e.Id).ToHashSet(StringComparer.Ordinal);
+        var deleted = before.Keys.Where(id => !currentIds.Contains(id)).ToList();
+        if (changed.Count == 0 && deleted.Count == 0) return "";
+        var text = new StringBuilder("[记忆本更新：system prompt 中 [记忆本] 之后的变化，以这里为准]");
+        if (changed.Count > 0) text.Append('\n').Append(Format(changed));
+        if (deleted.Count > 0) text.Append("\n已删除：").Append(string.Join("、", deleted.Select(id => "#" + id)));
+        return text.ToString();
+    }
+
     private string PathFor(ConversationKey key) => Path.Combine(_dir, key.ToFileSafeString() + ".json");
 
     private static List<MemoryEntry> Read(string path)

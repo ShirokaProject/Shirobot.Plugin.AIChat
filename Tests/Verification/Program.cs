@@ -7,6 +7,7 @@ using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.AiChatPlugin.Conversation;
+using ShiroBot.AiChatPlugin.Memory;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.AiChatPlugin.UserState;
@@ -185,7 +186,7 @@ if (args.Contains("--live-qq-fetch"))
 var options = new TomlSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 var template = (string)typeof(AiChatPlugin).GetField("DefaultConfigTemplate", BindingFlags.NonPublic | BindingFlags.Static)!.GetRawConstantValue()!;
 var config = TomlSerializer.Deserialize<PluginConfig>(template, options)!;
-Check(config.ToolUse.Tavily is { Enabled: true } && config.History.CompactPrompt == HistorySection.DefaultCompactPrompt,
+Check(config.ToolUse.Tavily is { ApiKey: "" } && config.History.CompactPrompt == HistorySection.DefaultCompactPrompt,
     "Default template must deserialize nested tool config and compact prompt.");
 Check(config.ToolUse.ImageGen.PromptInstructions == "" &&
     TomlSerializer.Deserialize<PluginConfig>("[tool_use.image_gen]\nprompt_instructions = '用中文自然语言描述主体、构图和光影'", options)!
@@ -196,17 +197,34 @@ var toolsConfig = new PluginConfig();
 toolsConfig.ToolUse.HttpFetch.Enabled = false;
 toolsConfig.ToolUse.Tavily.ApiKey = "test";
 using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(registry.HasTools, "Nested Tavily must register.");
-toolsConfig.ToolUse.Tavily.Enabled = false;
-using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(!registry.HasTools, "Disabled Tavily must not register.");
+toolsConfig.ToolUse.Tavily.ApiKey = "";
+using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(!registry.HasTools, "Tavily without an API key must not register.");
 toolsConfig.ToolUse.Enabled = false;
-toolsConfig.ToolUse.Tavily.Enabled = true;
+toolsConfig.ToolUse.Tavily.ApiKey = "test";
 using (var registry = ChatToolRegistry.Create(toolsConfig)) Check(!registry.HasTools && registry.SystemPrompt == "", "Disabled tools must not advertise capabilities.");
 Console.WriteLine("PASS: TOML template, nested Tavily config, removed legacy entry and tool disable");
 
 // 模板字段与默认值一致。最大输出 Token 为 0 时不发送该参数。
 Check(config.Default.MaxOutputTokens == 0 && config.Default.OutputTokenLimit() is null && new DefaultSection { MaxOutputTokens = 4096 }.OutputTokenLimit() == 4096,
     "Zero max output tokens must mean no limit.");
-Check(config.History is { MaxTurns: 0, MaxTokens: 128000, CompactKeepTurns: 32, CompactKeepTokens: 16000 } &&
+var legacyConfig = TomlSerializer.Deserialize<PluginConfig>(
+    "[default]\nretry_on_timeout_delay_ms = 5\n[owner_prompt]\nenabled = false\n[history]\nmax_turns = 4\npersist = false\n" +
+    "[resources]\ncache_dir = 'x'\ndownload_timeout_seconds = 1\n[behaviour]\nfold_above_chars = 0\nanswer_fold_above_chars = 9\n" +
+    "warn_on_no_vision = false\nhint_on_empty_input = false\n[tool_use.tavily]\nenabled = false\n" +
+    "[proactive]\ninclude_bot_name = false\ninterject = false\njudge_context_messages = 1\nquiet_min_seconds = 0\nquiet_max_seconds = 0", options)!;
+Check(legacyConfig.Default.RetryOnTimeoutDelayMs == 1000 && legacyConfig.History.MaxTurns == 0 && legacyConfig.Resources.CacheDir == "data/resource_cache" &&
+    legacyConfig.Behaviour.FoldAboveChars == 0 && legacyConfig.Proactive is { JudgeContextMessages: 6, QuietMinSeconds: 3, QuietMaxSeconds: 10, Interjects: true },
+    "Configs with removed keys must still load; removed keys must not reach the internal defaults.");
+foreach (var removed in new[] { "retry_on_timeout_delay_ms", "max_turns", "persist", "cache_dir", "download_timeout_seconds", "answer_fold_above_chars",
+             "warn_on_no_vision", "hint_on_empty_input", "include_bot_name", "interject", "judge_context_messages", "quiet_min_seconds", "quiet_max_seconds" })
+    Check(!template.Contains("\n" + removed + " =") && !System.Text.RegularExpressions.Regex.IsMatch(template, @"^\s*" + removed + @"\s*=", System.Text.RegularExpressions.RegexOptions.Multiline),
+        $"The template must not expose the removed key {removed}.");
+Check(!System.Text.RegularExpressions.Regex.IsMatch(template, @"\[owner_prompt\]\s*\n(\s*#.*\n)*\s*enabled") &&
+    !System.Text.RegularExpressions.Regex.IsMatch(template, @"\[tool_use\.tavily\]\s*\n(\s*#.*\n)*\s*enabled") && config.Behaviour.FoldAboveChars == 400,
+    "Owner prompt and Tavily are enabled by their text, and folding has a single 400-character default.");
+Check(TomlSerializer.Deserialize<PluginConfig>("[history]\nmax_tokens = 64000\ncompact_keep_tokens = 16000\ncompact_keep_turns = 32\ncompact_chunk_tokens = 24000", options)!
+        .History.MaxTokens == 64000, "Configs that still contain removed compaction keys must load.");
+Check(config.History is { MaxTurns: 0, MaxTokens: 128000 } &&
     config.Resources.RecursiveDepth == 3 && config.Resources.MaxFileExcerptChars == 16000
     && config.Default.SharedPromptSuffix == DefaultSection.DefaultSharedPromptSuffix, "Template defaults must match the config class.");
 Check(!config.History.CompactPrompt.Contains("长期记忆") && DefaultSection.DefaultSharedPromptSuffix.Contains("完整回答"),
@@ -505,6 +523,205 @@ Console.WriteLine("PASS: compaction fallback and retries, token-triggered compac
     Console.WriteLine("PASS: full legacy transcripts, persisted pairs, summary failure, cancellation and write failure");
 }
 
+// Compaction extracts long-term facts into the memory notebook and refreshes the cached snapshot.
+{
+    var root = Path.Combine(Path.GetTempPath(), "aichat-compact-memory-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    var (toolUse, memoryOn, maxTurns, maxTokens) = (config.ToolUse.Enabled, config.ToolUse.Memory.Enabled, config.History.MaxTurns, config.History.MaxTokens);
+    try
+    {
+        config.ToolUse.Enabled = true;
+        config.ToolUse.Memory.Enabled = true;
+        config.History.MaxTurns = 4;
+        config.History.MaxTokens = 128000;
+        var memoryStore = new MemoryNotebookStore(root);
+        var memoryStoreField = typeof(AiChatPlugin).GetField("_memory", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var previousMemory = memoryStoreField.GetValue(plugin);
+        Set(plugin, "_memory", memoryStore);
+        var memStore = new ConversationStore(root, true);
+        Set(plugin, "_conversations", memStore);
+        var memKey = new ConversationKey("mem", ChatScene.Group, "g", "u");
+        await memoryStore.UpdateAsync(memKey, entries => { entries.Add(new MemoryEntry("m1", "alice 喜欢猫", DateTimeOffset.UtcNow)); return (true, ""); });
+        var memState = await memStore.AcquireAsync(memKey);
+        for (var i = 0; i < 10; i++) memState.Turns.Add(new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart($"round {i}")], i));
+        var memoryHandler = new StubHandler(_ => Completion(
+            "<summary>\nmerged summary\n</summary>\n<memory>\n" +
+            """{"add":["bob 是程序员","alice 喜欢猫和狗",""],"update":[{"id":"m1","text":"alice 喜欢猫和狗"},{"id":"m9","text":"不存在"}]}""" +
+            "\n</memory>"));
+        using (var memoryClient = Client(memoryHandler))
+        {
+            Set(plugin, "_openAi", memoryClient);
+            Check((bool)await (Task<bool>)Invoke(plugin, "TryCompactConversationAsync", memState, primary, CancellationToken.None),
+                "Compaction with memory extraction must succeed.");
+        }
+        memStore.Release(memKey);
+        var memInput = memoryHandler.Requests.Single().GetProperty("messages")[1].GetProperty("content").GetString()!;
+        Check(memInput.Contains("【现有记忆本】") && memInput.Contains("#m1 alice 喜欢猫") && memInput.Contains("<memory>"),
+            "Compaction must send the current notebook and ask for memory changes.");
+        var notebook = await memoryStore.LoadAsync(memKey);
+        Check(memState.Summary == "merged summary" &&
+            notebook.Select(e => (e.Id, e.Text)).SequenceEqual([("m1", "alice 喜欢猫和狗"), ("m2", "bob 是程序员")]),
+            "Compaction must store only the summary, update existing ids, skip duplicates, empty text and unknown ids.");
+        Check(memState.MemorySnapshot!.SequenceEqual(notebook), "Compaction must refresh the in-memory snapshot.");
+        var memReloaded = await memStore.AcquireAsync(memKey);
+        memStore.Release(memKey);
+        Check(memReloaded.Summary == "merged summary" && memReloaded.MemorySnapshot!.SequenceEqual(notebook) && memReloaded.Turns.Count == 2,
+            "The snapshot must persist with the compacted history.");
+
+        var changed = notebook.Where(e => e.Id != "m2").Append(new MemoryEntry("m3", "carol 住在上海", DateTimeOffset.UtcNow)).ToList();
+        var changes = MemoryNotebookStore.FormatChanges(notebook, changed);
+        Check(MemoryNotebookStore.FormatChanges(notebook, notebook) == "" && changes.Contains("#m3 carol 住在上海") &&
+            changes.Contains("已删除：#m2") && !changes.Contains("#m1"), "Memory changes must list only additions, edits and deletions since the snapshot.");
+        Check(AiChatPlugin.SplitCompactResponse("plain summary") == ("plain summary", null),
+            "An untagged compaction response must be used as the summary without memory changes.");
+        memoryStoreField.SetValue(plugin, previousMemory);
+    }
+    finally
+    {
+        (config.ToolUse.Enabled, config.ToolUse.Memory.Enabled, config.History.MaxTurns, config.History.MaxTokens) = (toolUse, memoryOn, maxTurns, maxTokens);
+        Directory.Delete(root, recursive: true);
+    }
+    Console.WriteLine("PASS: compaction extracts memory notes, skips duplicates and refreshes the persisted snapshot");
+}
+
+// Chunked compaction keeps the same retained boundary, halves chunks on context-length errors,
+// saves partial progress and backs off silently after unfinished attempts.
+{
+    var root = Path.Combine(Path.GetTempPath(), "aichat-compact-chunks-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    var saved = (config.ToolUse.Memory.Enabled, config.History.MaxTurns, config.History.MaxTokens,
+        config.History.CompactModel, config.Default.FallbackModel, config.Default.RetryOnTimeoutDelayMs);
+    try
+    {
+        config.ToolUse.Memory.Enabled = false;
+        config.History.MaxTurns = 0;
+        // 8000 预算推算出：保留 2000 tokens 原文，每块 2000 tokens（约 4 轮）。
+        config.History.MaxTokens = 8000;
+        config.History.CompactModel = "";
+        config.Default.FallbackModel = "";
+        config.Default.RetryOnTimeoutDelayMs = 100;
+        var chunkStore = new ConversationStore(root, true);
+        Set(plugin, "_conversations", chunkStore);
+        List<ChatTurn> Rounds() => Enumerable.Range(0, 40)
+            .Select(i => new ChatTurn(i % 2 == 0 ? "user" : "assistant", [new TextPart($"<r{i}>" + new string('文', 200))], i)).ToList();
+        string Transcript(JsonElement request) => request.GetProperty("messages")[1].GetProperty("content").GetString()!;
+        int[] Messages(JsonElement request) => Enumerable.Range(0, 40).Where(i => Transcript(request).Contains($"<r{i}>")).ToArray();
+        async Task<ConversationState> Fresh(string id)
+        {
+            var key = new ConversationKey("chunk", ChatScene.Group, id, "u");
+            var fresh = await chunkStore.AcquireAsync(key);
+            chunkStore.Release(key);
+            fresh.Turns.AddRange(Rounds());
+            await chunkStore.RewriteAsync(fresh, throwOnFailure: true);
+            return fresh;
+        }
+        static IEnumerable<string> Texts(IEnumerable<ChatTurn> turns) =>
+            turns.Select(turn => turn.Role + ":" + string.Concat(turn.Parts.OfType<TextPart>().Select(part => part.Text)));
+        async Task<ConversationState> Reload(ConversationKey key)
+        {
+            var reloaded = await chunkStore.AcquireAsync(key);
+            chunkStore.Release(key);
+            return reloaded;
+        }
+
+        // Same retained suffix as a single pass: 4 most recent rounds, older ones in 4-round chunks.
+        var chunked = await Fresh("chunked");
+        var original = chunked.Turns.ToList();
+        var expectedKept = original.Skip((int)Invoke(plugin, "CountMessagesToCompact", original)).ToList();
+        var chunkHandler = new StubHandler(_ => "");
+        chunkHandler.Respond = _ => Completion($"summary {chunkHandler.Requests.Count}");
+        using (var chunkClient = Client(chunkHandler))
+        {
+            Set(plugin, "_openAi", chunkClient);
+            Check(await (Task<bool>)Invoke(plugin, "TryCompactConversationAsync", chunked, primary, CancellationToken.None), "Chunked compaction must succeed.");
+        }
+        Check(expectedKept.Count == 8 && chunked.Turns.SequenceEqual(expectedKept) && chunked.Summary == "summary 4",
+            "Chunking must stop at the single-pass retained boundary instead of the trigger threshold.");
+        Check(chunkHandler.Requests.Count == 4 && chunkHandler.Requests.Select((request, k) =>
+                Messages(request).SequenceEqual(Enumerable.Range(k * 8, 8)) &&
+                Transcript(request).Contains(k == 0 ? "（暂无）" : $"summary {k}")).All(ok => ok),
+            "Each chunk must send only its own rounds and merge into the previous chunk's summary.");
+        var chunkedReloaded = await Reload(chunked.Key);
+        Check(chunkedReloaded.Summary == "summary 4" && Texts(chunkedReloaded.Turns).SequenceEqual(Texts(expectedKept)), "Chunked compaction must persist the final state.");
+
+        // A context-length rejection halves the chunk and retries immediately.
+        var halved = await Fresh("halved");
+        var halvingHandler = new StubHandler(_ => "");
+        halvingHandler.Status = _ => halvingHandler.Requests.Count == 1 ? HttpStatusCode.BadRequest : HttpStatusCode.OK;
+        halvingHandler.Respond = _ => halvingHandler.Requests.Count == 1
+            ? """{"error":{"message":"This model's maximum context length is 1000 tokens"}}"""
+            : Completion("halved summary");
+        using (var halvingClient = Client(halvingHandler))
+        {
+            Set(plugin, "_openAi", halvingClient);
+            Check(await (Task<bool>)Invoke(plugin, "TryCompactConversationAsync", halved, primary, CancellationToken.None), "Halved compaction must succeed.");
+        }
+        Check(Messages(halvingHandler.Requests[0]).SequenceEqual(Enumerable.Range(0, 8)) &&
+            Messages(halvingHandler.Requests[1]).SequenceEqual(Enumerable.Range(0, 4)) &&
+            halvingHandler.Requests.Count == 9 && Texts(halved.Turns).SequenceEqual(Texts(expectedKept)),
+            "A context-length error must retry the same oldest messages with half the chunk size.");
+        Check(AiChatPlugin.IsContextLengthError(new UpstreamHttpException(HttpStatusCode.RequestEntityTooLarge, "")) &&
+            !AiChatPlugin.IsContextLengthError(new UpstreamHttpException(HttpStatusCode.BadRequest, "invalid api key")) &&
+            !AiChatPlugin.IsContextLengthError(new HttpRequestException("context")),
+            "Only upstream rejections that look like oversized requests may shrink chunks.");
+
+        // A failure after the first chunk keeps and persists the completed part.
+        var partial = await Fresh("partial");
+        var failing = false;
+        var partialHandler = new StubHandler(_ => "");
+        partialHandler.Status = _ => failing || partialHandler.Requests.Count > 1 ? HttpStatusCode.BadRequest : HttpStatusCode.OK;
+        partialHandler.Respond = _ => failing || partialHandler.Requests.Count > 1
+            ? """{"error":{"message":"invalid request"}}""" : Completion("first chunk");
+        using var partialClient = Client(partialHandler);
+        Set(plugin, "_openAi", partialClient);
+        Check(await (Task<bool>)Invoke(plugin, "TryCompactConversationAsync", partial, primary, CancellationToken.None) &&
+            partial.Summary == "first chunk" && Texts(partial.Turns).SequenceEqual(Texts(original.Skip(8))) && partialHandler.Requests.Count == 2,
+            "A failed later chunk must keep the completed chunk and report the rewritten history.");
+        var partialReloaded = await Reload(partial.Key);
+        Check(partialReloaded.Summary == "first chunk" && Texts(partialReloaded.Turns).SequenceEqual(Texts(original.Skip(8))), "Partial progress must be persisted.");
+
+        // Unfinished compaction backs off per conversation without contacting upstream; success clears it.
+        var now = DateTimeOffset.UtcNow;
+        plugin.CompactionClock = () => now;
+        failing = true;
+        var before = partialHandler.Requests.Count;
+        Check(!await (Task<bool>)Invoke(plugin, "CompactWithBackoffAsync", partial, primary, CancellationToken.None) &&
+            partialHandler.Requests.Count == before + 1, "A failing attempt must contact upstream once.");
+        await (Task<bool>)Invoke(plugin, "CompactWithBackoffAsync", partial, primary, CancellationToken.None);
+        Check(partialHandler.Requests.Count == before + 1, "Compaction must be skipped during the backoff window.");
+        now += TimeSpan.FromSeconds(61);
+        await (Task<bool>)Invoke(plugin, "CompactWithBackoffAsync", partial, primary, CancellationToken.None);
+        Check(partialHandler.Requests.Count == before + 2, "Compaction must retry after the first backoff step.");
+        now += TimeSpan.FromMinutes(4);
+        await (Task<bool>)Invoke(plugin, "CompactWithBackoffAsync", partial, primary, CancellationToken.None);
+        Check(partialHandler.Requests.Count == before + 2, "Repeated failures must lengthen the backoff.");
+        failing = false;
+        partialHandler.Status = _ => HttpStatusCode.OK;
+        partialHandler.Respond = _ => Completion("recovered");
+        now += TimeSpan.FromMinutes(2);
+        Check(await (Task<bool>)Invoke(plugin, "CompactWithBackoffAsync", partial, primary, CancellationToken.None) &&
+            partial.Summary == "recovered" && Texts(partial.Turns).SequenceEqual(Texts(expectedKept)),
+            "Compaction must resume from saved progress after the backoff and reach the same boundary.");
+        var backoffs = (System.Collections.IDictionary)typeof(AiChatPlugin).GetField("_compactionBackoff", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plugin)!;
+        Check(backoffs.Count == 0, "Successful compaction must clear the backoff.");
+        plugin.CompactionClock = () => DateTimeOffset.UtcNow;
+
+        var urgent = new ConversationState(new ConversationKey("chunk", ChatScene.Group, "urgent", "u"));
+        urgent.Turns.AddRange(Rounds().Take(32));
+        Check((bool)Invoke(plugin, "NeedsCompaction", urgent) && !(bool)Invoke(plugin, "NeedsUrgentCompaction", urgent),
+            "History between 75% and 100% of the budget must compact after the reply, not before it.");
+        urgent.Turns.AddRange(Rounds());
+        Check((bool)Invoke(plugin, "NeedsUrgentCompaction", urgent), "History over the budget must compact before the reply.");
+    }
+    finally
+    {
+        (config.ToolUse.Memory.Enabled, config.History.MaxTurns, config.History.MaxTokens,
+            config.History.CompactModel, config.Default.FallbackModel, config.Default.RetryOnTimeoutDelayMs) = saved;
+        Directory.Delete(root, recursive: true);
+    }
+    Console.WriteLine("PASS: chunked compaction boundary, context-length halving, partial progress and silent backoff");
+}
+
 var messageContext = DispatchProxy.Create<IMessageContext, TestProxy>();
 var context = DispatchProxy.Create<IBotContext, TestProxy>();
 ((TestProxy)(object)context).Call = (method, _) => method.Name == "get_Message" ? messageContext : throw new NotSupportedException();
@@ -584,10 +801,9 @@ Console.WriteLine("PASS: private auto reply switch, ordinary text and image trig
 
 Check(config.Permissions.ClearAdminOnly && typeof(PermissionsSection).GetProperty("AllowUsers") is null && typeof(PermissionsSection).GetProperty("DenyUsers") is null,
     "Only administrative restrictions remain; clear defaults to admin-only.");
-config.OwnerPrompt.Enabled = false;
+config.OwnerPrompt.Template = "";
 var identityBase = (string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt");
 Check(identityBase.StartsWith("base prompt\n[身份标记规则"), "Identity metadata rules must always be present.");
-config.OwnerPrompt.Enabled = true;
 config.OwnerPrompt.Template = "主人是 789，QQ 123456，机器人使用 ShiroBot。{自定义文字}\n第二行";
 var identity = (string)Invoke(plugin, "ApplyOwnerPrompt", "base prompt");
 Check(identity == identityBase + "\n" + config.OwnerPrompt.Template, "Owner text must be appended verbatim, including braces and newlines.");
@@ -606,7 +822,7 @@ admin = true;
 Check(await (Task<bool>)Invoke(plugin, "CanClearAsync", direct), "Host administrator must be allowed.");
 admin = false; config.Permissions.ClearAdminOnly = false;
 Check(await (Task<bool>)Invoke(plugin, "CanClearAsync", direct), "Disabled restriction must allow clearing personal conversations.");
-config.Permissions.ClearAdminOnly = true; config.OwnerPrompt.Enabled = false;
+config.Permissions.ClearAdminOnly = true; config.OwnerPrompt.Template = "";
 Console.WriteLine("PASS: route-only access config, admin clear guard before mutation, optional owner template and no prompt-based privilege grants");
 
 CollectibleSerializationChecks.Run();

@@ -13,6 +13,8 @@ internal sealed class ConversationStore
 {
     /// <summary>会话文件中保存历史摘要的特殊行，始终位于第一行。</summary>
     internal const string SummaryRole = "summary";
+    /// <summary>会话文件中保存记忆本快照的特殊行，位于摘要之后。</summary>
+    internal const string MemorySnapshotRole = "memory_snapshot";
     private const string LegacySummaryPrefix = "[对话摘要] ";
 
     private readonly ConcurrentDictionary<ConversationKey, SemaphoreSlim> _locks = new();
@@ -155,6 +157,11 @@ internal sealed class ConversationStore
                     var summary = new ChatTurn(SummaryRole, [new TextPart(state.Summary)], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                     await writer.WriteLineAsync(PluginJson.Serialize(summary, _jsonOptions)).ConfigureAwait(false);
                 }
+                if (state.MemorySnapshot is { } snapshot)
+                {
+                    var line = new ChatTurn(MemorySnapshotRole, [new TextPart(PluginJson.Serialize(snapshot))], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    await writer.WriteLineAsync(PluginJson.Serialize(line, _jsonOptions)).ConfigureAwait(false);
+                }
                 foreach (var turn in state.Turns)
                 {
                     await writer.WriteLineAsync(PluginJson.Serialize(turn, _jsonOptions)).ConfigureAwait(false);
@@ -215,6 +222,9 @@ internal sealed class ConversationStore
                     if (turn is null) continue;
                     if (turn.Role == SummaryRole)
                         state.Summary = string.Concat(turn.Parts.OfType<TextPart>().Select(p => p.Text));
+                    else if (turn.Role == MemorySnapshotRole)
+                        state.MemorySnapshot = PluginJson.Deserialize<List<Memory.MemoryEntry>>(
+                            string.Concat(turn.Parts.OfType<TextPart>().Select(p => p.Text))) ?? [];
                     else
                         state.Turns.Add(turn);
                 }

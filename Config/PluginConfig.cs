@@ -61,9 +61,8 @@ public sealed class DefaultSection
     [ConfigField("可重试请求的总尝试次数，包含首次请求。适用于对话、历史压缩、生图和编辑。", Label = "请求最大尝试次数", Min = 1, Max = 5)]
     public int RetryOnTimeoutMaxAttempts { get; set; } = DefaultRetryAttempts;
 
-    /// <summary>重试前的基础等待毫秒数；后续重试线性递增。</summary>
-    [ConfigField("重试前的基础等待时间；后续重试线性递增。", Label = "重试等待（毫秒）", Min = 100, Max = 10000)]
-    public int RetryOnTimeoutDelayMs { get; set; } = DefaultRetryDelayMs;
+    /// <summary>重试前的基础等待毫秒数，后续重试线性递增。不在配置文件中暴露，测试可以调小。</summary>
+    internal int RetryOnTimeoutDelayMs { get; set; } = DefaultRetryDelayMs;
     [ConfigField("允许同时处理的 AI 请求数量；修改后重载插件生效。", Label = "最大并发请求数", Min = 1)]
     public int MaxConcurrency { get; set; } = 4;
 
@@ -111,28 +110,16 @@ public sealed class HistorySection
     [ConfigField("生成历史摘要使用的模型名称，可填更便宜的模型；留空使用当前对话的模型。", Label = "上下文压缩模型")]
     public string CompactModel { get; set; } = "";
     /// <summary>
-    /// 单会话的轮数压缩阈值，每轮包含用户消息和 AI 回复。
+    /// 轮数压缩阈值（每轮包含用户消息和 AI 回复），0 使用默认的 1000 轮安全上限。
+    /// 压缩主要由 MaxTokens 控制，不在配置文件中暴露，测试可以调小。
     /// </summary>
-    [ConfigField("接近此轮数时自动压缩成历史摘要；0 使用默认阈值 1000 轮。", Label = "历史轮数压缩阈值", Min = 0)]
-    public int MaxTurns { get; set; }
+    internal int MaxTurns { get; set; }
 
     /// <summary>
     /// 用于估算何时触发历史压缩的 Token 预算。
     /// </summary>
-    [ConfigField("历史估算用量超过此预算的 75% 时自动压缩成历史摘要。", Label = "历史压缩 Token 预算", Min = 1000)]
+    [ConfigField("历史估算用量超过此预算的 75% 时，在回复后自动压缩成历史摘要；超过 100% 时在回复前压缩。压缩后保留的原文和分块大小按它推算，不要超过聊天模型的上下文窗口。", Label = "历史压缩 Token 预算", Min = 1000)]
     public int MaxTokens { get; set; } = 128000;
-
-    [ConfigField("压缩后保留的近期原文估算 Token 上限，同时受历史压缩 Token 预算的四分之一限制。至少保留最近一轮。", Label = "压缩保留原文 Token", Min = 1)]
-    public int CompactKeepTokens { get; set; } = 16000;
-
-    [ConfigField("压缩后保留的近期原文轮数，同时受历史轮数压缩阈值的四分之一限制。每轮从一条用户消息开始。", Label = "压缩保留原文轮数", Min = 1)]
-    public int CompactKeepTurns { get; set; } = 32;
-
-    /// <summary>
-    /// 是否落盘到 JSONL。
-    /// </summary>
-    [ConfigField("将对话历史保存到磁盘 JSONL 文件；修改后重载插件生效。", Label = "持久化历史")]
-    public bool Persist { get; set; } = true;
 
     /// <summary>在后续请求中重新发送图片的最近用户轮次数。0 表示只保留文字摘要。</summary>
     [ConfigField("后续请求重新发送图片的最近用户轮数；0 仅保留文字摘要。", Label = "图片记忆轮数", Min = 0)]
@@ -170,9 +157,8 @@ public sealed class ResourcesSection
         "sh", "ps1", "sql", "lua", "rb", "php"
     ];
 
-    /// <summary>资源缓存目录，相对插件目录。</summary>
-    [ConfigField("相对于插件目录的资源缓存路径。", Label = "资源缓存目录")]
-    public string CacheDir { get; set; } = "data/resource_cache";
+    /// <summary>资源缓存目录，相对插件目录。不在配置文件中暴露。</summary>
+    internal string CacheDir { get; set; } = "data/resource_cache";
 
     /// <summary>缓存保留天数。小于等于 0 表示不按时间清理。</summary>
     [ConfigField("小于等于 0 表示不按时间清理。", Label = "缓存保留天数")]
@@ -182,9 +168,8 @@ public sealed class ResourcesSection
     [ConfigField("递归展开引用消息和合并转发的最大层数。", Label = "引用与转发展开深度", Min = 0)]
     public int RecursiveDepth { get; set; } = 3;
 
-    /// <summary>HTTP 下载超时（秒）。</summary>
-    [ConfigField("下载图片和文件的 HTTP 超时时间。", Label = "资源下载超时（秒）", Min = 1)]
-    public int DownloadTimeoutSeconds { get; set; } = 60;
+    /// <summary>下载图片和文件的 HTTP 超时（秒）。不在配置文件中暴露。</summary>
+    internal int DownloadTimeoutSeconds { get; set; } = 60;
 }
 
 public sealed class BehaviourSection
@@ -201,9 +186,9 @@ public sealed class BehaviourSection
     [ConfigField("优先使用 QQ 官方私聊流式回复；适配器、聊天场景或上游不支持时回退完整文本。", Label = "使用流式发送")]
     public bool UseStreaming { get; set; }
 
-    /// <summary>AI 回复超过此字符数时使用 QQ 合并转发折叠；小于等于 0 禁用。</summary>
-    [ConfigField("QQ 回复超过此字符数时使用合并转发折叠；0 禁用。", Label = "长回复折叠字数", Min = 0)]
-    public int FoldAboveChars { get; set; }
+    /// <summary>AI 回复超过此字符数时使用 QQ 合并转发折叠；小于等于 0 禁用。适用于所有回复模式和主动回复。</summary>
+    [ConfigField("QQ 上的 AI 回复超过此字数时收进合并转发聊天记录，适用于所有回复模式和主动回复；0 不折叠。", Label = "长回复折叠字数", Min = 0)]
+    public int FoldAboveChars { get; set; } = 400;
 
     [ConfigField("answer 回答：一问一答整条发送，超长时按“长回复折叠字数”折叠（默认，原来的行为）；chat 聊天：总是像真人一样分几条短消息发送，模型自行决定是否引用回复；auto 自动：模型每次在聊天和解答之间自选，解答时输出完整长内容，超长时收进聊天记录。chat 和 auto 需要模型稳定输出首行标记，小模型建议用 answer。", Label = "回复模式", Options = new[] { "answer", "chat", "auto" })]
     public string ReplyMode { get; set; } = "answer";
@@ -222,9 +207,6 @@ public sealed class BehaviourSection
     [ConfigField("聊天模式两条消息之间的基础间隔，实际还会按下一条的字数增加模拟打字时间（最多再加 3 秒）；0 表示不等待。", Label = "聊天模式发送间隔（毫秒）", Min = 0, Max = 10000)]
     public int ChatMessageDelayMs { get; set; } = 800;
 
-    [ConfigField("解答模式超过此字数时收进 QQ 合并转发聊天记录；0 表示不折叠。", Label = "解答模式折叠字数", Min = 0)]
-    public int AnswerFoldAboveChars { get; set; } = 400;
-
     [ConfigField("合并转发聊天记录中单条消息的最大字数，超出时按段落和句子拆成多条。", Label = "聊天记录单条字数", Min = 50)]
     public int ForwardNodeMaxChars { get; set; } = 600;
 
@@ -234,14 +216,6 @@ public sealed class BehaviourSection
 
     [ConfigField("群聊回复时 @ 原消息发送者，可与引用回复同时开启；私聊不添加 @。", Label = "@发送者回复")]
     public bool ReplyWithMention { get; set; }
-
-    /// <summary>当前模型不支持视觉但用户带了图片时是否提醒。</summary>
-    [ConfigField("模型不支持图片时提示用户图片已被忽略。", Label = "无视觉能力提醒")]
-    public bool WarnOnNoVision { get; set; } = true;
-
-    /// <summary>当 #ai 后没有任何内容时是否提示用法。</summary>
-    [ConfigField("当 #ai 后没有可处理内容时显示用法提示。", Label = "空输入使用提示")]
-    public bool HintOnEmptyInput { get; set; } = true;
 }
 
 public sealed class ProactiveSection
@@ -252,26 +226,27 @@ public sealed class ProactiveSection
     public string JudgeModel { get; set; } = "";
     [ConfigField("允许主动回复的群号；留空表示不在任何群主动回复。", Label = "主动回复群白名单")]
     public string[] Groups { get; set; } = [];
-    [ConfigField("消息里提到这些词（不需要 @）时视为在叫机器人，使用较短的冷却并让模型优先考虑回应，例如机器人的昵称、外号。", Label = "称呼关键词")]
+    [ConfigField("消息里提到这些词（不需要 @）时视为在叫机器人，使用较短的冷却并让模型优先考虑回应，例如机器人的昵称、外号。机器人当前的群昵称/名称始终算作称呼。", Label = "称呼关键词")]
     public string[] Keywords { get; set; } = [];
-    [ConfigField("把机器人当前的群昵称/名称也当作称呼关键词。", Label = "名称算作称呼")]
-    public bool IncludeBotName { get; set; } = true;
-    [ConfigField("没有提到机器人的普通消息也交给模型判断是否插话；关闭时只在被提到时判断。", Label = "允许主动插话")]
-    public bool Interject { get; set; } = true;
     [ConfigField("主动插话距机器人上次在本群回复结束（含被 @ 的回复和模型选择沉默）至少间隔的秒数；冷却期间进来的消息会在冷却结束后一起补判，等待超过 2 分钟的不补判。", Label = "主动插话冷却（秒）", Min = 0, Max = 86400)]
     public int CooldownSeconds { get; set; } = 10;
     [ConfigField("主动插话前，自上次判断以来群里至少要有这么多条其他消息，避免冷清时自说自话。", Label = "主动插话最少间隔消息数", Min = 0, Max = 1000)]
     public int MinMessagesBetween { get; set; } = 1;
     [ConfigField("决定接话后，生成正式回复时参考的群聊最近消息条数，优先通过适配器的历史消息接口获取。", Label = "回复参考最近消息数", Min = 1, Max = 100)]
     public int ContextMessages { get; set; } = 20;
-    [ConfigField("判断是否接话时只看这些近期文字消息和本批新消息，不加载完整会话、图片或工具；输入还有总长度限制。", Label = "判断参考最近消息数", Min = 1, Max = 20)]
-    public int JudgeContextMessages { get; set; } = 6;
-    [ConfigField("群里来消息后先等一个随机的安静窗口（最短秒数），期间有新消息就重新计时，安静下来后把这段时间的新消息一起判断一次，避免连续发消息时每条都请求模型。", Label = "安静窗口最短（秒）", Min = 0, Max = 120)]
-    public int QuietMinSeconds { get; set; } = 3;
-    [ConfigField("安静窗口的最长秒数，每次在最短和最长之间随机取值。", Label = "安静窗口最长（秒）", Min = 0, Max = 120)]
-    public int QuietMaxSeconds { get; set; } = 10;
-    [ConfigField("没被提到时模型插话的积极程度：low 只在有人找它或明显能帮上忙时开口；medium 被问到、有人求助、能补充有价值信息或有很好笑的点时开口；high 除非完全无关都接话。", Label = "活跃度", Options = new[] { "low", "medium", "high" })]
+    /// <summary>判断是否接话时参考的近期文字消息数。不在配置文件中暴露。</summary>
+    internal int JudgeContextMessages { get; set; } = 6;
+    /// <summary>
+    /// 安静窗口：来消息后随机等这么久，期间有新消息就重新计时，安静下来后把这段时间的新消息一起判断一次。
+    /// 不在配置文件中暴露，测试可以调整。
+    /// </summary>
+    internal int QuietMinSeconds { get; set; } = 3;
+    internal int QuietMaxSeconds { get; set; } = 10;
+    [ConfigField("没被提到时模型插话的积极程度：off 不主动插话，只在被提到时判断；low 只在有人找它或明显能帮上忙时开口；medium 被问到、有人求助、能补充信息、有好笑的点或能自然接上开放话题时开口；high 除非完全无关都接话。", Label = "活跃度", Options = new[] { "off", "low", "medium", "high" })]
     public string Eagerness { get; set; } = "medium";
+
+    /// <summary>活跃度为 off 时只在被提到时判断。</summary>
+    internal bool Interjects => !string.Equals(Eagerness?.Trim(), "off", StringComparison.OrdinalIgnoreCase);
     [ConfigField("自定义没被提到时的插话提示词，填写后代替活跃度对应的内置提示词；没有写 [skip] 时会自动补上“不想说话时只输出 [skip]”。留空使用内置提示词。", Label = "自定义插话提示词", Type = "text")]
     public string Prompt { get; set; } = "";
 }
@@ -377,10 +352,8 @@ public sealed class McpServerEntry
 
 public sealed class TavilySection
 {
-    [ConfigField("启用且填写 API 密钥时才向模型提供搜索工具。", Label = "启用 Tavily 搜索")]
-    public bool Enabled { get; set; } = true;
     /// <summary>留空时不注册网络搜索工具，也不向模型透露该能力。</summary>
-    [ConfigField("留空时不注册搜索工具。", Label = "Tavily API 密钥", Type = "password")]
+    [ConfigField("填写后向模型提供搜索工具；留空不启用。", Label = "Tavily API 密钥", Type = "password")]
     public string ApiKey { get; set; } = "";
 
     [ConfigField("单次搜索返回的最大结果数。", Label = "搜索结果数量", Min = 1, Max = 5)]
@@ -450,7 +423,7 @@ public sealed class TimerToolSection
 
 public sealed class MemoryToolSection
 {
-    [ConfigField("允许模型通过 memory_note 工具新增、修改、删除当前会话记忆本的条目，记忆本内容会附在对话提示词中。shared 模式一个群一本，multi 模式每人一本，single 模式不可用。", Label = "启用记忆本工具")]
+    [ConfigField("允许模型通过 memory_note 工具新增、修改、删除当前会话记忆本的条目，历史压缩时也会自动补记长期信息。记忆本内容会附在对话提示词中。shared 模式一个群一本，multi 模式每人一本，single 模式不可用。", Label = "启用记忆本工具")]
     public bool Enabled { get; set; }
     [ConfigField("每天本地时间 0 点用默认模型整理一次所有记忆本：删除过时、重复或无用的条目，合并相近内容。需同时启用记忆本工具。", Label = "每日整理记忆本")]
     public bool DailyReview { get; set; }
@@ -465,9 +438,7 @@ public sealed class OwnerPromptSection
     [ConfigField("用于聊天认主，按完整真实用户 ID 精确匹配，不授予管理权限。每项可填用户 ID，或填 实例ID/用户ID 限定适配器实例；留空则仅使用宿主主人配置。", Label = "Master 用户 ID")]
     public List<string> MasterIds { get; set; } = [];
 
-    [ConfigField("开启后将下方文本追加到聊天及定时推送提示词中，不影响实际管理权限。", Label = "启用主人提示词")]
-    public bool Enabled { get; set; }
-    [ConfigField("直接填写主人介绍、QQ 号、机器人框架等文字，开启后原样追加；留空不追加。", Label = "主人提示词", Type = "text")]
+    [ConfigField("直接填写主人介绍、QQ 号、机器人框架等文字，原样追加到聊天及定时推送提示词中，不影响实际管理权限；留空不追加。", Label = "主人提示词", Type = "text")]
     public string Template { get; set; } = "";
 }
 

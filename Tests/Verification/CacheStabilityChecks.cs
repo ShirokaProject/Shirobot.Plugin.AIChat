@@ -146,8 +146,9 @@ internal static class CacheStabilityChecks
                 Check(System(later) == System(first), "The system prompt must not change between requests of one conversation.");
                 Check(Tools(later) == Tools(first), "Tool definitions must not change between requests of one conversation.");
             }
-            Check(!System(first).Contains("[记忆本]\n") && LastUser(upstream.Requests[1]).Contains("alice 喜欢猫"),
-                "The memory notebook must be sent with the current user message, not in the system prompt.");
+            Check(!System(first).Contains("[记忆本：长期记忆条目") && LastUser(upstream.Requests[1]).Contains("[记忆本更新") &&
+                LastUser(upstream.Requests[1]).Contains("#1 alice 喜欢猫"),
+                "Memory changes after the snapshot must be sent with the current user message, not in the system prompt.");
             Check(!System(first).Contains("当前没有可用历史图片") && LastUser(first).Contains("当前没有可用历史图片"),
                 "The history image catalog must be sent with the current user message, not in the system prompt.");
             Console.WriteLine("PASS: system prompt and tool definitions stay identical across speakers, memory changes and proactive replies");

@@ -55,7 +55,7 @@ internal static class ProactiveChecks
         Check(trigger.TryTrigger("g1", "随便聊聊", config, now.AddHours(2).AddSeconds(20)) is null, "Replies must still start the interjection cooldown.");
         Check(trigger.TryTrigger("g2", "露露", config, now.AddHours(2).AddSeconds(10)) is not null, "Cooldowns are per group.");
         Check(trigger.TryTrigger("g2", "随便聊聊", config, now.AddHours(3)) is null, "A fresh group needs enough messages before interjecting.");
-        var mentionsOnly = new ProactiveSection { Enabled = true, Groups = ["g3"], Keywords = ["露露"], Interject = false, MinMessagesBetween = 0 };
+        var mentionsOnly = new ProactiveSection { Enabled = true, Groups = ["g3"], Keywords = ["露露"], Eagerness = "off", MinMessagesBetween = 0 };
         Check(trigger.TryTrigger("g3", "随便聊聊", mentionsOnly, now) is null && trigger.TryTrigger("g3", "露露", mentionsOnly, now) is not null,
             "With interjection off only mentions are judged.");
         // 冷却未到时给出补判等待时间；其他原因不触发时不补判。回复结束时冷却重新计时，但消息计数不清零。
@@ -77,8 +77,17 @@ internal static class ProactiveChecks
             "Mention detection must match keywords and bot names of at least two characters.");
         var burst = new ProactiveTrigger();
         Check(burst.Evaluate("b", mentioned: true, cfg, now).Prompt == ProactiveTrigger.KeywordPrompt, "A burst that mentioned the bot must use the mention prompt.");
-        Check(ProactiveTrigger.MediumPrompt.Contains("十几条消息里接一两条") && ProactiveTrigger.MediumPrompt.Contains(ProactiveTrigger.SkipTag),
-            "The medium prompt must stay restrained.");
+        Check(!ProactiveTrigger.MediumPrompt.Contains("十几条消息里接一两条") && ProactiveTrigger.MediumPrompt.Contains("两可时可以接一句") &&
+            ProactiveTrigger.MediumPrompt.Contains(ProactiveTrigger.SkipTag),
+            "The medium prompt must leave frequency to the cooldown and lean toward joining open topics.");
+        // 判断模型决定接话后，正式回复直接开口，不再按活跃度重新判断一次。
+        var decided = ProactiveTrigger.ReplyPrompt(new ProactiveSection(), mentioned: false);
+        var styled = ProactiveTrigger.ReplyPrompt(new ProactiveSection { Prompt = "说话带点东北味" }, mentioned: false);
+        Check(decided == ProactiveTrigger.DecidedInterjectPrompt && decided.Contains("你已经决定在这里插话") &&
+            !decided.Contains("普通闲聊") && !decided.Contains("两可时") &&
+            ProactiveTrigger.ReplyPrompt(new ProactiveSection { Prompt = "x" }, mentioned: true) == ProactiveTrigger.DecidedKeywordPrompt &&
+            styled.StartsWith(ProactiveTrigger.DecidedInterjectPrompt) && styled.Contains("说话带点东北味") && styled.Contains("是否开口已经决定"),
+            "The reply stage must not repeat the eagerness gate; custom prompts only guide style.");
 
         var window = typeof(AiChatPlugin).GetMethod("QuietWindow", BindingFlags.NonPublic | BindingFlags.Static)!;
         var quiet = new ProactiveSection { QuietMinSeconds = 3, QuietMaxSeconds = 10 };
@@ -88,7 +97,7 @@ internal static class ProactiveChecks
         Check((TimeSpan)window.Invoke(null, [new ProactiveSection { QuietMinSeconds = 5, QuietMaxSeconds = 1 }])! == TimeSpan.FromSeconds(5) &&
             (TimeSpan)window.Invoke(null, [new ProactiveSection { QuietMinSeconds = 0, QuietMaxSeconds = 0 }])! == TimeSpan.Zero,
             "A max below the min uses the min, and zero disables the wait.");
-        Console.WriteLine("PASS: burst mention carry-over, restrained medium prompt and random quiet window");
+        Console.WriteLine("PASS: burst mention carry-over, medium prompt, decided reply prompts and random quiet window");
         Console.WriteLine("PASS: cooldown-blocked messages report a retry delay, cooldown restarts at reply end, counts survive");
         Console.WriteLine("PASS: proactive whitelist, per-group context, model-judged interjections, name mentions, cooldowns and message gaps");
 

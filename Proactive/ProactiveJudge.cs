@@ -16,8 +16,8 @@ internal static class ProactiveJudge
     {
         Model = model,
         // Gemini includes hidden reasoning in this limit; 128 can truncate even
-        // the final closing bracket of a four-token decision marker.
-        MaxCompletionTokens = 256,
+        // the final closing bracket of a four-token decision marker; reasoning models need more headroom.
+        MaxCompletionTokens = 512,
         Messages =
         [
             new() { Role = "system", Content =
@@ -30,7 +30,8 @@ internal static class ProactiveJudge
                 "即使用第三人称称呼机器人，也不要一概当成无关讨论，例如“是不是某某下药了”“某某又发癫了”。" +
                 "只有中性提及名字、谈论旧事或引用转述而没有当前互动意图时才保持沉默；仍要结合语境判断，不能见到名字就必回。" +
                 "若只有图片或附件且文字不足以判断，不猜测其内容。" +
-                "严格只输出 [reply] 或 [skip]：适合参与输出 [reply]，不适合、拿不准或无需回应输出 [skip]。不要解释，不要使用工具。" },
+                "严格只输出 [reply] 或 [skip]：按参与规则适合参与输出 [reply]，否则输出 [skip]。" +
+                "拿不准时按参与规则中的倾向决定，规则没有说明时保持沉默。插话频率由系统另行控制，不需要你自己限制次数。不要解释，不要使用工具。" },
             new() { Role = "user", Content =
                 "[机器人名称]\n" + Clip(selfName.ReplaceLineEndings(" "), 64) +
                 "\n[其他称呼]\n" + string.Join("、", aliases.Take(16).Select(a => Clip(a.ReplaceLineEndings(" "), 32))) +

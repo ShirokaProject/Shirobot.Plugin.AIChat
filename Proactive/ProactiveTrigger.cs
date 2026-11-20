@@ -22,10 +22,11 @@ internal sealed class ProactiveTrigger
         "先判断：有人在叫你或在问你（即使没有 @、用的是外号或“你”）、有人提出你能帮上忙的问题、或者有你很自然想接的话，才开口；" + InterjectStyle +
         "大多数时候应该保持沉默：话题和你无关、别人在相互交流、或者你没什么特别好说的，只输出 " + SkipTag + "，不要输出别的内容。]";
 
-    /// <summary>medium：被问到、有人求助、能补充有价值的信息或真有好笑的点才开口，普通闲聊不接。</summary>
+    /// <summary>medium：被问到、有人求助、能补充信息、有好笑的点或能自然接上的开放话题时开口。</summary>
     internal const string MediumPrompt = InterjectIntro +
-        "只在这些情况开口：有人在问你或叫你（即使没有 @、用的是外号或“你”）、有人提出你能帮上忙的问题、你能补充明显有价值的信息、或者真的有特别好笑想接的点。" + InterjectStyle +
-        "普通闲聊、别人之间的对话、链接、表情、刷屏、或者你刚说过话时都不用接，这些情况只输出 " + SkipTag + "，不要输出别的内容。一般来说十几条消息里接一两条就够了。]";
+        "这些情况可以开口：有人在问你或叫你（即使没有 @、用的是外号或“你”）、有人提出你能帮上忙的问题、你能补充有价值的信息或纠正明显的错误、" +
+        "有好笑或有意思的点你自然想接、或者大家在聊的开放话题你能自然地说上一句。" + InterjectStyle +
+        "两个人之间明显的私下对话、单纯的链接、表情或刷屏不用接；两可时可以接一句，插话频率另有冷却控制。不接时只输出 " + SkipTag + "，不要输出别的内容。]";
 
     /// <summary>high：积极参与，除非完全无关都接话。</summary>
     internal const string HighPrompt = InterjectIntro +
@@ -49,6 +50,25 @@ internal sealed class ProactiveTrigger
             _ => MediumPrompt
         };
     }
+
+    /// <summary>
+    /// 判断模型已经决定接话后，正式回复使用的提示词：直接回复，不再按活跃度重新决定要不要说话，
+    /// 只在发现明显不该出现时保留 [skip]，避免两次保守判断叠加导致几乎不开口。
+    /// </summary>
+    internal const string DecidedInterjectPrompt = InterjectIntro +
+        "你已经决定在这里插话，直接说你想说的话。" + InterjectStyle +
+        "只有发现新消息里已经有人说完了你想说的、或者明显不需要你出现时，才只输出 " + SkipTag + "。]";
+
+    internal const string DecidedKeywordPrompt =
+        "[交互方式: 没有人 @ 你，但新消息里有人提到了你的名字或称呼，你已经决定回应。上面是群里之前的聊天记录和你上次看过之后的新消息。" +
+        "像群友一样简短随意地回应提到你的那条，新消息里其他人说的也可以顺带回应。" +
+        "只有发现那条明显不是在对你说话时，才只输出 " + SkipTag + "。]";
+
+    /// <summary>正式回复的提示词；自定义插话提示词只作为语气和风格参考附上。</summary>
+    internal static string ReplyPrompt(ProactiveSection config, bool mentioned) =>
+        mentioned ? DecidedKeywordPrompt
+        : string.IsNullOrWhiteSpace(config.Prompt) ? DecidedInterjectPrompt
+        : DecidedInterjectPrompt + "\n[插话风格参考：只参考其中的语气和风格，是否开口已经决定]\n" + config.Prompt.Trim();
 
     internal const string KeywordPrompt =
         "[交互方式: 没有人 @ 你，但新消息里这条出现了你的名字或称呼。上面是群里之前的聊天记录和你上次看过之后的新消息。" +
@@ -117,7 +137,7 @@ internal sealed class ProactiveTrigger
             var state = GetState(groupKey);
             if (!mentioned)
             {
-                if (!config.Interject) return default;
+                if (!config.Interjects) return default;
                 // 刚启动时也要先攒够消息，避免第一条消息就带着几乎空白的上下文插话。
                 if (state.MessagesSince < Math.Clamp(config.MinMessagesBetween, 0, 1000)) return default;
             }

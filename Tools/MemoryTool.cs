@@ -10,12 +10,12 @@ namespace ShiroBot.AiChatPlugin.Tools;
 /// <summary>让模型维护当前会话的记忆本。修改立即生效，同一条内容重复新增时直接返回已有条目。</summary>
 internal sealed class MemoryTool(MemoryNotebookStore store, MemoryToolSection config, ConversationKey key) : IChatTool
 {
-    internal const string Prompt = "你有一个记忆本，现有条目列在用户消息末尾的 [记忆本] 中，可用 memory_note 增改删。用户要求你记住或忘记某事时必须使用。也可以主动记录以后对话仍然有用的长期信息，例如某人的称呼、身份、偏好、约定和重要事实；不要记录寒暄、一次性问题或记忆本里已有的内容。信息变化时用 update 修改原条目，过时或错误时用 delete 删除。每条一句话，写清是谁的信息（群聊中带上对方的称呼）。记忆本满时先删除或合并旧条目。";
+    internal const string Prompt = "你有一个记忆本，可用 memory_note 增改删。条目列在 system prompt 末尾的 [记忆本] 中，之后的增改删列在用户消息末尾的 [记忆本更新] 中，两者合起来才是当前内容；都没有列出时记忆本为空。用户要求你记住或忘记某事时必须立即使用。得知以后对话仍然有用的长期信息时也要主动记录，例如某人的称呼、身份、偏好、约定和重要事实；不要记录寒暄、一次性问题或记忆本里已有的内容。信息变化时用 update 修改原条目，过时或错误时用 delete 删除。每条一句话，写清是谁的信息（群聊中带上对方的称呼）。记忆本满时先删除或合并旧条目。";
     public string SystemPrompt => Prompt;
     public int MaxCallsPerTurn => 5;
     public OpenAiTool Definition { get; } = new()
     {
-        Function = new OpenAiToolFunction { Name = "memory_note", Description = "Add, update or delete an entry in this conversation's long-term memory notebook.",
+        Function = new OpenAiToolFunction { Name = "memory_note", Description = "记录、修改或删除当前会话的长期记忆。用户要求记住或忘记时必须调用；得知某人的称呼、身份、偏好、约定或重要事实时主动调用。",
             Parameters = new { type = "object", additionalProperties = false, required = new[] { "action" }, properties = new {
                 action = new { type = "string", @enum = new[] { "add", "update", "delete" } },
                 id = new { type = "string", description = "Entry id without '#', required for update and delete." },
@@ -47,9 +47,9 @@ internal sealed class MemoryTool(MemoryNotebookStore store, MemoryToolSection co
                         return (false, PluginJson.Serialize(new { id = existing.Id, status = "already_exists" }));
                     if (entries.Count >= Math.Clamp(config.MaxEntries, 1, 200))
                         return (false, "Memory notebook is full. Delete or merge outdated entries first.");
-                    var next = entries.Select(e => int.TryParse(e.Id.TrimStart('m'), out var n) ? n : 0).DefaultIfEmpty(0).Max() + 1;
-                    entries.Add(new MemoryEntry("m" + next, text!, now));
-                    return (true, PluginJson.Serialize(new { id = "m" + next, status = "added" }));
+                    var next = MemoryNotebookStore.NextId(entries);
+                    entries.Add(new MemoryEntry(next, text!, now));
+                    return (true, PluginJson.Serialize(new { id = next, status = "added" }));
                 case "update":
                     if (index < 0) return (false, $"Entry {id} not found.");
                     entries[index] = entries[index] with { Text = text!, UpdatedAt = now };

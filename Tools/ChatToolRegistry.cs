@@ -25,7 +25,7 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
         if (skills.HasSkills) registry.Register(skills);
         else skills.Dispose();
         var tavily = config.ToolUse.Tavily;
-        if (tavily is { Enabled: true } && !string.IsNullOrWhiteSpace(tavily.ApiKey))
+        if (!string.IsNullOrWhiteSpace(tavily.ApiKey))
             registry.Register(new TavilySearchTool(tavily, config.Network.HttpProxy));
         if (config.ToolUse.HttpFetch.Enabled)
             registry.Register(new HttpFetchTool(config.ToolUse.HttpFetch, summarizePage));
