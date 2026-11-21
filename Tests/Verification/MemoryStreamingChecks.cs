@@ -58,11 +58,11 @@ internal static class MemoryStreamingChecks
                 await content.CopyToAsync(buffer);
                 using var json = JsonDocument.Parse(buffer.ToArray());
                 var r = json.RootElement;
-                Check(r.GetProperty("messages")[3].GetProperty("content")[1].GetProperty("image_url").GetProperty("url").GetString() == expected,
+                Check(r.GetProperty("messages")[2].GetProperty("content").EnumerateArray().Single(part => part.TryGetProperty("image_url", out _)).GetProperty("image_url").GetProperty("url").GetString() == expected,
                     "Historical image payload must be byte-equivalent.");
                 Check(r.GetProperty("tools")[0].GetProperty("function").GetProperty("name").GetString() == "test_tool"
-                    && r.GetProperty("messages")[5].GetProperty("tool_call_id").GetString() == "call1"
-                    && r.GetProperty("messages")[4].GetProperty("reasoning_content").GetString() == "reason"
+                    && r.GetProperty("messages")[4].GetProperty("tool_call_id").GetString() == "call1"
+                    && r.GetProperty("messages")[3].GetProperty("reasoning_content").GetString() == "reason"
                     && r.GetProperty("temperature").GetDouble() == .5 && r.GetProperty("max_completion_tokens").GetInt32() == 123
                     && r.GetProperty("stream").GetBoolean(), "Tools, reasoning and request options must survive streaming.");
             }

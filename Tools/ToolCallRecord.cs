@@ -13,6 +13,53 @@ namespace ShiroBot.AiChatPlugin.Tools;
 internal static partial class ToolCallRecord
 {
     internal const string Prefix = "[程序记录：本轮实际执行的工具调用，由程序自动添加，不是回复文字；";
+    private const string RecordStart = "[程序记录";
+
+    /// <summary>历史中助手消息里的程序记录（工具调用记录、生图完成记录）。</summary>
+    internal static bool IsRecord(string text) => text.StartsWith(RecordStart, StringComparison.Ordinal);
+
+    /// <summary>
+    /// 程序记录放在助手消息里时，模型会把它当成自己说过的话，回复开头跟着写一段“[程序记录：…]”。
+    /// 发送请求时改放到下一条用户消息开头，措辞也改成说明是上一条回复对应的记录。
+    /// </summary>
+    internal static string ForUserSide(string record)
+    {
+        if (record.StartsWith(Prefix, StringComparison.Ordinal))
+            return "[程序记录：你上一条回复实际执行的工具调用，由程序自动添加，不是任何人发送的消息；" + record[Prefix.Length..];
+        if (record.StartsWith(Conversation.ImagePart.GeneratedRecordPrefix, StringComparison.Ordinal))
+            return "[程序记录：imagegen 工具已生成并单独发送了一张图片，由程序自动添加，不是任何人发送的消息；提示词：" +
+                record[Conversation.ImagePart.GeneratedRecordPrefix.Length..];
+        return record;
+    }
+
+    /// <summary>去掉模型在回复里模仿写出的“[程序记录…]”段落（按方括号配对，没有闭合时删到行尾）。</summary>
+    internal static string StripEchoes(string text)
+    {
+        var start = text.IndexOf(RecordStart, StringComparison.Ordinal);
+        if (start < 0) return text;
+        var output = new StringBuilder(text.Length);
+        var position = 0;
+        while (start >= 0)
+        {
+            output.Append(text, position, start - position);
+            var depth = 0;
+            var end = -1;
+            for (var i = start; i < text.Length; i++)
+            {
+                if (text[i] == '[') depth++;
+                else if (text[i] == ']' && --depth == 0) { end = i + 1; break; }
+            }
+            if (end < 0)
+            {
+                end = text.IndexOf('\n', start);
+                if (end < 0) end = text.Length;
+            }
+            position = end;
+            start = text.IndexOf(RecordStart, position, StringComparison.Ordinal);
+        }
+        output.Append(text, position, text.Length - position);
+        return output.ToString().Trim();
+    }
 
     /// <summary>从工具循环追加的消息里整理出本轮执行过的工具；没有调用工具时返回空字符串。</summary>
     internal static string Describe(IReadOnlyList<OpenAiMessage> transcript)

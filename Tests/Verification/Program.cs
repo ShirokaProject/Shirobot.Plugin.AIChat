@@ -1013,8 +1013,10 @@ await DisabledToolCommandChecks.RunAsync();
     var history = Enumerable.Range(0, 12).Select(i => new ChatTurn("user", [new TextPart($"消息{i}"), image], i)).ToList();
     var current = new ChatTurn("user", [new TextPart("当前"), image], 99);
     var first = imagePolicyPlugin.BuildVisionMessages("stable", history, current, true);
-    Check(first.Take(history.Count + 2).All(message => !message.HasImage) && first[^1].HasImage,
+    Check(first.Count == history.Count + 2 && first.Take(history.Count + 1).All(message => !message.HasImage) && first[^1].HasImage,
         "History images must be absent from the stable text prefix.");
+    Check(first[^1].Role == "user" && first[^1].Segments[0].Text == "当前",
+        "Images must be appended to the current user message, not sent as an extra trailing message.");
     Check(first.SelectMany(message => message.Segments).Count(segment => segment.Kind == SegmentKind.Image) == 1,
         "By default only current/quoted images are resent.");
     imagePolicyConfig.History.ImageMemoryTurns = 12;
@@ -1028,6 +1030,30 @@ await DisabledToolCommandChecks.RunAsync();
     Check(!imagePolicyPlugin.BuildVisionMessages("stable", history, current, false).Any(message => message.HasImage),
         "Non-vision fallback must never receive image payloads.");
     Console.WriteLine("PASS: image eviction, bounded tail payload and stable text prefix");
+
+    var toolRecord = ToolCallRecord.Prefix + "web_search（天气）→ 晴]";
+    var recordHistory = new List<ChatTurn>
+    {
+        new("user", [new TextPart("[张三/123456] 查下天气")], 1),
+        new("assistant", [new TextPart(toolRecord), new TextPart("今天晴")], 2),
+        new("assistant", [new TextPart(ImagePart.GeneratedRecord("a cat")), image], 3),
+        new("user", [new TextPart("[李四/654321] 谢谢")], 4),
+        new("assistant", [new TextPart(toolRecord), new TextPart("不客气")], 5)
+    };
+    var rendered = imagePolicyPlugin.BuildVisionMessages("stable", recordHistory, new ChatTurn("user", [new TextPart("再来")], 6), false);
+    string Text(ChatMessageDescriptor message) => string.Concat(message.Segments.Select(segment => segment.Text));
+    Check(rendered.Count == 6 && rendered.Where(message => message.Role == "assistant").All(message => !Text(message).Contains("程序记录"))
+        && Text(rendered[2]) == "今天晴" && Text(rendered[4]) == "不客气",
+        "Program records must not stay inside assistant messages.");
+    Check(Text(rendered[3]).StartsWith("[程序记录：你上一条回复实际执行的工具调用") && Text(rendered[3]).Contains("imagegen 工具已生成并单独发送了一张图片")
+        && Text(rendered[3]).Contains("[李四/654321] 谢谢") && Text(rendered[5]).StartsWith("[程序记录：你上一条回复") && Text(rendered[5]).Contains("再来"),
+        "Program records must lead the following user message.");
+    var echoed = ToolCallRecord.Prefix + "get_message（id=1）→ Message: [张三/123456] [图片] Attachment: [file_id: x]][chat+reply]\n破案了\n" +
+        ImagePart.GeneratedRecord("a cute bird");
+    Check(ToolCallRecord.StripEchoes(echoed) == "[chat+reply]\n破案了", "Echoed program records must be removed from replies.");
+    Check(ToolCallRecord.StripEchoes("正常回复 [不相关]") == "正常回复 [不相关]" && ToolCallRecord.StripEchoes("前文\n[程序记录：没闭合\n后文") == "前文\n\n后文",
+        "Only program records are removed; unclosed ones end at the line break.");
+    Console.WriteLine("PASS: program records move to user messages and echoed records are stripped");
 }
 await CacheStabilityChecks.RunAsync();
 await RichReplyChecks.RunAsync();
