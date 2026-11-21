@@ -9,6 +9,7 @@ using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
+using ShiroBot.AiChatPlugin.Tools.Images;
 
 internal static class ImageEditQuoteChecks
 {

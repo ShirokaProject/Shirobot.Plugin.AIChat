@@ -54,12 +54,12 @@ public sealed partial class AiChatPlugin
                 Ui.Metric("上游输出 Token", total.UsageRequests == 0 ? "—" : total.CompletionTokens.ToString("N0")),
                 Ui.Metric("返回用量", $"{total.UsageRequests:N0}/{total.Requests:N0} 次")),
             Ui.Row(
-                Ui.Metric("本地前缀复用率", Rate(total.LocalRate), $"覆盖 {total.LocalRequests:N0} 次请求；按 UTF-8 字节计算"),
+                Ui.Metric("本地前缀复用率", Rate(total.LocalRate), $"覆盖 {total.LocalTokenRequests:N0} 次请求；按估算 Token 计算"),
                 Ui.Metric("上游缓存命中率", Rate(total.CacheRate), CacheHint(total)),
-                Ui.Metric("本地复用量", Bytes(total.LocalReusableBytes), $"请求内容共 {Bytes(total.LocalInputBytes)}")),
-            Ui.Text("本地在实际发送时比较同一实例、会话和上游模型的工具定义与消息（含图片），统计完整工具/消息边界前相同的 UTF-8 字节。它确认前缀复用，不代表服务商实际命中缓存；上游命中率按返回的缓存 Token 计算；有的上游只在命中时才返回缓存字段，同一上游模型返回过一次后，缺少字段的请求按 0 命中计。首次、重启后及独立用途请求从 0 开始。"),
-            Ui.Text(total.ComparedPromptTokens > 0
-                ? $"同时具备两项数据的请求：本地复用 {Rate(total.ComparedLocalRate)}（字节），上游命中 {Rate(total.ComparedCacheRate)}（Token）。"
+                Ui.Metric("本地复用量", $"约 {total.LocalReusableTokens:N0} Token", $"请求内容共约 {total.LocalInputTokens:N0} Token（{Bytes(total.LocalInputBytes)}）")),
+            Ui.Text($"本地在实际发送时比较同一实例、会话和上游模型的工具定义与消息（含图片），统计完整工具/消息边界前相同部分的估算 Token：中日韩文字约 1 字 1 Token、其他字符约 4 个 1 Token，每张图片按 {TokenEstimate.ImageTokens} Token 计，不按 base64 体积。它确认前缀复用，不代表服务商实际命中缓存；上游命中率按返回的缓存 Token 计算；有的上游只在命中时才返回缓存字段，同一上游模型返回过一次后，缺少字段的请求按 0 命中计。首次、重启后及独立用途请求从 0 开始。"),
+            Ui.Text(total.ComparedTokenPromptTokens > 0
+                ? $"同时具备两项数据的请求：本地复用 {Rate(total.ComparedLocalRate)}，上游命中 {Rate(total.ComparedTokenCacheRate)}（均按 Token）。"
                 : "还没有同时具备本地前缀和上游缓存信息的请求；上游未返回时仍会记录本地复用。"),
             Ui.Empty("还没有完成的模型请求。", total.Requests == 0),
             Ui.Tabs("view",
@@ -78,8 +78,10 @@ public sealed partial class AiChatPlugin
                         .Column("上游输入", record => record.UsageReported ? record.PromptTokens.ToString("N0") : "未返回")
                         .Column("上游命中", record => record.CachedTokens is { } cached
                             ? $"{cached:N0}（{Rate(record.PromptTokens == 0 ? null : (double)cached / record.PromptTokens)}）" : "未返回")
-                        .Column("本地复用", record => record.LocalInputBytes is { } input
-                            ? $"{Rate(input == 0 ? null : (double)(record.LocalReusableBytes ?? 0) / input)}（{Bytes(record.LocalReusableBytes ?? 0)}/{Bytes(input)}）" : "未采集")
+                        .Column("本地复用", record => record.LocalInputTokens is { } inputTokens
+                            ? $"{Rate(inputTokens == 0 ? null : (double)(record.LocalReusableTokens ?? 0) / inputTokens)}（约 {record.LocalReusableTokens ?? 0:N0}/{inputTokens:N0} Token）"
+                            : record.LocalInputBytes is { } input
+                                ? $"{Rate(input == 0 ? null : (double)(record.LocalReusableBytes ?? 0) / input)}（旧记录按字节：{Bytes(record.LocalReusableBytes ?? 0)}/{Bytes(input)}）" : "未采集")
                         .Column("上游输出", record => record.UsageReported ? record.CompletionTokens.ToString("N0") : "未返回")
                         .Column("消息/图片/工具", record => $"{record.Messages}/{record.Images}/{record.Tools}")
                         .Column("前缀变化", record => record.Change),

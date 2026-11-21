@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.SDK.Plugin;
+using ShiroBot.AiChatPlugin.Tools.Mcp;
 
 namespace ShiroBot.AiChatPlugin.Tools;
 

@@ -279,7 +279,7 @@ internal sealed class ConversationStore
                     if (turn.Role == SummaryRole)
                         state.Summary = string.Concat(turn.Parts.OfType<TextPart>().Select(p => p.Text));
                     else if (turn.Role == MemorySnapshotRole)
-                        state.MemorySnapshot = PluginJson.Deserialize<List<Memory.MemoryEntry>>(
+                        state.MemorySnapshot = PluginJson.Deserialize<List<Tools.Memory.MemoryEntry>>(
                             string.Concat(turn.Parts.OfType<TextPart>().Select(p => p.Text))) ?? [];
                     else
                         state.Turns.Add(UpgradeGeneratedImageRecord(turn));

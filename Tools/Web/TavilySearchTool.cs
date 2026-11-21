@@ -3,7 +3,7 @@ using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Web;
 
 internal sealed class TavilySearchTool(TavilySection config, string httpProxy) : IReadOnlyChatTool
 {

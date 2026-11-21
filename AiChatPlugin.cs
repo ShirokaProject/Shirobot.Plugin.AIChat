@@ -9,10 +9,10 @@ using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.AiChatPlugin.UserState;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.AiChatPlugin.Delivery;
-using ShiroBot.AiChatPlugin.Mcp;
-using ShiroBot.AiChatPlugin.Memory;
+using ShiroBot.AiChatPlugin.Tools.Mcp;
+using ShiroBot.AiChatPlugin.Tools.Memory;
 using ShiroBot.AiChatPlugin.Proactive;
-using ShiroBot.AiChatPlugin.Timers;
+using ShiroBot.AiChatPlugin.Tools.Timers;
 using ShiroBot.AiChatPlugin.Usage;
 using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
@@ -20,8 +20,9 @@ using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
+using ShiroBot.AiChatPlugin.Tools.Web;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.9")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.10")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -32,7 +33,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.4.9",
+    Version = "1.4.10",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -2681,22 +2682,11 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
     {
         TextPart text => EstimateTokens(text.Text),
         FileTextPart file => EstimateTokens(file.Excerpt) + 20,
-        ImagePart => 800,
+        ImagePart => TokenEstimate.ImageTokens,
         _ => 20
     });
 
-    /// <summary>粗略估算：CJK 字符约 1 token，其他字符约 4 个 1 token。</summary>
-    private static int EstimateTokens(string text)
-    {
-        var cjk = 0;
-        var other = 0;
-        foreach (var rune in text.EnumerateRunes())
-        {
-            if (rune.Value >= 0x2E80) cjk++;
-            else other++;
-        }
-        return cjk + (other + 3) / 4;
-    }
+    private static int EstimateTokens(string text) => TokenEstimate.Text(text);
 
     private static string TurnToTranscript(ChatTurn turn) => string.Join(" ", turn.Parts.Select(part => part switch
     {

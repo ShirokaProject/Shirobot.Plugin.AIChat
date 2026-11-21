@@ -2,7 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Web;
 
 /// <summary>遇到本机 Fake-IP 时查询可信公网 DNS；DoH 连接固定公网地址，不依赖本机 DNS，也不关闭 TLS 验证。</summary>
 internal static class PublicDnsResolver

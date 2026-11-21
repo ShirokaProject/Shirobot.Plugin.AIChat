@@ -2,17 +2,23 @@ using System.Security.Cryptography;
 
 namespace ShiroBot.AiChatPlugin.Usage;
 
-internal sealed record PrefixPoint(long Bytes, string Hash);
-internal sealed record PrefixSnapshot(long Bytes, PrefixPoint[] Points)
+/// <param name="Tokens">到这个边界为止的估算 token（图片按固定数量计），见 <see cref="TokenEstimate"/>。</param>
+internal sealed record PrefixPoint(long Bytes, string Hash, long Tokens = 0);
+internal sealed record PrefixSnapshot(long Bytes, PrefixPoint[] Points, long Tokens = 0)
 {
-    public long CommonBytes(PrefixSnapshot? previous)
+    public long CommonBytes(PrefixSnapshot? previous) => Common(previous)?.Bytes ?? 0;
+
+    public long CommonTokens(PrefixSnapshot? previous) => Common(previous)?.Tokens ?? 0;
+
+    /// <summary>和上一次请求相同的最后一个完整边界。</summary>
+    private PrefixPoint? Common(PrefixSnapshot? previous)
     {
-        if (previous is null) return 0;
-        long common = 0;
+        if (previous is null) return null;
+        PrefixPoint? common = null;
         for (var i = 0; i < Points.Length && i < previous.Points.Length; i++)
         {
             if (Points[i] != previous.Points[i]) break;
-            common = Points[i].Bytes;
+            common = Points[i];
         }
         return common;
     }
@@ -24,12 +30,15 @@ internal sealed class PrefixCaptureStream(Stream inner) : Stream
     private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
     private readonly List<PrefixPoint> _points = [];
     private long _bytes;
-    public void Checkpoint()
+    private long _tokens;
+    /// <param name="tokens">上一个边界到这里的内容估算 token。</param>
+    public void Checkpoint(long tokens = 0)
     {
+        _tokens += tokens;
         // 极长上下文只保留前 4096 个完整边界，复用量仍是保守值。
-        if (_points.Count < 4096) _points.Add(new(_bytes, Convert.ToHexString(_hash.GetCurrentHash())));
+        if (_points.Count < 4096) _points.Add(new(_bytes, Convert.ToHexString(_hash.GetCurrentHash()), _tokens));
     }
-    public PrefixSnapshot Snapshot() => new(_bytes, _points.ToArray());
+    public PrefixSnapshot Snapshot() => new(_bytes, _points.ToArray(), _tokens);
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
     {
         await inner.WriteAsync(buffer, ct).ConfigureAwait(false);

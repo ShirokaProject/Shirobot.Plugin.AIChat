@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using ShiroBot.AiChatPlugin.Config;
 
-namespace ShiroBot.AiChatPlugin.OpenAi;
+namespace ShiroBot.AiChatPlugin.Tools.Images;
 
 internal static class ImageGenerationCommand
 {

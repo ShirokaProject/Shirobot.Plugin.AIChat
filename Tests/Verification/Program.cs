@@ -7,7 +7,7 @@ using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Contracts;
 using ShiroBot.AiChatPlugin.Conversation;
-using ShiroBot.AiChatPlugin.Memory;
+using ShiroBot.AiChatPlugin.Tools.Memory;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.AiChatPlugin.UserState;
@@ -18,6 +18,7 @@ using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Plugin;
 using PluginJson = ShiroBot.AiChatPlugin.PluginJson;
 using Tomlyn;
+using ShiroBot.AiChatPlugin.Tools.Web;
 
 static void Check(bool condition, string message)
 {
@@ -1054,6 +1055,22 @@ await DisabledToolCommandChecks.RunAsync();
     Check(ToolCallRecord.StripEchoes("正常回复 [不相关]") == "正常回复 [不相关]" && ToolCallRecord.StripEchoes("前文\n[程序记录：没闭合\n后文") == "前文\n\n后文",
         "Only program records are removed; unclosed ones end at the line break.");
     Console.WriteLine("PASS: program records move to user messages and echoed records are stripped");
+
+    var loopMessages = new List<OpenAiMessage>
+    {
+        new() { Role = "system", Content = "stable" },
+        new() { Role = "user", Content = new ChatMessageDescriptor { Role = "user", Segments = [new ContentSegment { Kind = SegmentKind.Text, Text = "看看那张图" }] } },
+        new() { Role = "assistant", Content = "", ToolCalls = [new OpenAiToolCall { Id = "c1", Function = new() { Name = "get_message", Arguments = "{}" } }] },
+        new() { Role = "tool", ToolCallId = "c1", Content = "ok" }
+    };
+    ChatToolRegistry.AppendAttachments(loopMessages, [new OpenAiMessage { Role = "user", Content = new ChatMessageDescriptor { Role = "user", Segments = [
+        new ContentSegment { Kind = SegmentKind.Text, Text = "[工具读取的图片]" }, new ContentSegment { Kind = SegmentKind.Image, ImageFilePath = "/tmp/x.png", Mime = "image/png" }] } }]);
+    Check(loopMessages.Count == 4 && loopMessages[^1].Role == "tool" && loopMessages[1].Content is ChatMessageDescriptor { HasImage: true, Segments.Count: 3 },
+        "Tool-loaded images must be appended to the current user message instead of a new trailing user message.");
+    var noUser = new List<OpenAiMessage> { new() { Role = "system", Content = "timer" } };
+    ChatToolRegistry.AppendAttachments(noUser, [new OpenAiMessage { Role = "user", Content = "img" }]);
+    Check(noUser.Count == 2, "Without a user message the attachment is still sent.");
+    Console.WriteLine("PASS: tool-loaded images join the current user message");
 }
 await CacheStabilityChecks.RunAsync();
 await RichReplyChecks.RunAsync();

@@ -1,9 +1,9 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using ShiroBot.AiChatPlugin.Mcp;
+using ShiroBot.AiChatPlugin.Tools.Mcp;
 using ShiroBot.AiChatPlugin.OpenAi;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Mcp;
 
 /// <summary>把一个 MCP 工具包装成模型可调用的函数；连接由 McpHub 持有，这里不释放任何资源。</summary>
 internal sealed class McpChatTool(McpHub hub, string toolName, string server, McpToolInfo tool, int maxCallsPerTurn) : IChatTool

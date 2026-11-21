@@ -3,7 +3,7 @@ using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Timers;
+namespace ShiroBot.AiChatPlugin.Tools.Timers;
 
 /// <summary>到点需要 @ 的群成员；为空时提醒创建者本人。</summary>
 internal sealed record TimerTarget(string UserId, string Name);

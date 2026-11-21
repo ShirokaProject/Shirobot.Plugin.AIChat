@@ -10,7 +10,8 @@ internal sealed record UsageRecord(
     DateTimeOffset At, string Model, string Source, string Purpose,
     int PromptTokens, int CompletionTokens, int? CachedTokens,
     int Messages, int Images, int Tools, int CommonMessages = 0, string Change = "",
-    bool UsageReported = true, long? LocalInputBytes = null, long? LocalReusableBytes = null);
+    bool UsageReported = true, long? LocalInputBytes = null, long? LocalReusableBytes = null,
+    long? LocalInputTokens = null, long? LocalReusableTokens = null);
 
 /// <summary>一组请求的合计。缓存命中率只按返回了缓存信息的请求计算。</summary>
 internal sealed class UsageTotals
@@ -30,9 +31,18 @@ internal sealed class UsageTotals
     public long ComparedReusableBytes { get; set; }
     public long ComparedPromptTokens { get; set; }
     public long ComparedCachedTokens { get; set; }
+    // 本地复用率按估算 token 计算（图片按固定数量计）；旧版本只记录了字节，这些请求不计入 token 口径。
+    public long LocalTokenRequests { get; set; }
+    public long LocalInputTokens { get; set; }
+    public long LocalReusableTokens { get; set; }
+    public long ComparedLocalTokens { get; set; }
+    public long ComparedReusableTokens { get; set; }
+    public long ComparedTokenPromptTokens { get; set; }
+    public long ComparedTokenCachedTokens { get; set; }
 
-    public double? LocalRate => LocalInputBytes == 0 ? null : (double)LocalReusableBytes / LocalInputBytes;
-    public double? ComparedLocalRate => ComparedLocalBytes == 0 ? null : (double)ComparedReusableBytes / ComparedLocalBytes;
+    public double? LocalRate => LocalInputTokens == 0 ? null : (double)LocalReusableTokens / LocalInputTokens;
+    public double? ComparedLocalRate => ComparedLocalTokens == 0 ? null : (double)ComparedReusableTokens / ComparedLocalTokens;
+    public double? ComparedTokenCacheRate => ComparedTokenPromptTokens == 0 ? null : (double)ComparedTokenCachedTokens / ComparedTokenPromptTokens;
     public double? ComparedCacheRate => ComparedPromptTokens == 0 ? null : (double)ComparedCachedTokens / ComparedPromptTokens;
 
     public double? CacheRate => CacheKnownPromptTokens == 0 ? null : (double)CachedTokens / CacheKnownPromptTokens;
@@ -52,6 +62,13 @@ internal sealed class UsageTotals
         ComparedReusableBytes += other.ComparedReusableBytes;
         ComparedPromptTokens += other.ComparedPromptTokens;
         ComparedCachedTokens += other.ComparedCachedTokens;
+        LocalTokenRequests += other.LocalTokenRequests;
+        LocalInputTokens += other.LocalInputTokens;
+        LocalReusableTokens += other.LocalReusableTokens;
+        ComparedLocalTokens += other.ComparedLocalTokens;
+        ComparedReusableTokens += other.ComparedReusableTokens;
+        ComparedTokenPromptTokens += other.ComparedTokenPromptTokens;
+        ComparedTokenCachedTokens += other.ComparedTokenCachedTokens;
     }
 }
 
@@ -104,7 +121,11 @@ internal sealed class UsageStats
                 record = record with { CommonMessages = common, Change = change };
             }
             if (prefix is not null)
-                record = record with { LocalInputBytes = prefix.Bytes, LocalReusableBytes = prefix.CommonBytes(previous.Prefix) };
+                record = record with
+                {
+                    LocalInputBytes = prefix.Bytes, LocalReusableBytes = prefix.CommonBytes(previous.Prefix),
+                    LocalInputTokens = prefix.Tokens, LocalReusableTokens = prefix.CommonTokens(previous.Prefix)
+                };
             if (compareKey is not null)
             {
                 // 只保存最近 256 个比较范围的摘要，不保存正文；重启后重新建立基线。
@@ -127,6 +148,19 @@ internal sealed class UsageStats
                     totals.ComparedReusableBytes += record.LocalReusableBytes ?? 0;
                     totals.ComparedPromptTokens += record.PromptTokens;
                     totals.ComparedCachedTokens += comparableCached;
+                }
+            }
+            if (record.LocalInputTokens is { } inputTokens)
+            {
+                totals.LocalTokenRequests++;
+                totals.LocalInputTokens += inputTokens;
+                totals.LocalReusableTokens += record.LocalReusableTokens ?? 0;
+                if (record.CachedTokens is { } comparableCached)
+                {
+                    totals.ComparedLocalTokens += inputTokens;
+                    totals.ComparedReusableTokens += record.LocalReusableTokens ?? 0;
+                    totals.ComparedTokenPromptTokens += record.PromptTokens;
+                    totals.ComparedTokenCachedTokens += comparableCached;
                 }
             }
             totals.PromptTokens += record.PromptTokens;
@@ -209,7 +243,14 @@ internal sealed class UsageStats
                         ComparedLocalBytes = Long(item, "compared_local_bytes"),
                         ComparedReusableBytes = Long(item, "compared_reusable_bytes"),
                         ComparedPromptTokens = Long(item, "compared_prompt_tokens"),
-                        ComparedCachedTokens = Long(item, "compared_cached_tokens")
+                        ComparedCachedTokens = Long(item, "compared_cached_tokens"),
+                        LocalTokenRequests = Long(item, "local_token_requests"),
+                        LocalInputTokens = Long(item, "local_input_tokens"),
+                        LocalReusableTokens = Long(item, "local_reusable_tokens"),
+                        ComparedLocalTokens = Long(item, "compared_local_tokens"),
+                        ComparedReusableTokens = Long(item, "compared_reusable_tokens"),
+                        ComparedTokenPromptTokens = Long(item, "compared_token_prompt_tokens"),
+                        ComparedTokenCachedTokens = Long(item, "compared_token_cached_tokens")
                     };
                 }
                 foreach (var item in Items(doc.RootElement, "cache_reporters"))
@@ -223,7 +264,8 @@ internal sealed class UsageStats
                         (int)Long(item, "messages"), (int)Long(item, "images"), (int)Long(item, "tools"),
                         (int)Long(item, "common_messages"), Str(item, "change"),
                         !item.TryGetProperty("usage_reported", out var reported) || reported.ValueKind != JsonValueKind.False,
-                        OptionalLong(item, "local_input_bytes"), OptionalLong(item, "local_reusable_bytes")));
+                        OptionalLong(item, "local_input_bytes"), OptionalLong(item, "local_reusable_bytes"),
+                        OptionalLong(item, "local_input_tokens"), OptionalLong(item, "local_reusable_tokens")));
                 }
                 Prune();
             }
@@ -294,6 +336,13 @@ internal sealed class UsageStats
                 writer.WriteNumber("compared_reusable_bytes", totals.ComparedReusableBytes);
                 writer.WriteNumber("compared_prompt_tokens", totals.ComparedPromptTokens);
                 writer.WriteNumber("compared_cached_tokens", totals.ComparedCachedTokens);
+                writer.WriteNumber("local_token_requests", totals.LocalTokenRequests);
+                writer.WriteNumber("local_input_tokens", totals.LocalInputTokens);
+                writer.WriteNumber("local_reusable_tokens", totals.LocalReusableTokens);
+                writer.WriteNumber("compared_local_tokens", totals.ComparedLocalTokens);
+                writer.WriteNumber("compared_reusable_tokens", totals.ComparedReusableTokens);
+                writer.WriteNumber("compared_token_prompt_tokens", totals.ComparedTokenPromptTokens);
+                writer.WriteNumber("compared_token_cached_tokens", totals.ComparedTokenCachedTokens);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
@@ -319,6 +368,8 @@ internal sealed class UsageStats
                 writer.WriteBoolean("usage_reported", record.UsageReported);
                 if (record.LocalInputBytes is { } input) writer.WriteNumber("local_input_bytes", input);
                 if (record.LocalReusableBytes is { } reusable) writer.WriteNumber("local_reusable_bytes", reusable);
+                if (record.LocalInputTokens is { } inputTokens) writer.WriteNumber("local_input_tokens", inputTokens);
+                if (record.LocalReusableTokens is { } reusableTokens) writer.WriteNumber("local_reusable_tokens", reusableTokens);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();

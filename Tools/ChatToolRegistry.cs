@@ -3,6 +3,7 @@ using System.Text.Json;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.SDK.Abstractions;
+using ShiroBot.AiChatPlugin.Tools.Web;
 
 namespace ShiroBot.AiChatPlugin.Tools;
 
@@ -147,9 +148,30 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
             var results = await ExecuteCallsAsync(response.ToolCalls, tools, calls, model.Name, round + 1, ct, readOnlyOnly).ConfigureAwait(false);
             messages.AddRange(results);
             foreach (var source in tools.Values.OfType<IToolAttachments>().Distinct())
-                messages.AddRange(source.TakeAttachments());
+                AppendAttachments(messages, source.TakeAttachments());
         }
         throw new InvalidOperationException("工具调用未返回最终回答。");
+    }
+
+    /// <summary>
+    /// 工具读到的图片并进本轮用户消息末尾，不在工具结果后面另起一条用户消息：
+    /// 上游常在最后一条用户消息之前留缓存点，另起一条时这个点落在工具结果之后，下一轮对不上，只能退回很早的缓存。
+    /// 找不到可以追加的用户消息时仍然单独附加。
+    /// </summary>
+    internal static void AppendAttachments(List<OpenAiMessage> messages, IReadOnlyList<OpenAiMessage> attachments)
+    {
+        if (attachments.Count == 0) return;
+        var target = messages.LastOrDefault(message => message.Role == "user");
+        if (target?.Content is not ChatMessageDescriptor descriptor)
+        {
+            messages.AddRange(attachments);
+            return;
+        }
+        foreach (var attachment in attachments)
+        {
+            if (attachment.Content is ChatMessageDescriptor extra) descriptor.Segments.AddRange(extra.Segments);
+            else if (attachment.Content is string text) descriptor.Segments.Add(new ContentSegment { Kind = SegmentKind.Text, Text = text });
+        }
     }
 
     /// <summary>Parallel read groups separated by exclusive barriers; results always retain model order.</summary>

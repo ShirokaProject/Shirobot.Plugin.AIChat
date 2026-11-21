@@ -1,5 +1,6 @@
 using ShiroBot.AiChatPlugin.OpenAi;
 using SkiaSharp;
+using ShiroBot.AiChatPlugin.Tools.Images;
 
 namespace ShiroBot.AiChatPlugin.Resources;
 

@@ -2,7 +2,7 @@ using System.Text;
 using ShiroBot.AiChatPlugin.Conversation;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Memory;
+namespace ShiroBot.AiChatPlugin.Tools.Memory;
 
 internal sealed record MemoryEntry(string Id, string Text, DateTimeOffset UpdatedAt);
 

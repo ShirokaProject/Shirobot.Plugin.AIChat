@@ -286,6 +286,22 @@ internal static class UsageChecks
             var inline2 = ImageRequest(true, 4); await Send(inline2, "inline");
             Check(stats.Recent(1).Single().LocalReusableBytes == inline2.SentPrefix!.Points[1].Bytes,
                 "Different inline images of equal length must not be counted as identical.");
+            // 本地复用率按估算 token：一张大图只算固定数量，不按 base64 体积压过文字。
+            var bigImage = Path.Combine(root, "big.b64");
+            await File.WriteAllTextAsync(bigImage, "data:image/png;base64," + new string('A', 400_000));
+            OpenAiChatRequest TextThenImage(int turns) => new()
+            {
+                Model = "test", Messages = [new OpenAiMessage { Role = "system", Content = new string('甲', 2000) },
+                    .. Enumerable.Range(0, turns).Select(i => new OpenAiMessage { Role = i % 2 == 0 ? "user" : "assistant", Content = $"第{i}条" + new string('乙', 50) }),
+                    new OpenAiMessage { Role = "user", Content = new ChatMessageDescriptor { Role = "user", Segments =
+                        [new ContentSegment { Kind = SegmentKind.Text, Text = "看图" }, new ContentSegment { Kind = SegmentKind.Image, B64FilePath = bigImage }] } }]
+            };
+            await Send(TextThenImage(2), "tokens");
+            var tokenRequest = TextThenImage(4); await Send(tokenRequest, "tokens");
+            row = stats.Recent(1).Single();
+            Check(row.LocalInputTokens == tokenRequest.SentPrefix!.Tokens && row.LocalReusableTokens > 0 &&
+                (double)row.LocalReusableTokens! / row.LocalInputTokens! > 0.6 && (double)row.LocalReusableBytes! / row.LocalInputBytes! < 0.1,
+                "Local reuse must be token-estimated with a fixed image cost instead of dominated by base64 bytes.");
             var wire = upstream.LastBody;
             using (var doc = JsonDocument.Parse(wire))
                 Check(!doc.RootElement.TryGetProperty("CapturePrefix", out _) && !doc.RootElement.TryGetProperty("SentPrefix", out _),
@@ -295,6 +311,8 @@ internal static class UsageChecks
             Check(!persisted.Contains(secretText) && !persisted.Contains(imageFile), "Statistics must not persist prompt text or image paths.");
             var loaded = new UsageStats(Path.Combine(root, "stats.json")); await loaded.LoadAsync();
             Check(loaded.Total(today).LocalInputBytes == stats.Total(today).LocalInputBytes &&
+                loaded.Total(today).LocalInputTokens == stats.Total(today).LocalInputTokens && loaded.Total(today).LocalInputTokens > 0 &&
+                loaded.Recent(1).Single().LocalReusableTokens == stats.Recent(1).Single().LocalReusableTokens &&
                 loaded.Total(today).UsageRequests == stats.Total(today).UsageRequests && loaded.Total(today).ComparedLocalRate == 1 &&
                 loaded.Recent(1).Single().LocalReusableBytes == stats.Recent(1).Single().LocalReusableBytes,
                 "Local aggregates, comparison cohorts and request rows must survive reload.");

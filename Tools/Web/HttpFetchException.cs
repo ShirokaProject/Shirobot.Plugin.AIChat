@@ -1,7 +1,7 @@
 using System.Net;
 using System.Text.Json;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Web;
 
 internal sealed class HttpFetchException(Uri url, HttpStatusCode? status, string error) : HttpRequestException(error, null, status)
 {

@@ -1,4 +1,4 @@
-using ShiroBot.AiChatPlugin.Memory;
+using ShiroBot.AiChatPlugin.Tools.Memory;
 
 namespace ShiroBot.AiChatPlugin.Conversation;
 

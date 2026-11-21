@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
+using ShiroBot.AiChatPlugin.Tools.Images;
 
 internal static class ImageRetryChecks
 {

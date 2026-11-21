@@ -1,7 +1,7 @@
 using System.Text.Json;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Delivery;
-using ShiroBot.AiChatPlugin.Timers;
+using ShiroBot.AiChatPlugin.Tools.Timers;
 using ShiroBot.AiChatPlugin.Tools;
 using ShiroBot.SDK.Models;
 

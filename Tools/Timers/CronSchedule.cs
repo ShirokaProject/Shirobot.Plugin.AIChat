@@ -1,4 +1,4 @@
-namespace ShiroBot.AiChatPlugin.Timers;
+namespace ShiroBot.AiChatPlugin.Tools.Timers;
 
 /// <summary>
 /// 标准 5 段 cron：分 时 日 月 周，按宿主本地时区计算。每段支持 *、数字、a-b、逗号列表和 /步长；

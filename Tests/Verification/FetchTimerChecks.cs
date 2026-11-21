@@ -6,9 +6,10 @@ using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
-using ShiroBot.AiChatPlugin.Timers;
+using ShiroBot.AiChatPlugin.Tools.Timers;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
+using ShiroBot.AiChatPlugin.Tools.Web;
 
 internal static class FetchTimerChecks
 {

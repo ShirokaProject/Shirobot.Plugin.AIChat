@@ -6,10 +6,10 @@ using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
-using ShiroBot.AiChatPlugin.Timers;
+using ShiroBot.AiChatPlugin.Tools.Timers;
 using ShiroBot.SDK.Models;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Timers;
 
 /// <summary>待提交任务只属于本次请求，成功生成最终回复后统一持久化；撤回和失败不会遗留任务。</summary>
 internal sealed class TimerTool(TimerScheduler scheduler, TimerToolSection config, MessageEvent message) : IChatTool

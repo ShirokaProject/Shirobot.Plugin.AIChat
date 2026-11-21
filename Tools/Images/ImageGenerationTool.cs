@@ -1,7 +1,7 @@
 using System.Text.Json;
 using ShiroBot.AiChatPlugin.OpenAi;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Images;
 
 internal sealed class ImageGenerationTool(Func<string, ImageGenerationOptions, CancellationToken, Task<string>> generate,
     Func<int[], string, ImageGenerationOptions, CancellationToken, Task<string>>? editHistory = null, string historyCatalog = "",

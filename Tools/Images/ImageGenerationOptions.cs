@@ -1,6 +1,6 @@
 using ShiroBot.AiChatPlugin.Config;
 
-namespace ShiroBot.AiChatPlugin.OpenAi;
+namespace ShiroBot.AiChatPlugin.Tools.Images;
 
 internal sealed record ImageGenerationOptions(string? Size = null, string? Quality = null,
     string? Background = null, string? OutputFormat = null, int? OutputCompression = null, int? FrameCount = null, int? FrameDurationMs = null)

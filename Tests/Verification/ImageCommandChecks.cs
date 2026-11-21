@@ -1,6 +1,7 @@
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Tools;
+using ShiroBot.AiChatPlugin.Tools.Images;
 
 internal static class ImageCommandChecks
 {

@@ -4,7 +4,7 @@ using System.Text.Json;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.OpenAi;
+namespace ShiroBot.AiChatPlugin.Tools.Web;
 
 internal sealed class TavilySearchClient : IDisposable
 {
@@ -79,7 +79,7 @@ internal sealed class TavilySearchClient : IDisposable
                 var link = image.ValueKind == JsonValueKind.String ? image.GetString() :
                     image.ValueKind == JsonValueKind.Object && image.TryGetProperty("url", out var url) && url.ValueKind == JsonValueKind.String ? url.GetString() : null;
                 if (link is null || !Uri.TryCreate(link, UriKind.Absolute, out var parsed)) continue;
-                try { Tools.PublicHttpPolicy.ValidateUrl(parsed); } catch (InvalidOperationException) { continue; }
+                try { PublicHttpPolicy.ValidateUrl(parsed); } catch (InvalidOperationException) { continue; }
                 if (output.Count >= 12 || !seen.Add(parsed.AbsoluteUri)) continue;
                 var description = image.ValueKind == JsonValueKind.Object && image.TryGetProperty("description", out var desc) && desc.ValueKind == JsonValueKind.String ? desc.GetString() ?? "" : "";
                 output.Add(new() { ["url"] = parsed.AbsoluteUri, ["description"] = description[..Math.Min(description.Length, 500)], ["source_url"] = page ?? "" });

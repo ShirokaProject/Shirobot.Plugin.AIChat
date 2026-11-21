@@ -1,11 +1,11 @@
 using System.Text.Json;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
-using ShiroBot.AiChatPlugin.Memory;
+using ShiroBot.AiChatPlugin.Tools.Memory;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Memory;
 
 /// <summary>让模型维护当前会话的记忆本。修改立即生效，同一条内容重复新增时直接返回已有条目。</summary>
 internal sealed class MemoryTool(MemoryNotebookStore store, MemoryToolSection config, ConversationKey key) : IChatTool

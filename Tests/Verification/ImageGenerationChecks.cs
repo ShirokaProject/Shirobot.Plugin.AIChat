@@ -12,6 +12,7 @@ using ShiroBot.SDK.Adapter;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 using PluginJson = ShiroBot.AiChatPlugin.PluginJson;
+using ShiroBot.AiChatPlugin.Tools.Images;
 
 internal static class ImageGenerationChecks
 {

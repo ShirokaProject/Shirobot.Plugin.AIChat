@@ -2,7 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Web;
 
 /// <summary>公网抓取专用策略。重定向逐次检查；连接时解析并直接连接核验后的 IP，避免 DNS 重绑定。</summary>
 internal static class PublicHttpPolicy

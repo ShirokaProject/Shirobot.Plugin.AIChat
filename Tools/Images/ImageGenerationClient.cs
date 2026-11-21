@@ -4,10 +4,11 @@ using System.Text;
 using System.Text.Json;
 using System.Buffers;
 using ShiroBot.AiChatPlugin.Config;
+using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.OpenAi;
+namespace ShiroBot.AiChatPlugin.Tools.Images;
 
 internal sealed class ImageGenerationException(string message) : Exception(message);
 

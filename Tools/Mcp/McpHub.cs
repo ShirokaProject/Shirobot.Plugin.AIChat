@@ -5,7 +5,7 @@ using System.Text.RegularExpressions;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Mcp;
+namespace ShiroBot.AiChatPlugin.Tools.Mcp;
 
 internal sealed record McpToolInfo(string Name, string Description, JsonObject InputSchema);
 

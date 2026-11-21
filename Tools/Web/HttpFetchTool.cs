@@ -8,7 +8,7 @@ using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Web;
 
 internal sealed class HttpFetchTool : IReadOnlyChatTool
 {

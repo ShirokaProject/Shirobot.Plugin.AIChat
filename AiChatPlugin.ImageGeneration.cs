@@ -6,6 +6,7 @@ using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Adapter;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Abstractions;
+using ShiroBot.AiChatPlugin.Tools.Images;
 
 namespace ShiroBot.AiChatPlugin;
 
@@ -242,31 +243,40 @@ public sealed partial class AiChatPlugin
         }
     }
 
-    private async Task<Func<Task>?> ShowImageGenerationProgressAsync(MessageEvent message, CancellationToken ct)
+    private static async Task<bool> TryReactAsync(string kind, Func<CancellationToken, Task> react, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(5));
         try
         {
-            var service = Context.GetAdapterExtension<IMessageReactionService>();
-            if (service is not null && message.InstanceId is { Length: > 0 } id &&
-                service.GetReactionCapabilities(message.Channel).HasFlag(ReactionCapabilities.Unicode))
-            {
-                var reference = new MessageReference(id, message.Channel, message.MessageId);
-                var emoji = new UnicodeReactionEmoji("🎨");
-                await service.SetReactionAsync(reference, emoji, true, timeout.Token).ConfigureAwait(false);
+            await react(timeout.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            BotLog.Warning($"[AiChat] 生图进度{kind}失败，改用下一种方式：{ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private async Task<Func<Task>?> ShowImageGenerationProgressAsync(MessageEvent message, CancellationToken ct)
+    {
+        // 依次尝试通用表情回应、QQ 系统表情，都不行再发一条等待消息；前一种失败不影响后一种。
+        var service = Context.GetAdapterExtension<IMessageReactionService>();
+        if (service is not null && message.InstanceId is { Length: > 0 } id &&
+            service.GetReactionCapabilities(message.Channel).HasFlag(ReactionCapabilities.Unicode))
+        {
+            var reference = new MessageReference(id, message.Channel, message.MessageId);
+            var emoji = new UnicodeReactionEmoji("🎨");
+            if (await TryReactAsync("表情回应", token => service.SetReactionAsync(reference, emoji, true, token), ct).ConfigureAwait(false))
                 return async () => { using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                     await service.SetReactionAsync(reference, emoji, false, stop.Token).ConfigureAwait(false); };
-            }
-            if (!message.IsDirect && message.Platform.Equals("qq", StringComparison.OrdinalIgnoreCase) &&
-                Context.GetAdapterExtension<IQGroupApi>() is { } qq)
-            {
-                await qq.SendMessageReactionAsync(message.Channel.Id, message.MessageId, "66", true, timeout.Token).ConfigureAwait(false);
-                return async () => { using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    await qq.SendMessageReactionAsync(message.Channel.Id, message.MessageId, "66", false, stop.Token).ConfigureAwait(false); };
-            }
         }
-        catch (Exception) when (!ct.IsCancellationRequested) { }
+        if (!message.IsDirect && message.Platform.Equals("qq", StringComparison.OrdinalIgnoreCase) &&
+            Context.GetAdapterExtension<IQGroupApi>() is { } qq &&
+            await TryReactAsync("QQ 表情回应", token => qq.SendMessageReactionAsync(message.Channel.Id, message.MessageId, "66", true, token), ct).ConfigureAwait(false))
+            return async () => { using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await qq.SendMessageReactionAsync(message.Channel.Id, message.MessageId, "66", false, stop.Token).ConfigureAwait(false); };
         ct.ThrowIfCancellationRequested();
         var progress = await Context.Message.SendMessageAsync(message.Channel, [new TextSegment("生成图片中...")], ct).ConfigureAwait(false);
         if (!progress.IsSuccess || string.IsNullOrWhiteSpace(progress.MessageId)) return null;

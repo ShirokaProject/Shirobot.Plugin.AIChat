@@ -5,7 +5,7 @@ using System.Text.Json;
 using ShiroBot.AiChatPlugin;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.Conversation;
-using ShiroBot.AiChatPlugin.Memory;
+using ShiroBot.AiChatPlugin.Tools.Memory;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Proactive;
 using ShiroBot.SDK.Abstractions;

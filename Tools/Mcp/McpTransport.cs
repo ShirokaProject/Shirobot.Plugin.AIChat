@@ -6,7 +6,7 @@ using System.Text.Json.Nodes;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Mcp;
+namespace ShiroBot.AiChatPlugin.Tools.Mcp;
 
 /// <summary>JSON-RPC 消息通道：请求返回对应 id 的响应消息（含 result 或 error）。</summary>
 internal interface IMcpTransport : IAsyncDisposable

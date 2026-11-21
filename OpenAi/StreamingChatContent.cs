@@ -79,7 +79,7 @@ internal sealed class StreamingChatContent : HttpContent
             }).ToList();
             await JsonSerializer.SerializeAsync(stream, schemas, JsonOptions, ct);
         }
-        prefix?.Checkpoint();
+        prefix?.Checkpoint(request.Tools is { } toolList ? TokenEstimate.Tools(toolList) : 0);
         await WriteAsync(stream, ",\"messages\":[", ct);
         for (int i = 0; i < request.Messages.Count; i++)
         {
@@ -108,7 +108,7 @@ internal sealed class StreamingChatContent : HttpContent
                 await JsonSerializer.SerializeAsync(stream, calls, JsonOptions, ct);
             }
             await WriteAsync(stream, "}", ct);
-            prefix?.Checkpoint();
+            prefix?.Checkpoint(TokenEstimate.Message(message));
         }
         await WriteAsync(stream, "]}", ct);
         prefix?.Checkpoint();
