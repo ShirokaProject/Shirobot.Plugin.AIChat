@@ -45,7 +45,7 @@ internal static class MemoryStreamingChecks
             var history = new List<ChatTurn> { new("user", [new ImagePart(Path.Combine(root, "image.jpg"), "image/jpeg", bytes.Length)], 1) };
             var current = new ChatTurn("user", [new TextPart("follow up: \"quoted\"\n中文")], 2);
             var messages = (List<OpenAiMessage>)typeof(AiChatPlugin).GetMethod("BuildOpenAiMessages", BindingFlags.Instance | BindingFlags.NonPublic)!
-                .Invoke(plugin, new object[] { "system", history, current, true })!;
+                .Invoke(plugin, new object?[] { "system", history, current, null, true })!;
             Check(messages[1].Content is ChatMessageDescriptor { HasImage: false } && messages[^1].Content is ChatMessageDescriptor { HasImage: true }, "Historical images must remain file descriptors at the request tail.");
             var request = new OpenAiChatRequest { Model = "test", Messages = messages, Stream = true, Temperature = .5, MaxCompletionTokens = 123,
                 Tools = [new OpenAiTool { Function = new OpenAiToolFunction { Name = "test_tool", Description = "test", Parameters = new { type = "object" } } }] };

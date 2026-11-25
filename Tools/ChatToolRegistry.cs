@@ -3,6 +3,7 @@ using System.Text.Json;
 using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.SDK.Abstractions;
+using ShiroBot.AiChatPlugin.Tools.Skills;
 using ShiroBot.AiChatPlugin.Tools.Web;
 
 namespace ShiroBot.AiChatPlugin.Tools;
@@ -10,7 +11,9 @@ namespace ShiroBot.AiChatPlugin.Tools;
 /// <summary>统一管理工具定义、提示词、调用分发及每种工具的调用上限。</summary>
 internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAttempts = 3, int retryDelayMs = 300) : IDisposable
 {
-    private readonly Dictionary<string, IChatTool> _tools = new(StringComparer.Ordinal);
+    // 写时复制：技能在页面上修改后会替换 skill 工具，正在进行的对话继续用拿到的那份。
+    private volatile Dictionary<string, IChatTool> _tools = new(StringComparer.Ordinal);
+    private readonly Lock _gate = new();
     public bool HasTools => _tools.Count > 0;
     public IEnumerable<string> Names => _tools.Keys;
     public bool HasReadOnlyTools => _tools.Values.OfType<IReadOnlyChatTool>().Any();
@@ -18,22 +21,36 @@ internal sealed class ChatToolRegistry(int maxParallelCalls = 4, int requestAtte
     private const string ParallelPrompt = "\n需要多个互不依赖的查询时，可在同一条回复里发出多个工具调用，系统会并发执行支持并发的调用。有依赖的步骤分轮执行，拿到上一步结果再继续，不要猜测前一步返回值。";
     public string SystemPrompt => string.Join("\n", _tools.Values.Select(tool => tool.SystemPrompt)) + (HasTools ? ParallelPrompt : "");
 
-    public static ChatToolRegistry Create(PluginConfig config, Func<string, CancellationToken, Task<string>>? summarizePage = null)
+    public static ChatToolRegistry Create(PluginConfig config, Func<string, CancellationToken, Task<string>>? summarizePage = null,
+        IReadOnlyList<SkillDefinition>? skills = null)
     {
         var registry = new ChatToolRegistry(config.ToolUse.MaxParallelCalls, config.Default.RetryOnTimeoutMaxAttempts, config.Default.RetryOnTimeoutDelayMs);
         if (!config.ToolUse.Enabled) return registry;
-        var skills = new SkillTool(config.Skills);
-        if (skills.HasSkills) registry.Register(skills);
-        else skills.Dispose();
+        if (config.Skills.Enabled) registry.ReplaceSkills(new SkillTool(skills ?? []));
         var tavily = config.ToolUse.Tavily;
         if (!string.IsNullOrWhiteSpace(tavily.ApiKey))
             registry.Register(new TavilySearchTool(tavily, config.Network.HttpProxy));
         if (config.ToolUse.HttpFetch.Enabled)
-            registry.Register(new HttpFetchTool(config.ToolUse.HttpFetch, summarizePage));
+            registry.Register(new HttpFetchTool(config.ToolUse.HttpFetch, summarizePage, proxy: config.Network.HttpProxy));
         return registry;
     }
 
-    public void Register(IChatTool tool) => _tools.Add(tool.Definition.Function.Name, tool);
+    public void Register(IChatTool tool)
+    {
+        lock (_gate) _tools = new Dictionary<string, IChatTool>(_tools, StringComparer.Ordinal) { { tool.Definition.Function.Name, tool } };
+    }
+
+    /// <summary>换成新的技能快照；没有启用的技能时不提供 skill 工具。</summary>
+    public void ReplaceSkills(SkillTool? skills)
+    {
+        lock (_gate)
+        {
+            var next = new Dictionary<string, IChatTool>(_tools, StringComparer.Ordinal);
+            next.Remove("skill");
+            if (skills is { HasSkills: true }) next.Add("skill", skills);
+            _tools = next;
+        }
+    }
 
     public async Task<string> ChatAsync(OpenAiClient client, ModelEntry model,
         List<OpenAiMessage> messages, int maxRounds, Func<string, Task>? onContent = null, CancellationToken ct = default, IReadOnlyList<IChatTool>? contextualTools = null, bool readOnlyOnly = false, int? maxOutputTokens = null,

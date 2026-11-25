@@ -3,6 +3,7 @@ using System.Reflection;
 using ShiroBot.SDK.Adapter;
 using ShiroBot.AiChatPlugin.OpenAi;
 using ShiroBot.AiChatPlugin.Resources;
+using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
@@ -100,12 +101,23 @@ internal sealed class ConversationToolSet(IBotContext bot, MessageEvent current,
         var images = new List<object>();
         var errors = new List<string>();
         if (include)
-            foreach (var image in message.Segments.OfType<ImageSegment>().Take(4))
+            foreach (var url in ImageUrls(message).Take(4))
             {
-                try { images.Add(await SaveImageAsync(image.Uri, "message_" + messageId, ct).ConfigureAwait(false)); }
+                try { images.Add(await SaveImageAsync(url, "message_" + messageId, ct).ConfigureAwait(false)); }
                 catch (Exception ex) when (!ct.IsCancellationRequested && ex is not OutOfMemoryException) { errors.Add("One image could not be loaded."); }
             }
         return PluginJson.Serialize(new { message_id = messageId, text = describe(message), files = images, images_attached = images.Count, image_errors = errors });
+    }
+
+    /// <summary>普通图片和 QQ 商城表情都当图片取回；商城表情不是 ImageSegment，之前会被漏掉。</summary>
+    private static IEnumerable<string> ImageUrls(MessageEvent message)
+    {
+        foreach (var segment in message.Segments)
+        {
+            if (segment is ImageSegment image && !string.IsNullOrWhiteSpace(image.Uri)) yield return image.Uri;
+            else if (segment is RawSegment { Payload: QIncomingMarketFace face } &&
+                     Uri.TryCreate(face.Url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https") yield return face.Url;
+        }
     }
 
     private async Task<string> MentionAsync(string arguments, CancellationToken ct)

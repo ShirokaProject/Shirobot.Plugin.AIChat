@@ -58,6 +58,31 @@ internal static class ImageEditQuoteChecks
                 throw new Exception("Quoted content lost its original author or current-user boundary.");
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+        // 商城表情是 RawSegment 而不是 ImageSegment，也要像图片一样下载给模型看。
+        using (var faceServer = new HttpListener())
+        {
+            var facePort = Random.Shared.Next(40001, 60000); var faceUrl = $"http://127.0.0.1:{facePort}/face.png";
+            faceServer.Prefixes.Add($"http://127.0.0.1:{facePort}/"); faceServer.Start();
+            var serveFace = Task.Run(async () =>
+            {
+                var ctx = await faceServer.GetContextAsync();
+                ctx.Response.ContentType = "image/png"; await ctx.Response.OutputStream.WriteAsync(png); ctx.Response.Close();
+            });
+            var faceRoot = Path.Combine(Path.GetTempPath(), "face-check-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                using var fetcher = new ResourceFetcher(5, 10000, 10000, "");
+                var collector = new ResourceCollector(bot, fetcher, new ResourceCache(faceRoot, "cache", 1), new ResourcesSection());
+                var sticker = original with { MessageId = "face", Segments = [new TextSegment("#ai 看这个"),
+                    new RawSegment("qq", "market_face", new ShiroBot.Model.QQ.QIncomingMarketFace("e1", faceUrl) { Summary = "[开心]" })] };
+                var parts = await collector.CollectAsync(sticker);
+                await serveFace;
+                if (parts.OfType<ImagePart>().Count() != 1 || !parts.OfType<TextPart>().Any(p => p.Text == "[商城表情 开心]"))
+                    throw new Exception("Market face stickers must be downloaded as images with their name.");
+            }
+            finally { faceServer.Stop(); if (Directory.Exists(faceRoot)) Directory.Delete(faceRoot, true); }
+        }
+        Console.WriteLine("PASS: QQ market face stickers are downloaded as images");
         var selected = Array.Empty<int>(); var newCalls = 0; var editCalls = 0;
         using var tool = new ImageGenerationTool((p, options, token) => { newCalls++; return Task.FromResult("new"); },
             (ids, p, options, token) => { selected = ids; editCalls++; return Task.FromResult("edit queued"); },

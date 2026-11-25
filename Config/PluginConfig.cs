@@ -379,6 +379,10 @@ public sealed class HttpFetchSection
     public bool Enabled { get; set; } = true;
     [ConfigField("单次读取超时秒数。", Label = "读取超时秒数", Min = 5, Max = 120)]
     public int TimeoutSeconds { get; set; } = 20;
+    [ConfigField("GET/HEAD/OPTIONS 遇到连接失败、超时、DNS 或 TLS 失败、408/429/5xx 时的总尝试次数；写入请求不自动重试。", Label = "临时错误尝试次数", Min = 1, Max = 5)]
+    public int RetryAttempts { get; set; } = 3;
+    [ConfigField("重试前等待的毫秒数，第 N 次重试等待 N 倍。", Label = "重试间隔毫秒", Min = 0, Max = 10000)]
+    public int RetryDelayMs { get; set; } = 800;
     [ConfigField("限制下载体积，超过限制时返回工具错误。", Label = "最大下载字节数", Min = 1024, Max = 2097152)]
     public int MaxBytes { get; set; } = 524288;
     [ConfigField("返回给模型的文本字符数上限，超过时截断。", Label = "最大文本字符数", Min = 100, Max = 40000)]
@@ -477,9 +481,9 @@ public sealed class ImageGenerationSection
 
 public sealed class CustomSkillSection
 {
-    [ConfigField("关闭时不提供技能目录和 skill 工具。", Label = "启用自定义技能")]
+    [ConfigField("关闭时不提供技能目录和 skill 工具。技能本身在 Dashboard 的“AI 技能”页面管理。", Label = "启用自定义技能")]
     public bool Enabled { get; set; } = true;
-    [ConfigField("最多200条；每条填写唯一名称、适用场景和具体操作步骤。保存后下一次对话生效。", Label = "技能列表")]
+    [ConfigField("旧版写法，只用于迁移：启动时把这里的技能搬到 data/skills 目录，之后请在 Dashboard 的“AI 技能”页面管理。", Label = "旧版技能列表（已迁移）")]
     public List<CustomSkillEntry> Entries { get; set; } = [];
 }
 

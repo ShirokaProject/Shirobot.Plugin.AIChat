@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 技能</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e3e2dc;
+    --accent: #2f6f5e; --accent-text: #ffffff; --accent-soft: #e4f0ec;
+    --danger: #b3261e; --danger-soft: #fbe9e7; --warn-soft: #fff4d6; --warn-text: #6b4e00;
+    --radius: 10px;
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.55;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161716; --panel: #1f201f; --text: #ececea; --muted: #a2a29c; --line: #333532;
+      --accent: #7cc4ad; --accent-text: #0f1f1a; --accent-soft: #20322c;
+      --danger: #f2b8b5; --danger-soft: #3a1f1d; --warn-soft: #3a3120; --warn-text: #f0d48a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; }
+  button {
+    font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    padding: 6px 14px; cursor: pointer; min-height: 34px;
+  }
+  button:hover { border-color: var(--muted); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .55; cursor: default; }
+  .notice { border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; background: var(--warn-soft); color: var(--warn-text); }
+  .notice.error { background: var(--danger-soft); color: var(--danger); }
+  .notice.ok { background: var(--accent-soft); color: var(--accent); }
+  .list { display: grid; gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; align-items: start; }
+  .card.off { opacity: .62; }
+  .name { font-weight: 600; font-size: 15px; word-break: break-all; }
+  .desc { color: var(--text); white-space: pre-wrap; word-break: break-word; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; align-items: center; }
+  .switch { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; cursor: pointer; }
+  .switch input { width: 16px; height: 16px; accent-color: var(--accent); }
+  .empty { text-align: center; color: var(--muted); padding: 40px 16px; border: 1px dashed var(--line); border-radius: var(--radius); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 18px; }
+  .field { display: grid; gap: 4px; margin-bottom: 14px; }
+  .field label { font-weight: 600; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .count { color: var(--muted); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .count.over { color: var(--danger); }
+  input[type=text], textarea {
+    font: inherit; width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text);
+  }
+  textarea { min-height: 120px; resize: vertical; }
+  textarea.long { min-height: 320px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .spacer { flex: 1; }
+  .import-item { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .import-item:first-child { border-top: 0; }
+  .tag { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+  .tag.bad { background: var(--danger-soft); color: var(--danger); }
+  .tag.warn { background: var(--warn-soft); color: var(--warn-text); }
+  [hidden] { display: none !important; }
+  @media (max-width: 560px) {
+    .card { grid-template-columns: 1fr; }
+    .actions { justify-content: flex-start; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>AI 技能</h1>
+      <div class="sub" id="summary">正在读取…</div>
+    </div>
+    <div class="toolbar">
+      <button type="button" id="new" class="primary">新建技能</button>
+      <button type="button" id="import">导入 SKILL.md</button>
+      <button type="button" id="reload" title="手动改过 data/skills 里的文件后重新读取">重新读取目录</button>
+      <input type="file" id="files" accept=".md,text/markdown,text/plain" multiple hidden>
+    </div>
+  </header>
+
+  <div class="notice" id="disabled" hidden>技能功能当前是关闭的（配置里的 tool_use.enabled 或 skills.enabled），这里的修改会保存，但 AI 暂时用不到。</div>
+  <div class="notice" id="message" role="status" hidden></div>
+
+  <section class="panel" id="importer" hidden aria-labelledby="importer-title">
+    <h2 id="importer-title">导入预览</h2>
+    <div id="import-list"></div>
+    <div class="row" style="margin-top:12px">
+      <label class="switch"><input type="checkbox" id="overwrite"> 同名技能直接覆盖</label>
+      <span class="spacer"></span>
+      <button type="button" id="import-cancel">取消</button>
+      <button type="button" id="import-confirm" class="primary">导入</button>
+    </div>
+  </section>
+
+  <section class="panel" id="editor" hidden aria-labelledby="editor-title">
+    <h2 id="editor-title">新建技能</h2>
+    <div class="field">
+      <label for="f-name">名称</label>
+      <input type="text" id="f-name" autocomplete="off" placeholder="例如 transparent-sticker，可以用中文">
+      <div class="row"><span class="hint">AI 通过名称加载技能，名称不能重复。</span><span class="spacer"></span><span class="count" data-for="f-name"></span></div>
+    </div>
+    <div class="field">
+      <label for="f-description">用途</label>
+      <textarea id="f-description" placeholder="告诉 AI 什么时候用，例如：用户要求制作透明背景贴纸时使用。"></textarea>
+      <div class="row"><span class="hint">AI 平时只看到名称和用途，靠这段判断要不要加载。</span><span class="spacer"></span><span class="count" data-for="f-description"></span></div>
+    </div>
+    <div class="field">
+      <label for="f-instructions">操作说明</label>
+      <textarea id="f-instructions" class="long" placeholder="具体怎么做：先后步骤、用哪些工具、输出要求。"></textarea>
+      <div class="row"><span class="hint">即 SKILL.md 的正文，支持 Markdown。</span><span class="spacer"></span><span class="count" data-for="f-instructions"></span></div>
+    </div>
+    <div class="row">
+      <label class="switch"><input type="checkbox" id="f-enabled" checked> 启用</label>
+      <span class="spacer"></span>
+      <button type="button" id="cancel">取消</button>
+      <button type="button" id="save" class="primary">保存</button>
+    </div>
+  </section>
+
+  <section class="panel" id="exporter" hidden aria-labelledby="exporter-title">
+    <h2 id="exporter-title">导出</h2>
+    <div class="field">
+      <textarea id="export-text" class="long" readonly aria-label="SKILL.md 内容"></textarea>
+      <span class="hint">复制后保存为 SKILL.md，放进另一个插件的 data/skills/&lt;名称&gt;/ 目录，或在那边用“导入”。</span>
+    </div>
+    <div class="row">
+      <span class="spacer"></span>
+      <button type="button" id="export-close">关闭</button>
+      <button type="button" id="export-download">下载</button>
+      <button type="button" id="export-copy" class="primary">复制</button>
+    </div>
+  </section>
+
+  <div class="list" id="list" aria-live="polite"></div>
+</main>
+
+<script>
+(() => {
+  const dashboard = window.ShiroBotDashboard;
+  const $ = (id) => document.getElementById(id);
+  let limits = { skills: 200, name: 64, description: 1000, instructions: 32000 };
+  let skills = [];
+  let editing = null;          // 正在编辑的原名称；新建时为 null
+  let pending = [];            // 导入预览
+
+  function el(tag, props = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(props)) {
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value);
+    }
+    for (const child of children) if (child) node.append(child);
+    return node;
+  }
+
+  function show(text, tone = 'ok') {
+    const box = $('message');
+    box.textContent = text;
+    box.className = 'notice ' + tone;
+    box.hidden = !text;
+    if (tone === 'ok' && text) setTimeout(() => { if (box.textContent === text) box.hidden = true; }, 3000);
+  }
+
+  async function call(action, args = {}) {
+    const result = await dashboard.call(action, args);
+    if (result && result.error) throw new Error(result.error);
+    return result;
+  }
+
+  async function busy(button, work) {
+    button.disabled = true;
+    try { await work(); }
+    catch (error) { show(error.message || String(error), 'error'); }
+    finally { button.disabled = false; }
+  }
+
+  function render(data) {
+    skills = data.skills;
+    limits = data.limits || limits;
+    $('disabled').hidden = data.enabled;
+    const on = skills.filter((skill) => skill.enabled).length;
+    $('summary').textContent = `共 ${skills.length} 个技能，启用 ${on} 个 · 保存在插件目录 ${data.directory}/<名称>/SKILL.md`;
+    const list = $('list');
+    list.replaceChildren();
+    if (skills.length === 0) {
+      list.append(el('div', { class: 'empty' },
+        el('div', { text: '还没有技能。' }),
+        el('div', { class: 'hint', text: '点“新建技能”手写一个，或导入现成的 SKILL.md 文件。' })));
+      return;
+    }
+    for (const skill of skills) {
+      const toggle = el('input', { type: 'checkbox', 'aria-label': `启用 ${skill.name}` });
+      toggle.checked = skill.enabled;
+      toggle.addEventListener('change', () => busy(toggle, async () => {
+        await call('toggle', { name: skill.name, enabled: toggle.checked });
+        await refresh();
+      }));
+      const modified = skill.modified ? new Date(skill.modified).toLocaleString() : '';
+      list.append(el('article', { class: 'card' + (skill.enabled ? '' : ' off') },
+        el('div', {},
+          el('div', { class: 'name', text: skill.name }),
+          el('div', { class: 'desc', text: skill.description }),
+          el('div', { class: 'meta', text: `目录 ${skill.folder} · 说明 ${skill.instructions_chars} 字${modified ? ' · 修改于 ' + modified : ''}` })),
+        el('div', { class: 'actions' },
+          el('label', { class: 'switch' }, toggle, el('span', { text: '启用' })),
+          el('button', { type: 'button', text: '编辑', onclick: (event) => busy(event.currentTarget, () => openEditor(skill.name)) }),
+          el('button', { type: 'button', text: '导出', onclick: (event) => busy(event.currentTarget, () => exportSkill(skill.name)) }),
+          el('button', { type: 'button', class: 'danger', text: '删除', onclick: (event) => busy(event.currentTarget, async () => {
+            await call('delete', { name: skill.name });
+            if (editing === skill.name) closeEditor();
+            show(`已删除 ${skill.name}`);
+            await refresh();
+          }) }))));
+    }
+  }
+
+  async function refresh() { render(await call('list')); }
+
+  function updateCounts() {
+    for (const counter of document.querySelectorAll('.count')) {
+      const input = $(counter.dataset.for);
+      const max = { 'f-name': limits.name, 'f-description': limits.description, 'f-instructions': limits.instructions }[counter.dataset.for];
+      const length = input.value.trim().length;
+      counter.textContent = `${length} / ${max}`;
+      counter.classList.toggle('over', length > max);
+    }
+  }
+
+  async function openEditor(name) {
+    $('importer').hidden = true;
+    $('exporter').hidden = true;
+    editing = name;
+    let skill = { name: '', description: '', instructions: '', enabled: true };
+    if (name) skill = await call('get', { name });
+    $('editor-title').textContent = name ? `编辑：${name}` : '新建技能';
+    $('f-name').value = skill.name;
+    $('f-description').value = skill.description;
+    $('f-instructions').value = skill.instructions;
+    $('f-enabled').checked = skill.enabled;
+    updateCounts();
+    $('editor').hidden = false;
+    $('editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    $('f-name').focus();
+  }
+
+  function closeEditor() { $('editor').hidden = true; editing = null; }
+  function closePanels() { closeEditor(); $('importer').hidden = true; $('exporter').hidden = true; }
+
+  async function save() {
+    const saved = await call('save', {
+      name: $('f-name').value, description: $('f-description').value, instructions: $('f-instructions').value,
+      enabled: $('f-enabled').checked, original_name: editing || ''
+    });
+    closeEditor();
+    show(`已保存 ${saved.name}，下一次对话生效`);
+    await refresh();
+  }
+
+  let exported = null;
+  async function exportSkill(name) {
+    exported = await call('export', { name });
+    closeEditor();
+    $('importer').hidden = true;
+    $('exporter-title').textContent = `导出：${name}`;
+    $('export-text').value = exported.content;
+    $('exporter').hidden = false;
+    $('exporter').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // 沙箱网页可能不允许下载或写剪贴板；失败时文本框里的内容仍可以手动复制。
+  function download() {
+    const url = URL.createObjectURL(new Blob([exported.content], { type: 'text/markdown;charset=utf-8' }));
+    const link = el('a', { href: url, download: `${exported.folder}-SKILL.md` });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function copy() {
+    try { await navigator.clipboard.writeText(exported.content); show('已复制到剪贴板'); }
+    catch {
+      $('export-text').focus();
+      $('export-text').select();
+      show('浏览器不允许直接写剪贴板，已选中全文，按 Ctrl/⌘+C 复制', 'error');
+    }
+  }
+
+  async function preview(files) {
+    pending = [];
+    for (const file of files) {
+      const content = await file.text();
+      try {
+        const skill = await call('parse', { content });
+        pending.push({ file: file.name, content, skill, exists: skills.some((item) => item.name === skill.name) });
+      } catch (error) {
+        pending.push({ file: file.name, error: error.message || String(error) });
+      }
+    }
+    const list = $('import-list');
+    list.replaceChildren();
+    for (const item of pending) {
+      const status = item.error ? el('span', { class: 'tag bad', text: '无法导入' })
+        : item.exists ? el('span', { class: 'tag warn', text: '同名已存在' }) : el('span', { class: 'tag', text: '新技能' });
+      list.append(el('div', { class: 'import-item' },
+        el('div', {},
+          el('div', { class: 'name', text: item.skill ? item.skill.name : item.file }),
+          el('div', { class: item.error ? 'hint' : 'desc', text: item.error || item.skill.description }),
+          el('div', { class: 'meta', text: item.skill ? `${item.file} · 说明 ${item.skill.instructions_chars} 字` : item.file })),
+        status));
+    }
+    $('import-confirm').disabled = !pending.some((item) => !item.error);
+    closePanels();
+    $('importer').hidden = false;
+  }
+
+  async function importAll() {
+    const overwrite = $('overwrite').checked;
+    const done = [], failed = [];
+    for (const item of pending.filter((entry) => !entry.error)) {
+      try { await call('import', { content: item.content, overwrite }); done.push(item.skill.name); }
+      catch (error) { failed.push(`${item.skill.name}：${error.message}`); }
+    }
+    $('importer').hidden = true;
+    pending = [];
+    await refresh();
+    if (failed.length) show(`导入 ${done.length} 个；未导入：${failed.join('；')}`, 'error');
+    else show(`已导入 ${done.length} 个技能`);
+  }
+
+  $('new').addEventListener('click', (event) => busy(event.currentTarget, () => openEditor(null)));
+  $('export-close').addEventListener('click', () => { $('exporter').hidden = true; });
+  $('export-download').addEventListener('click', download);
+  $('export-copy').addEventListener('click', copy);
+  $('cancel').addEventListener('click', closeEditor);
+  $('save').addEventListener('click', (event) => busy(event.currentTarget, save));
+  $('import').addEventListener('click', () => $('files').click());
+  $('files').addEventListener('change', (event) => {
+    const files = [...event.target.files];
+    event.target.value = '';
+    if (files.length) busy($('import'), () => preview(files));
+  });
+  $('import-cancel').addEventListener('click', () => { $('importer').hidden = true; pending = []; });
+  $('import-confirm').addEventListener('click', (event) => busy(event.currentTarget, importAll));
+  $('reload').addEventListener('click', (event) => busy(event.currentTarget, async () => {
+    render(await call('reload'));
+    show('已重新读取技能目录');
+  }));
+  for (const id of ['f-name', 'f-description', 'f-instructions']) $(id).addEventListener('input', updateCounts);
+
+  Promise.resolve(typeof dashboard.ready === 'function' ? dashboard.ready() : dashboard.ready).then(refresh).catch((error) => show(error.message || String(error), 'error'));
+})();
+</script>
+</body>
+</html>

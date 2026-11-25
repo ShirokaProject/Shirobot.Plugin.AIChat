@@ -1,12 +1,10 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using ShiroBot.AiChatPlugin.Config;
 using ShiroBot.AiChatPlugin.OpenAi;
-using ShiroBot.SDK.Abstractions;
 
-namespace ShiroBot.AiChatPlugin.Tools;
+namespace ShiroBot.AiChatPlugin.Tools.Skills;
 
-/// <summary>Snapshot administrator-authored skills; advertise metadata and load instructions on demand.</summary>
+/// <summary>技能目录只列名称和用途，模型需要时再通过 skill 工具加载完整操作说明。</summary>
 internal sealed class SkillTool : IReadOnlyChatTool
 {
     private sealed record Skill(string Name, string Description, string Instructions);
@@ -17,19 +15,11 @@ internal sealed class SkillTool : IReadOnlyChatTool
     public OpenAiTool Definition { get; }
     public string SystemPrompt { get; }
 
-    public SkillTool(CustomSkillSection config)
+    /// <summary>每次构造时取一份快照：技能在对话进行中被修改，本轮仍用开始时的内容。</summary>
+    public SkillTool(IEnumerable<SkillDefinition> skills)
     {
-        if (config.Enabled)
-        foreach (var entry in config.Entries.Take(200))
-        {
-            if (!entry.Enabled) continue;
-            var name = entry.Name.Trim();
-            var description = entry.Description.Trim();
-            var instructions = entry.Instructions.Trim();
-            if (name.Length is < 1 or > 64 || name.Any(char.IsControl) || description.Length is < 1 or > 1000 ||
-                instructions.Length is < 1 or > 32000 || !_skills.TryAdd(name, new(name, description, instructions)))
-                BotLog.Warning("[AiChat] 跳过无效或重名的自定义技能；名称最多64字符，用途最多1000字符，说明最多32000字符。");
-        }
+        foreach (var skill in skills.Where(skill => skill.Enabled).Take(SkillStore.MaxSkills))
+            _skills.TryAdd(skill.Name, new(skill.Name, skill.Description, skill.Instructions));
         Definition = new() { Function = new() {
             Name = "skill", Description = "Load the instructions of a configured skill when its purpose matches the user's task. Loading instructions does not execute the task.",
             Parameters = new { type = "object", additionalProperties = false, required = new[] { "name" },

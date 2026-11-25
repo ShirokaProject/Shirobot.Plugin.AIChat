@@ -9,9 +9,9 @@ internal static class PublicHttpPolicy
 {
     public static void ValidateUrl(Uri url)
     {
-        if (!url.IsAbsoluteUri || url.Scheme is not ("http" or "https") || !url.IsDefaultPort ||
-            !string.IsNullOrEmpty(url.UserInfo))
-            throw new InvalidOperationException("Only public HTTP/HTTPS URLs on standard ports without credentials are allowed.");
+        // 任意端口都允许；目标是否安全由下面的主机名检查和连接时的公网 IP 校验决定。
+        if (!url.IsAbsoluteUri || url.Scheme is not ("http" or "https") || !string.IsNullOrEmpty(url.UserInfo))
+            throw new InvalidOperationException("Only public HTTP/HTTPS URLs without credentials are allowed.");
         var host = url.DnsSafeHost.TrimEnd('.').Trim('[', ']').ToLowerInvariant();
         if (IPAddress.TryParse(host, out var address))
         {
@@ -67,29 +67,96 @@ internal static class PublicHttpPolicy
         return ip.AddressFamily == AddressFamily.InterNetwork && bytes[0] == 198 && bytes[1] is 18 or 19;
     }
 
-    public static SocketsHttpHandler CreateHandler() => new()
+    /// <param name="proxy">可选 HTTP 代理（network.http_proxy）。走代理时仍由本地解析并核验目标 IP，
+    /// 再向代理发 CONNECT 到该 IP，代理只做转发，不替我们解析域名，因此私网拦截和防重绑定不受影响。
+    /// 代理不可用时退回直连。</param>
+    public static SocketsHttpHandler CreateHandler(string? proxy = null)
     {
-        AllowAutoRedirect = false, UseCookies = false, UseProxy = false,
-        MaxResponseHeadersLength = 32,
-        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
-        ConnectTimeout = TimeSpan.FromSeconds(10),
-        PooledConnectionLifetime = TimeSpan.FromMinutes(1),
-        ConnectCallback = async (context, ct) =>
+        var tunnel = ParseProxy(proxy);
+        return new()
         {
-            var addresses = await ResolvePublicAsync(context.DnsEndPoint.Host, ct).ConfigureAwait(false);
-            Exception? last = null;
-            foreach (var ip in addresses)
+            AllowAutoRedirect = false, UseCookies = false, UseProxy = false,
+            MaxResponseHeadersLength = 32,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+            ConnectTimeout = TimeSpan.FromSeconds(10),
+            PooledConnectionLifetime = TimeSpan.FromMinutes(1),
+            ConnectCallback = async (context, ct) =>
             {
-                var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-                try
+                var addresses = await ResolvePublicAsync(context.DnsEndPoint.Host, ct).ConfigureAwait(false);
+                var port = context.DnsEndPoint.Port;
+                Exception? last = null;
+                if (tunnel is not null)
                 {
-                    await socket.ConnectAsync(new IPEndPoint(ip, context.DnsEndPoint.Port), ct).ConfigureAwait(false);
-                    return new NetworkStream(socket, ownsSocket: true);
+                    foreach (var ip in addresses.OrderBy(a => a.AddressFamily == AddressFamily.InterNetworkV6))
+                    {
+                        try { return await ConnectViaProxyAsync(tunnel, ip, port, ct).ConfigureAwait(false); }
+                        catch (Exception ex) when (!ct.IsCancellationRequested) { last = ex; }
+                    }
+                    BotLog.Warning($"[AiChat] http_fetch 经代理连接 {context.DnsEndPoint.Host} 失败，改为直连：{last?.Message}");
                 }
-                catch (Exception ex) when (!ct.IsCancellationRequested) { socket.Dispose(); last = ex; }
-                catch { socket.Dispose(); throw; }
+                foreach (var ip in addresses)
+                {
+                    var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                    try
+                    {
+                        await socket.ConnectAsync(new IPEndPoint(ip, port), ct).ConfigureAwait(false);
+                        return new NetworkStream(socket, ownsSocket: true);
+                    }
+                    catch (Exception ex) when (!ct.IsCancellationRequested) { socket.Dispose(); last = ex; }
+                    catch { socket.Dispose(); throw; }
+                }
+                throw new HttpRequestException("Could not connect to the public HTTP target.", last);
             }
-            throw new HttpRequestException("Could not connect to the public HTTP target.", last);
+        };
+    }
+
+    internal sealed record ProxyEndpoint(string Host, int Port, string? Authorization);
+
+    internal static ProxyEndpoint? ParseProxy(string? proxy)
+    {
+        if (string.IsNullOrWhiteSpace(proxy)) return null;
+        if (!Uri.TryCreate(proxy.Trim(), UriKind.Absolute, out var uri) || uri.Scheme != "http")
+        {
+            BotLog.Warning("[AiChat] network.http_proxy 不是 http:// 代理，http_fetch 将直连。");
+            return null;
         }
-    };
+        string? auth = null;
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+            auth = "Basic " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(Uri.UnescapeDataString(uri.UserInfo)));
+        return new ProxyEndpoint(uri.DnsSafeHost, uri.Port, auth);
+    }
+
+    /// <summary>连到运维配置的代理，CONNECT 到已核验的公网 IP。TLS 由 SocketsHttpHandler 在隧道上按原域名完成。</summary>
+    internal static async Task<Stream> ConnectViaProxyAsync(ProxyEndpoint proxy, IPAddress target, int port, CancellationToken ct)
+    {
+        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        try
+        {
+            await socket.ConnectAsync(proxy.Host, proxy.Port, ct).ConfigureAwait(false);
+            var stream = new NetworkStream(socket, ownsSocket: true);
+            var authority = target.AddressFamily == AddressFamily.InterNetworkV6 ? $"[{target}]:{port}" : $"{target}:{port}";
+            var request = $"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n" +
+                (proxy.Authorization is null ? "" : $"Proxy-Authorization: {proxy.Authorization}\r\n") + "\r\n";
+            await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes(request), ct).ConfigureAwait(false);
+            // 逐字节读到空行为止，避免把隧道里的后续数据读进缓冲区。
+            var header = new List<byte>(256);
+            var one = new byte[1];
+            while (header.Count < 8192)
+            {
+                if (await stream.ReadAsync(one, ct).ConfigureAwait(false) == 0) throw new IOException("Proxy closed the connection.");
+                header.Add(one[0]);
+                var n = header.Count;
+                if (n >= 4 && header[n - 4] == '\r' && header[n - 3] == '\n' && header[n - 2] == '\r' && header[n - 1] == '\n') break;
+            }
+            var statusLine = System.Text.Encoding.ASCII.GetString(header.ToArray()).Split("\r\n", 2)[0];
+            var parts = statusLine.Split(' ', 3);
+            if (parts.Length < 2 || !parts[0].StartsWith("HTTP/1.") || parts[1] != "200")
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+                throw new HttpRequestException($"Proxy CONNECT failed: {statusLine}");
+            }
+            return stream;
+        }
+        catch { socket.Dispose(); throw; }
+    }
 }

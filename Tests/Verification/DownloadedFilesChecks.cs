@@ -58,8 +58,52 @@ internal static class DownloadedFilesChecks
             using var failed = new HttpFetchTool(new(), handler: new Handler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new ByteArrayContent(png) })), downloads: files);
             try { await failed.ExecuteAsync("{\"url\":\"https://example.com/missing\",\"response_mode\":\"file\"}"); throw new Exception("Failed response saved as a file."); } catch (HttpFetchException) { }
             Console.WriteLine("PASS: binary download, opaque scoped IDs, filename sanitization, image references, image/document sending, send deduplication, spoof rejection, size and HTTP errors");
+
+            using var create = new CreateTextFileTool(files);
+            using (var created = JsonDocument.Parse(await create.ExecuteAsync("{\"content\":\"# 标题\\n正文\",\"file_name\":\"../notes.md\"}")))
+            {
+                var createdId = created.RootElement.GetProperty("file").GetProperty("file_id").GetString()!;
+                var createdFile = files.Resolve(createdId);
+                Check(createdFile.Info.file_name == "notes.md" && createdFile.Info.mime == "text/markdown"
+                    && File.ReadAllText(createdFile.Path) == "# 标题\n正文", "Created text file lost content, name or type.");
+                using var sendCreated = new SendDownloadedFileTool(files, (file, asImage, _) => { Check(!asImage && file.Info.file_name == "notes.md", "Created file not sent as an attachment."); return Task.FromResult("File sent successfully."); });
+                Check(await sendCreated.ExecuteAsync("{\"file_id\":\"" + createdId + "\"}") == "File sent successfully.", "Created file could not be sent.");
+            }
+            Check(CreateTextFileTool.Normalize("run.exe") == ("run_exe.txt", "text/plain") && CreateTextFileTool.Normalize("") .Name == "file.txt"
+                && CreateTextFileTool.Normalize("C:\\x\\data.CSV") == ("data.csv", "text/csv"), "Unsafe or unknown file names must become plain .txt files.");
+            Check((await create.ExecuteAsync("{\"content\":\"" + new string('a', CreateTextFileTool.MaxBytes + 1) + "\",\"file_name\":\"big.txt\"}")).Contains("exceeds"),
+                "Oversized text files must be rejected.");
+            Check((await create.ExecuteAsync("{\"content\":\"\",\"file_name\":\"a.txt\"}")).Contains("empty"), "Empty files must be rejected.");
+            Console.WriteLine("PASS: create_text_file stores sanitized text files that send_file can deliver");
         }
         finally { Directory.Delete(directory, true); }
+        {
+            var calls = 0;
+            using var flaky = new HttpFetchTool(new() { RetryAttempts = 3, RetryDelayMs = 0 }, handler: new Handler(_ =>
+                ++calls < 3 ? throw new HttpRequestException(HttpRequestError.ConnectionError, "connect failed")
+                    : Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("ok", Encoding.UTF8, "text/plain") })));
+            Check((await flaky.ExecuteAsync("{\"url\":\"https://example.com/a\"}")).Contains("\"success\":true") && calls == 3,
+                "Transient connection failures must be retried until success.");
+
+            calls = 0;
+            using var down = new HttpFetchTool(new() { RetryAttempts = 3, RetryDelayMs = 0 }, handler: new Handler(_ =>
+            { calls++; return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("busy") }); }));
+            try { await down.ExecuteAsync("{\"url\":\"https://example.com/b\"}"); throw new Exception("503 not reported."); }
+            catch (HttpFetchException ex) { Check(calls == 3 && ex.Attempts == 3 && ex.ToolResult.Contains("retried"), "Persistent 5xx must be retried and then reported with the attempt count."); }
+
+            calls = 0;
+            using var missing = new HttpFetchTool(new() { RetryAttempts = 3, RetryDelayMs = 0 }, handler: new Handler(_ =>
+            { calls++; return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("no") }); }));
+            try { await missing.ExecuteAsync("{\"url\":\"https://example.com/c\"}"); throw new Exception("404 not reported."); }
+            catch (HttpFetchException) { Check(calls == 1, "A 404 must not be retried."); }
+
+            calls = 0;
+            using var write = new HttpFetchTool(new() { RetryAttempts = 3, RetryDelayMs = 0 }, handler: new Handler(_ =>
+            { calls++; throw new HttpRequestException(HttpRequestError.ConnectionError, "connect failed"); }));
+            try { await write.ExecuteAsync("{\"url\":\"https://example.com/d\",\"method\":\"POST\",\"body\":\"x\"}"); throw new Exception("POST failure not reported."); }
+            catch (HttpFetchException) { Check(calls == 1, "Write requests must never be retried automatically."); }
+            Console.WriteLine("PASS: http_fetch retries transient read failures, not 404s or writes");
+        }
         using var tavily = new TavilySearchClient(new() { ApiKey = "test" }, "", new Handler(async request => {
             using var input = JsonDocument.Parse(await request.Content!.ReadAsStringAsync());
             Check(input.RootElement.GetProperty("include_images").GetBoolean() && input.RootElement.GetProperty("include_image_descriptions").GetBoolean(), "Image search flags missing.");

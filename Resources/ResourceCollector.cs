@@ -128,15 +128,23 @@ internal sealed class ResourceCollector(
                 break;
 
             case QIncomingMarketFace market:
-                textBuf.Append($"[商城表情:{market.Url}]");
+                // 商城表情本身就是一张图（常见 GIF/PNG），和普通图片一样下载给模型看；拿不到时保留名称。
+                var label = string.IsNullOrWhiteSpace(market.Summary) ? "商城表情" : $"商城表情 {market.Summary.Trim().Trim('[', ']')}";
+                if (Uri.TryCreate(market.Url, UriKind.Absolute, out var faceUri) && faceUri.Scheme is "http" or "https")
+                {
+                    FlushText(textBuf, parts);
+                    parts.Add(new TextPart($"[{label}]"));
+                    parts.Add(await DownloadImageUrlAsync(market.Url, label, ct).ConfigureAwait(false));
+                }
+                else textBuf.Append($"[{label}]");
                 break;
 
-            case QIncomingLightApp:
-                textBuf.Append("[小程序卡片]");
+            case QIncomingLightApp app:
+                textBuf.Append(QqCardText.Describe(app));
                 break;
 
-            case QIncomingXml:
-                textBuf.Append("[XML卡片]");
+            case QIncomingXml xml:
+                textBuf.Append(QqCardText.Describe(xml));
                 break;
 
             case QIncomingMarkdown markdown:
@@ -182,17 +190,22 @@ internal sealed class ResourceCollector(
             }
         }
 
+        return await DownloadImageUrlAsync(url!, image.Summary, ct).ConfigureAwait(false);
+    }
+
+    private async Task<ChatPart> DownloadImageUrlAsync(string url, string? summary, CancellationToken ct)
+    {
         try
         {
-            var (bytes, contentType) = await fetcher.DownloadImageAsync(url!, ct).ConfigureAwait(false);
+            var (bytes, contentType) = await fetcher.DownloadImageAsync(url, ct).ConfigureAwait(false);
             if (bytes.Length == 0)
             {
                 BotLog.Warning("[AiChat] 下载到的图片为空。");
-                return new TextPart($"[图片(空内容): {image.Summary}]");
+                return new TextPart($"[图片(空内容): {summary}]");
             }
 
             // 用魔数 + Content-Type + URL 扩展名三重确认 mime，保证不会落到 octet-stream。
-            var fallbackExt = TryParseExtensionFromUrl(url!);
+            var fallbackExt = TryParseExtensionFromUrl(url);
             var mime = MimeGuesser.ResolveImageMime(bytes, contentType, fallbackExt);
             var ext = MimeGuesser.ExtensionForMime(mime);
             var path = await cache.StoreAsync(bytes, ext, mime).ConfigureAwait(false);
@@ -203,7 +216,7 @@ internal sealed class ResourceCollector(
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             BotLog.Warning($"[AiChat] 下载图片失败: {ex.Message}");
-            return new TextPart($"[图片(下载失败): {image.Summary}]");
+            return new TextPart($"[图片(下载失败): {summary}]");
         }
     }
 

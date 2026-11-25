@@ -26,8 +26,10 @@ internal static class FetchTimerChecks
             Check(!PublicHttpPolicy.IsPublicAddress(IPAddress.Parse(blocked)), "Blocked address: " + blocked);
         foreach (var allowed in new[] { "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111" })
             Check(PublicHttpPolicy.IsPublicAddress(IPAddress.Parse(allowed)), "Allowed address: " + allowed);
-        foreach (var url in new[] { "http://127.1/", "http://2130706433/", "http://[::1]/", "http://localhost/", "https://host.local/", "https://user:secret@example.com/", "http://example.com:8080/", "file:///etc/passwd", "ftp://example.com/" })
+        foreach (var url in new[] { "http://127.1/", "http://2130706433/", "http://[::1]/", "http://localhost/", "https://host.local/", "https://user:secret@example.com/", "http://127.0.0.1:8080/", "file:///etc/passwd", "ftp://example.com/" })
             await Reject(() => { PublicHttpPolicy.ValidateUrl(new Uri(url)); return Task.CompletedTask; });
+        foreach (var url in new[] { "http://example.com:8080/", "https://example.com:8443/x" })
+            PublicHttpPolicy.ValidateUrl(new Uri(url)); // 非标准端口允许，安全性由公网 IP 校验保证
         await Reject(async () => await PublicHttpPolicy.ResolvePublicAsync("example.com", default, (_, _) => Task.FromResult(new[] { IPAddress.Parse("8.8.8.8"), IPAddress.Loopback })));
         var fallbackCalls = 0;
         var resolved = await PublicHttpPolicy.ResolvePublicAsync("example.com", default,
@@ -89,7 +91,46 @@ internal static class FetchTimerChecks
                 capture.Lines.Any(l => l.Contains("http_status=404")) && capture.Lines.All(l => !l.Contains("secret-query")),
                 "HTTP failures must show safe path and status to model/logs while stripping secret query parameters.");
         }
-        Console.WriteLine("PASS: public URL/IP and DNS guards, redirect SSRF blocking, no proxy/cookies, HTML extraction, isolated summary and byte/text bounds");
+        // 代理隧道：CONNECT 的是本地核验过的 IP，而不是域名；代理拒绝时抛错（上层会退回直连）。
+        {
+            var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            string? seen = null;
+            var server = Task.Run(async () =>
+            {
+                for (var i = 0; i < 2; i++)
+                {
+                    using var client = await listener.AcceptTcpClientAsync();
+                    var stream = client.GetStream();
+                    var buffer = new byte[1024]; var text = "";
+                    while (!text.Contains("\r\n\r\n")) text += Encoding.ASCII.GetString(buffer, 0, await stream.ReadAsync(buffer));
+                    seen ??= text;
+                    if (i == 0)
+                    {
+                        await stream.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection established\r\n\r\nhello"));
+                        await Task.Delay(200);
+                    }
+                    else await stream.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 403 Forbidden\r\n\r\n"));
+                }
+            });
+            var proxy = PublicHttpPolicy.ParseProxy($"http://user:pw@127.0.0.1:{port}")!;
+            await using (var tunnel = await PublicHttpPolicy.ConnectViaProxyAsync(proxy, IPAddress.Parse("93.184.216.34"), 443, default))
+            {
+                var buf = new byte[5]; var read = 0;
+                while (read < 5) read += await tunnel.ReadAsync(buf.AsMemory(read));
+                Check(Encoding.ASCII.GetString(buf) == "hello", "Proxy tunnel must hand over bytes after the CONNECT response untouched.");
+            }
+            Check(seen!.StartsWith("CONNECT 93.184.216.34:443 HTTP/1.1\r\n") && seen.Contains("Proxy-Authorization: Basic dXNlcjpwdw=="),
+                "Proxy CONNECT must target the checked IP and carry proxy credentials.");
+            var refused = false;
+            try { await PublicHttpPolicy.ConnectViaProxyAsync(proxy, IPAddress.Parse("93.184.216.34"), 443, default); }
+            catch (HttpRequestException ex) { refused = ex.Message.Contains("403"); }
+            Check(refused, "A refused CONNECT must throw so the caller can fall back to direct.");
+            await server; listener.Stop();
+            Check(PublicHttpPolicy.ParseProxy("") is null && PublicHttpPolicy.ParseProxy("socks5://127.0.0.1:1080") is null, "Empty or non-HTTP proxy must fall back to direct.");
+        }
+        Console.WriteLine("PASS: public URL/IP and DNS guards, redirect SSRF blocking, CONNECT proxy tunnel to checked IP, no cookies, HTML extraction, isolated summary and byte/text bounds");
         await TimersAsync();
     }
     static async Task TimersAsync()

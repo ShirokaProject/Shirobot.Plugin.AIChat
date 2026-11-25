@@ -16,12 +16,12 @@ internal sealed class HttpFetchTool : IReadOnlyChatTool
     private readonly HttpClient _http;
     private readonly HttpFetchSection _config;
     private readonly Func<string, CancellationToken, Task<string>>? _summarize;
-    public HttpFetchTool(HttpFetchSection config, Func<string, CancellationToken, Task<string>>? summarize = null, HttpMessageHandler? handler = null, DownloadedFiles? downloads = null)
+    public HttpFetchTool(HttpFetchSection config, Func<string, CancellationToken, Task<string>>? summarize = null, HttpMessageHandler? handler = null, DownloadedFiles? downloads = null, string? proxy = null)
     {
         _downloads = downloads;
         _config = config;
         _summarize = summarize;
-        _http = new HttpClient(handler ?? PublicHttpPolicy.CreateHandler()) { Timeout = TimeSpan.FromSeconds(Math.Clamp(config.TimeoutSeconds, 5, 120)) };
+        _http = new HttpClient(handler ?? PublicHttpPolicy.CreateHandler(proxy)) { Timeout = TimeSpan.FromSeconds(Math.Clamp(config.TimeoutSeconds, 5, 120)) };
         _http.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5");
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
     }
@@ -97,7 +97,7 @@ internal sealed class HttpFetchTool : IReadOnlyChatTool
         }
         if (body is not null && method is "GET" or "HEAD") return "GET and HEAD do not accept a body; use a write method.";
         if (body?.Length > 1_048_576) return "Request body exceeds 1 MB.";
-        var page = await DownloadAsync(url, method, headers, body, contentType, mode == "raw", mode == "file", fileName ?? "download", ct).ConfigureAwait(false);
+        var page = await DownloadWithRetryAsync(url, method, headers, body, contentType, mode == "raw", mode == "file", fileName ?? "download", ct).ConfigureAwait(false);
         if (page.File is not null) return PluginJson.Serialize(new { url = page.Url, status = page.Status, success = true, file = page.File,
             expires_in_seconds = 3600, scope = "current_turn", hint = "Use file.file_id with imagegen reference_files or send_file. Downloading does not inspect image content." });
         var text = page.Text;
@@ -130,6 +130,50 @@ internal sealed class HttpFetchTool : IReadOnlyChatTool
         return PluginJson.Serialize(new { url = page.Url, method, status = page.Status, success = page.Status is >= 200 and < 300, headers = page.Headers, text = Clip(text, maxChars), links = page.Links, images = page.Images, summarized, truncated, source_truncated = sourceTruncated,
             trust = "untrusted_external_data" });
     }
+    /// <summary>
+    /// 连接失败、超时、TLS 握手失败、DNS 失败和 408/429/5xx 属于临时错误，按配置次数重试后再报失败；
+    /// 只重试 GET/HEAD/OPTIONS，写入请求可能已经生效，不自动重试。403/404 等明确拒绝不重试。
+    /// </summary>
+    private async Task<(string Url, string Text, IReadOnlyList<PageLink> Links, IReadOnlyList<PageImage> Images, int Status, Dictionary<string, string> Headers, DownloadedFile? File)> DownloadWithRetryAsync(
+        Uri url, string method, Dictionary<string, string> headers, byte[]? body, string? contentType, bool raw, bool saveFile, string fileName, CancellationToken ct)
+    {
+        var attempts = method is "GET" or "HEAD" or "OPTIONS" ? Math.Clamp(_config.RetryAttempts, 1, 5) : 1;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                // 跨域跳转会清空请求头，每次重试都从原始请求头开始。
+                return await DownloadAsync(url, method, new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase),
+                    body, contentType, raw, saveFile, fileName, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex))
+            {
+                var reason = Reason(ex);
+                if (attempt >= attempts)
+                    throw new HttpFetchException(ex is HttpFetchException failed ? failed.Url : url, (ex as HttpRequestException)?.StatusCode, reason, attempt);
+                var delay = TimeSpan.FromMilliseconds(Math.Clamp(_config.RetryDelayMs, 0, 10_000) * attempt);
+                BotLog.Warning($"[AiChat] ToolUse http_fetch 第 {attempt}/{attempts} 次失败 ({reason})，{delay.TotalMilliseconds:0}ms 后重试 target={PluginJson.Serialize(url.GetLeftPart(UriPartial.Path))}");
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    internal static bool IsTransient(Exception ex) => ex switch
+    {
+        TaskCanceledException => true,
+        HttpRequestException { StatusCode: { } status } => (int)status is 408 or 425 or 429 or >= 500,
+        HttpRequestException => true, // 没有状态码：连接、DNS、TLS 失败
+        _ => false
+    };
+
+    private static string Reason(Exception ex) => ex switch
+    {
+        TaskCanceledException => "Timeout",
+        HttpRequestException { StatusCode: { } status } => $"HTTP {(int)status}",
+        HttpRequestException http => http.Message,
+        _ => ex.GetType().Name
+    };
+
     private static string Clip(string text, int limit)
     {
         if (text.Length <= limit) return text;

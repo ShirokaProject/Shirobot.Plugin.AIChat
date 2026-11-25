@@ -157,9 +157,19 @@ internal static class CacheStabilityChecks
             Check(header >= 0 && tail.IndexOf("当前没有可用历史图片", StringComparison.Ordinal) > header &&
                 tail.IndexOf("[记忆本更新", StringComparison.Ordinal) > header &&
                 tail.IndexOf(AiChatPlugin.ProgramReferenceFooter, StringComparison.Ordinal) > tail.IndexOf("alice 喜欢猫", StringComparison.Ordinal) &&
-                System(first).Contains("程序附加参考由程序自动添加"),
+                System(first).Contains("程序附加参考，都由程序自动添加"),
                 "Program-attached catalogs and memory must be wrapped and explained as not sent by anyone.");
             Console.WriteLine("PASS: system prompt and tool definitions stay identical across speakers, memory changes and proactive replies");
+            // 本次请求才附带的内容单独成最后一条；下一轮只换掉这一条，之前的消息（包括上一条用户消息）逐字节不变。
+            for (var i = 1; i < upstream.Requests.Count; i++)
+            {
+                var previous = upstream.Requests[i - 1].RootElement.GetProperty("messages");
+                var next = upstream.Requests[i].RootElement.GetProperty("messages");
+                for (var j = 0; j < previous.GetArrayLength() - 1; j++)
+                    Check(previous[j].GetRawText() == next[j].GetRawText(),
+                        $"Request {i} must keep message {j} of the previous request byte-identical; only the request-only tail may change.");
+            }
+            Console.WriteLine("PASS: successive requests only replace the request-only tail message");
 
             settings.History.MaxTokens = 1000;
             settings.Default.RetryOnTimeoutMaxAttempts = 2;
@@ -205,6 +215,45 @@ internal static class CacheStabilityChecks
             Check(!interjectTail.Contains("当前没有可用历史图片") && !interjectTail.Contains("当前会话历史图片"),
                 "An unprompted interjection must not receive the image catalog.");
             Console.WriteLine("PASS: proactive replies addressed by name may use action tools; interjections may not");
+
+            // 主模型被上游内容审核拒绝时换备用模型；拒绝原文不发出、不进历史。
+            const string refusalText = "The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy.";
+            settings.Models.Add(new ModelEntry { Name = "backup", BaseUrl = "https://example.invalid/v1", ApiKey = "test" });
+            settings.Default.FallbackModel = "backup";
+            typeof(AiChatPlugin).GetMethod("ApplyConfigDerivatives", Flags)!.Invoke(plugin, [true]);
+            client = (OpenAiClient)typeof(AiChatPlugin).GetField("_openAi", Flags)!.GetValue(plugin)!;
+            ((Dictionary<string, HttpClient>)typeof(OpenAiClient).GetField("_clients", Flags)!.GetValue(client)!)["https://example.invalid/v1"] =
+                new HttpClient(upstream);
+            var models = new List<string>();
+            upstream.Reply = request =>
+            {
+                var name = request.GetProperty("model").GetString()!;
+                models.Add(name);
+                return (HttpStatusCode.OK, name == "test" ? refusalText : "备用模型的回复");
+            };
+            await Send("m8", "alice", "换个模型试试");
+            Check(models.SequenceEqual(["test", "backup"]), $"A refused request must be retried once on the fallback model, got [{string.Join(", ", models)}].");
+            var afterFallback = await store.AcquireAsync(sharedKey);
+            List<ChatTurn> savedTurns;
+            try { savedTurns = afterFallback.Turns.ToList(); }
+            finally { store.Release(sharedKey); }
+            Check(savedTurns[^1].Parts.OfType<TextPart>().Any(part => part.Text.Contains("备用模型的回复"))
+                && !savedTurns.Any(turn => turn.Parts.OfType<TextPart>().Any(part => part.Text.Contains("could not be submitted"))),
+                "The fallback reply must be saved and the refusal text must never reach history.");
+
+            models.Clear();
+            var turnsBefore = savedTurns.Count;
+            upstream.Reply = request =>
+            {
+                models.Add(request.GetProperty("model").GetString()!);
+                return (HttpStatusCode.OK, refusalText);
+            };
+            await Send("m9", "alice", "两个都拒绝");
+            var afterBoth = await store.AcquireAsync(sharedKey);
+            try { Check(afterBoth.Turns.Count == turnsBefore, "When every model refuses, the turn must not be saved."); }
+            finally { store.Release(sharedKey); }
+            Check(models.SequenceEqual(["test", "backup"]), "The fallback model must be tried exactly once when the main model refuses.");
+            Console.WriteLine("PASS: upstream refusals retry on the fallback model and never reach history");
         }
         finally
         {

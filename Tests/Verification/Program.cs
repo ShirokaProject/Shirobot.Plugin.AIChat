@@ -1031,6 +1031,16 @@ await DisabledToolCommandChecks.RunAsync();
     Check(!imagePolicyPlugin.BuildVisionMessages("stable", history, current, false).Any(message => message.HasImage),
         "Non-vision fallback must never receive image payloads.");
     Console.WriteLine("PASS: image eviction, bounded tail payload and stable text prefix");
+    var extras = new List<ChatPart> { new TextPart("[会话上下文: 群=测试群/100000; 用户=张三/123456]") };
+    var split = imagePolicyPlugin.BuildVisionMessages("stable", history, current, true, extras);
+    Check(split.Count == history.Count + 3 && split[^2].Role == "user" && !split[^2].HasImage
+        && split[^1].Role == "user" && split[^1].Segments[0].Text!.StartsWith("[会话上下文") && split[^1].HasImage,
+        "Request-only context and images must follow the current user message as a separate message.");
+    var nextHistory = history.Append(current).Append(new ChatTurn("assistant", [new TextPart("好的")], 100)).ToList();
+    var nextTurn = imagePolicyPlugin.BuildVisionMessages("stable", nextHistory, new ChatTurn("user", [new TextPart("下一条")], 101), true, extras);
+    Check(JsonSerializer.Serialize(split[^2]) == JsonSerializer.Serialize(nextTurn[split.Count - 2]),
+        "The current user message must serialize exactly as it will in the next turn's history.");
+    Console.WriteLine("PASS: request-only context is a separate trailing message");
 
     var toolRecord = ToolCallRecord.Prefix + "web_search（天气）→ 晴]";
     var recordHistory = new List<ChatTurn>
@@ -1055,6 +1065,22 @@ await DisabledToolCommandChecks.RunAsync();
     Check(ToolCallRecord.StripEchoes("正常回复 [不相关]") == "正常回复 [不相关]" && ToolCallRecord.StripEchoes("前文\n[程序记录：没闭合\n后文") == "前文\n\n后文",
         "Only program records are removed; unclosed ones end at the line break.");
     Console.WriteLine("PASS: program records move to user messages and echoed records are stripped");
+    {
+        var bili = new QIncomingLightApp("com.tencent.miniapp_01", """{"app":"com.tencent.miniapp_01","prompt":"[QQ小程序]张三的视频","meta":{"detail_1":{"title":"哔哩哔哩","desc":"张三的 [测试] 视频\n第二行","qqdocurl":"https://b23.tv/abc123","preview":"x"}}}""");
+        var news = new QIncomingLightApp("com.tencent.structmsg", """{"app":"com.tencent.structmsg","meta":{"news":{"title":"示例文章","desc":"一段简介","jumpUrl":"https://example.com/a","tag":"知乎"}}}""");
+        Check(ShiroBot.AiChatPlugin.Resources.QqCardText.Describe(bili) == "[小程序卡片 哔哩哔哩: 张三的 ［测试］ 视频 第二行 https://b23.tv/abc123]"
+            && ShiroBot.AiChatPlugin.Resources.QqCardText.Describe(bili, brief: true) == "[小程序卡片 哔哩哔哩: 张三的 ［测试］ 视频 第二行]"
+            && ShiroBot.AiChatPlugin.Resources.QqCardText.Describe(news) == "[小程序卡片 知乎: 示例文章 - 一段简介 https://example.com/a]"
+            && ShiroBot.AiChatPlugin.Resources.QqCardText.Describe(new QIncomingLightApp("x", "not json")) == "[小程序卡片 x]"
+            && ShiroBot.AiChatPlugin.Resources.QqCardText.Describe(new QIncomingLightApp("x", """{"meta":{"news":{"title":"t","jumpUrl":"javascript:alert(1)"}}}""")) == "[小程序卡片 x: t]"
+            && ShiroBot.AiChatPlugin.Resources.QqCardText.Describe(new QIncomingLightApp("x", "{\"meta\":{\"news\":{\"title\":\"" + new string('长', 1000) + "\"}}}")).Length < 320
+            && ShiroBot.AiChatPlugin.Resources.QqCardText.Describe(new QIncomingXml(1, """<?xml version="1.0"?><msg brief="[分享]示例" url="https://example.com/x"><item><title>示例标题</title><summary>示例摘要</summary></item><source name="示例来源"/></msg>""")) == "[XML卡片 示例来源: 示例标题 - 示例摘要 https://example.com/x]",
+            "QQ share cards must expose source, title, description and web link, bounded and with unsafe links dropped.");
+    }
+    Check(UpstreamRefusal.Is("The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy https://policies.google.com/terms/generative-ai/use-policy.")
+        && !UpstreamRefusal.Is("今天晴") && !UpstreamRefusal.Is("我们聊聊 prompt 能不能提交"),
+        "Upstream moderation refusals must be detected and ordinary replies left alone.");
+    Console.WriteLine("PASS: upstream refusal text is detected");
 
     var loopMessages = new List<OpenAiMessage>
     {
