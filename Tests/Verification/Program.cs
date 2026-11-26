@@ -111,6 +111,8 @@ if (args.Contains("--skills-concurrency-offline")) { await SkillsConcurrencyChec
 
 if (args.Contains("--image-api-offline")) { await ImageApiOfflineChecks.RunAsync(); return; }
 
+if (args.Contains("--nudge-reply-offline")) { await NudgeReplyChecks.RunAsync(); return; }
+
 // Verify the same initialization/application contract used by Dashboard and the host watcher.
 {
     var root = Path.Combine(Path.GetTempPath(), "aichat-config-" + Guid.NewGuid().ToString("N"));
@@ -189,6 +191,9 @@ var template = (string)typeof(AiChatPlugin).GetField("DefaultConfigTemplate", Bi
 var config = TomlSerializer.Deserialize<PluginConfig>(template, options)!;
 Check(config.ToolUse.Tavily is { ApiKey: "" } && config.History.CompactPrompt == HistorySection.DefaultCompactPrompt,
     "Default template must deserialize nested tool config and compact prompt.");
+Check(!config.Behaviour.ReplyToNudge && !new PluginConfig().Behaviour.ReplyToNudge &&
+    TomlSerializer.Deserialize<PluginConfig>("[behaviour]\nreply_to_nudge = true", options)!.Behaviour.ReplyToNudge,
+    "QQ nudge replies must default to off and be configurable through behaviour.reply_to_nudge.");
 Check(config.ToolUse.ImageGen.PromptInstructions == "" &&
     TomlSerializer.Deserialize<PluginConfig>("[tool_use.image_gen]\nprompt_instructions = '用中文自然语言描述主体、构图和光影'", options)!
         .ToolUse.ImageGen.PromptInstructions == "用中文自然语言描述主体、构图和光影",
@@ -1099,6 +1104,7 @@ await DisabledToolCommandChecks.RunAsync();
     Console.WriteLine("PASS: tool-loaded images join the current user message");
 }
 await CacheStabilityChecks.RunAsync();
+await NudgeReplyChecks.RunAsync();
 await RichReplyChecks.RunAsync();
 await ReplyModeChecks.RunAsync();
 await MemoryNotebookChecks.RunAsync();

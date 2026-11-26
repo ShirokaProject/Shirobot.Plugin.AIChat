@@ -23,6 +23,7 @@ public sealed partial class AiChatPlugin
         "chat" => "对话",
         "proactive" => "主动插话",
         "proactive_judge" => "接话判断",
+        "nudge" => "戳一戳回复",
         "timer" => "定时提醒",
         "compact" => "历史压缩",
         "page_summary" => "网页摘要",

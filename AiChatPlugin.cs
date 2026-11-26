@@ -12,13 +12,14 @@ using ShiroBot.AiChatPlugin.Tools.Memory;
 using ShiroBot.AiChatPlugin.Proactive;
 using ShiroBot.AiChatPlugin.Tools.Timers;
 using ShiroBot.AiChatPlugin.Usage;
+using ShiroBot.Model.QQ;
 using ShiroBot.SDK.Abstractions;
 using ShiroBot.SDK.Core;
 using ShiroBot.SDK.Config;
 using ShiroBot.SDK.Models;
 using ShiroBot.SDK.Plugin;
 
-[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.11")]
+[assembly: ShiroBotPackage("shirobot.plugin.aichat", ShiroBotPackageKind.Plugin, "1.4.12")]
 [assembly: RequiresShiroBotPackage("shirobot.model.qq", MinimumVersion = "0.9.8")]
 
 namespace ShiroBot.AiChatPlugin;
@@ -29,7 +30,7 @@ namespace ShiroBot.AiChatPlugin;
     Author = "ShirokaProject",
     Category = PluginCategory.Chat,
     Description = "支持上下文/图片/文件/历史/模型切换的 OpenAI 兼容聊天插件。",
-    Version = "1.4.11",
+    Version = "1.4.12",
     GithubRepo = "ShirokaProject/Shirobot.Plugin.AIChat",
     IsPluginSingleFile = true,
     SharedAssemblies = "ShiroBot.Model.QQ")]
@@ -150,6 +151,8 @@ public sealed partial class AiChatPlugin : PluginBase, IConfigurableComponent<Pl
         GroupCommands.MapWhen(ShouldRecordGroupMessage, HandleGroupChatterAsync);
 
         Events.Map<MessageDeletedEvent>(HandleMessageDeletedAsync);
+        Events.MapPlatform(QEventKinds.FriendNudge, HandleQqNudgeAsync);
+        Events.MapPlatform(QEventKinds.GroupNudge, HandleQqNudgeAsync);
         _timerScheduler.Start();
         _memoryReview = Task.Run(() => RunMemoryReviewLoopAsync(_backgroundStop.Token));
         BotLog.Info("[AiChat] 插件已加载。");

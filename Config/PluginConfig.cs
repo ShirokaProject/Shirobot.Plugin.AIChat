@@ -177,6 +177,9 @@ public sealed class BehaviourSection
     [ConfigField("开启后私聊普通消息无需 #ai 即可触发 AI 回复，仍检查使用权限。以 # 或 / 开头的命令不自动回复。", Label = "私聊直接回复")]
     public bool AutoReplyDirectMessages { get; set; }
 
+    [ConfigField("开启后，别人戳机器人时会在原 QQ 群聊或私聊回一句。需要适配器上报戳一戳事件。", Label = "被戳一戳时回复")]
+    public bool ReplyToNudge { get; set; }
+
     [ConfigField("收到原消息撤回事件且尚未开始回复时，取消资源处理、排队、模型和工具请求，不再重试或调用备用模型，也不保存这轮历史。已开始流式回复后不取消。需要适配器上报撤回事件。", Label = "撤回时取消请求")]
     public bool CancelOnRecall { get; set; }
 

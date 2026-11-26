@@ -90,6 +90,8 @@ public sealed partial class AiChatPlugin
         [behaviour]
         # 私聊普通消息无需 #ai 即可回复；以 # 或 / 开头的命令除外
         auto_reply_direct_messages = false
+        # 别人在 QQ 群聊或私聊戳机器人时回一句（需要适配器上报戳一戳事件）
+        reply_to_nudge = false
         # 原消息撤回且尚未开始回复时取消请求（需要适配器上报撤回事件）
         cancel_on_recall = false
         # 优先使用官方 Markdown 消息；能力不可用或发送失败时回退普通文本
